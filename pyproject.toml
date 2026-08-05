@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-dev-mcp"
+version = "0.1.0"
+description = "A project-aware ChatGPT-to-Claude Code MCP development bridge"
+requires-python = ">=3.11"
+dependencies = [
+  "fastmcp>=3.4,<4",
+  "ngrok>=1.4",
+  "pydantic>=2.10,<3",
+  "python-dotenv>=1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

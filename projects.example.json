@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "projects": [
+    {
+      "id": "cairn-knowledge-store",
+      "display_name": "CAIRN Knowledge Store",
+      "description": "Canonical CAIRN knowledge and governance repository",
+      "root": "/home/anindyasundar-bera/Downloads/docs/cairn-orch/cairn-knowledge-store",
+      "enabled": true,
+      "require_git": true,
+      "capabilities": [
+        "repository_read",
+        "markdown_write",
+        "claude_edit"
+      ],
+      "markdown_write_roots": [
+        "docs",
+        "canonical_knowledge"
+      ],
+      "protected_paths": [
+        ".git",
+        ".env"
+      ],
+      "default_effort": "high",
+      "allow_ultracode": true,
+      "self_managed": false
+    },
+    {
+      "id": "local-dev-mcp",
+      "display_name": "Local Development MCP",
+      "description": "The ChatGPT-to-Claude development bridge",
+      "root": "/home/anindyasundar-bera/local-dev-mcp",
+      "enabled": false,
+      "require_git": true,
+      "capabilities": [
+        "repository_read"
+      ],
+      "markdown_write_roots": [
+        "docs"
+      ],
+      "protected_paths": [
+        ".git",
+        ".env",
+        ".venv",
+        "openai-connectors-mtls-ca.pem"
+      ],
+      "default_effort": "high",
+      "allow_ultracode": true,
+      "self_managed": true
+    }
+  ]
+}
+
