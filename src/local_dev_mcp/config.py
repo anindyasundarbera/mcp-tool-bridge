@@ -27,6 +27,10 @@ class Settings:
     claude_max_turns: int
     max_input_chars: int
     max_output_bytes: int
+    max_markdown_file_bytes: int
+    max_markdown_list_results: int
+    max_markdown_search_results: int
+    max_markdown_range_lines: int
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str] | None = None) -> "Settings":
@@ -53,5 +57,16 @@ class Settings:
             claude_max_turns=_positive_int(env, "CLAUDE_MAX_TURNS", 30),
             max_input_chars=_positive_int(env, "MAX_INPUT_CHARS", 100000),
             max_output_bytes=_positive_int(env, "MAX_OUTPUT_BYTES", 2097152),
+            max_markdown_file_bytes=_positive_int(
+                env, "MAX_MARKDOWN_FILE_BYTES", 1048576
+            ),
+            max_markdown_list_results=_positive_int(
+                env, "MAX_MARKDOWN_LIST_RESULTS", 500
+            ),
+            max_markdown_search_results=_positive_int(
+                env, "MAX_MARKDOWN_SEARCH_RESULTS", 100
+            ),
+            max_markdown_range_lines=_positive_int(
+                env, "MAX_MARKDOWN_RANGE_LINES", 1000
+            ),
         )
-

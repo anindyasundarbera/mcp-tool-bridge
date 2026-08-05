@@ -9,6 +9,8 @@ class SettingsTests(unittest.TestCase):
         settings = Settings.from_env({})
         self.assertEqual(settings.claude_model, "glm-5.2:cloud")
         self.assertEqual(settings.mcp_port, 8000)
+        self.assertEqual(settings.max_markdown_file_bytes, 1048576)
+        self.assertEqual(settings.max_markdown_range_lines, 1000)
         self.assertTrue(settings.projects_config_path.is_absolute())
         self.assertEqual(settings.projects_config_path.name, "projects.json")
 
@@ -23,4 +25,3 @@ class SettingsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

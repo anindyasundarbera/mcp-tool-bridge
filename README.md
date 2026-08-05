@@ -1,11 +1,11 @@
 # Local Development MCP v2
 
-This is the MCPB-001 multi-project foundation for the ChatGPT-to-Claude Code
+This is the MCPB-002 project-aware repository reader for the ChatGPT-to-Claude Code
 development bridge. ChatGPT addresses projects by stable `project_id`; the
 server resolves those IDs through a local allowlist and never accepts an
 arbitrary filesystem root from a tool call.
 
-## MCPB-001 capabilities
+## Capabilities through MCPB-002
 
 - Validated JSON project registry
 - Safe public project discovery
@@ -15,9 +15,23 @@ arbitrary filesystem root from a tool call.
 - Project-specific effort policy
 - Existing Claude Code restrictions preserved
 - OpenAI connector mTLS tunnel preserved
+- Bounded Markdown discovery and literal text search
+- Full-file and line-range Markdown reads
+- Markdown outlines that ignore fenced code blocks
+- SHA-256, file size, line count, timestamp, and per-file Git status
+- Hidden, protected, non-Markdown, traversal, and symlink access denied
 
-Repository reading, Markdown writing, worktree isolation, verification, and
-commit tools are intentionally reserved for MCPB-002 through MCPB-005.
+Markdown writing, worktree isolation, verification, and commit tools are
+intentionally reserved for MCPB-003 through MCPB-005.
+
+## Repository reader tools
+
+- `list_project_markdown`
+- `search_project_markdown`
+- `read_project_markdown`
+- `read_project_file_range`
+- `get_markdown_outline`
+- `get_project_file_metadata`
 
 ## Install
 
@@ -71,4 +85,3 @@ python test_client.py --project cairn-knowledge-store
 4. Keep `claude_edit` disabled until MCPB-004 adds isolated worktrees.
 
 The running production checkout must not edit or restart itself directly.
-
