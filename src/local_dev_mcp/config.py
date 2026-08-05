@@ -31,6 +31,8 @@ class Settings:
     max_markdown_list_results: int
     max_markdown_search_results: int
     max_markdown_range_lines: int
+    max_markdown_write_bytes: int
+    max_markdown_diff_bytes: int
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str] | None = None) -> "Settings":
@@ -68,5 +70,11 @@ class Settings:
             ),
             max_markdown_range_lines=_positive_int(
                 env, "MAX_MARKDOWN_RANGE_LINES", 1000
+            ),
+            max_markdown_write_bytes=_positive_int(
+                env, "MAX_MARKDOWN_WRITE_BYTES", 1048576
+            ),
+            max_markdown_diff_bytes=_positive_int(
+                env, "MAX_MARKDOWN_DIFF_BYTES", 262144
             ),
         )

@@ -12,19 +12,25 @@ from .git import project_status
 from .models import Effort, ProjectCapability
 from .reader import RepositoryReader
 from .registry import ProjectLockManager, ProjectRegistry
+from .writer import RepositoryWriter, WriteMode
 
 
 def create_server(
     settings: Settings | None = None,
     registry: ProjectRegistry | None = None,
+    executor: ClaudeExecutor | None = None,
+    reader: RepositoryReader | None = None,
+    writer: RepositoryWriter | None = None,
+    locks: ProjectLockManager | None = None,
 ) -> FastMCP:
     active_settings = settings or Settings.from_env()
     active_registry = registry or ProjectRegistry.load(
         active_settings.projects_config_path
     )
-    locks = ProjectLockManager()
-    executor = ClaudeExecutor(active_settings)
-    reader = RepositoryReader(active_settings)
+    active_locks = locks or ProjectLockManager()
+    active_executor = executor or ClaudeExecutor(active_settings)
+    active_reader = reader or RepositoryReader(active_settings)
+    active_writer = writer or RepositoryWriter(active_settings)
 
     mcp = FastMCP(
         name="Local Development Bridge",
@@ -117,7 +123,7 @@ def create_server(
         ] = 100,
     ) -> dict[str, Any]:
         project = active_registry.resolve(project_id, ProjectCapability.REPOSITORY_READ)
-        return await reader.list_markdown(project, path, max_depth, max_results)
+        return await active_reader.list_markdown(project, path, max_depth, max_results)
 
     @mcp.tool(
         name="search_project_markdown",
@@ -143,7 +149,7 @@ def create_server(
         ] = 30,
     ) -> dict[str, Any]:
         project = active_registry.resolve(project_id, ProjectCapability.REPOSITORY_READ)
-        return await reader.search(project, query, path, max_results)
+        return await active_reader.search(project, query, path, max_results)
 
     @mcp.tool(
         name="read_project_markdown",
@@ -162,7 +168,7 @@ def create_server(
         ],
     ) -> dict[str, Any]:
         project = active_registry.resolve(project_id, ProjectCapability.REPOSITORY_READ)
-        return await reader.read_markdown(project, path)
+        return await active_reader.read_markdown(project, path)
 
     @mcp.tool(
         name="read_project_file_range",
@@ -187,7 +193,7 @@ def create_server(
         ] = None,
     ) -> dict[str, Any]:
         project = active_registry.resolve(project_id, ProjectCapability.REPOSITORY_READ)
-        return await reader.read_range(
+        return await active_reader.read_range(
             project, path, start_line, end_line, expected_sha256
         )
 
@@ -208,7 +214,7 @@ def create_server(
         ],
     ) -> dict[str, Any]:
         project = active_registry.resolve(project_id, ProjectCapability.REPOSITORY_READ)
-        return await reader.outline(project, path)
+        return await active_reader.outline(project, path)
 
     @mcp.tool(
         name="get_project_file_metadata",
@@ -227,7 +233,65 @@ def create_server(
         ],
     ) -> dict[str, Any]:
         project = active_registry.resolve(project_id, ProjectCapability.REPOSITORY_READ)
-        return await reader.metadata(project, path)
+        return await active_reader.metadata(project, path)
+
+    @mcp.tool(
+        name="write_project_markdown",
+        description=(
+            "Create or update one UTF-8 Markdown file beneath an approved write "
+            "root. Create never overwrites. Update requires the current SHA-256 "
+            "and fails if the file changed. Parent directories must already exist."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=False,
+            openWorldHint=False,
+        ),
+    )
+    async def write_project_markdown(
+        project_id: Annotated[
+            str, Field(description="Exact project ID returned by list_allowed_projects.")
+        ],
+        path: Annotated[
+            str,
+            Field(
+                description=(
+                    "Normalized project-relative .md path beneath an approved "
+                    "Markdown write root."
+                )
+            ),
+        ],
+        content: Annotated[
+            str,
+            Field(
+                description=(
+                    "Complete UTF-8 Markdown content. Line endings and final newline "
+                    "are preserved exactly."
+                )
+            ),
+        ],
+        write_mode: Annotated[
+            WriteMode,
+            Field(description="Use create for a missing file or update for an existing file."),
+        ] = "create",
+        expected_sha256: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Required for update and forbidden for create: the current "
+                    "64-character hexadecimal SHA-256."
+                ),
+                pattern=r"^[0-9A-Fa-f]{64}$",
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(project_id, ProjectCapability.MARKDOWN_WRITE)
+        lock = await active_locks.for_project(project.id)
+        async with lock:
+            return await active_writer.write(
+                project, path, content, write_mode, expected_sha256
+            )
 
     @mcp.tool(
         name="send_to_local_dev",
@@ -271,9 +335,9 @@ def create_server(
         ] = "high",
     ) -> dict[str, Any]:
         project = active_registry.resolve(project_id, ProjectCapability.CLAUDE_EDIT)
-        lock = await locks.for_project(project.id)
+        lock = await active_locks.for_project(project.id)
         async with lock:
-            return await executor.execute(project, text, effort)
+            return await active_executor.execute(project, text, effort)
 
     return mcp
 

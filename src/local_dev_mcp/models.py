@@ -71,9 +71,11 @@ class ProjectPolicy(BaseModel):
     def validate_policy(self) -> "ProjectPolicy":
         if self.default_effort == "ultracode" and not self.allow_ultracode:
             raise ValueError("default_effort cannot be ultracode when it is disabled")
-        if self.self_managed and ProjectCapability.CLAUDE_EDIT in self.capabilities:
+        if self.self_managed and self.capabilities.intersection(
+            {ProjectCapability.CLAUDE_EDIT, ProjectCapability.MARKDOWN_WRITE}
+        ):
             raise ValueError(
-                "self-managed projects cannot use direct claude_edit before "
+                "self-managed projects cannot use direct modifying capabilities before "
                 "worktree isolation is implemented"
             )
         if (
@@ -107,4 +109,3 @@ class ProjectRegistryDocument(BaseModel):
         if len(ids) != len(set(ids)):
             raise ValueError("project IDs must be unique")
         return self
-

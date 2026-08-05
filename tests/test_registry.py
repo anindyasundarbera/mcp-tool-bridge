@@ -45,6 +45,26 @@ class ProjectRegistryTests(unittest.TestCase):
             registry.resolve("missing")
         with self.assertRaisesRegex(ProjectRegistryError, "does not allow claude_edit"):
             registry.resolve("test-project", ProjectCapability.CLAUDE_EDIT)
+        with self.assertRaisesRegex(ProjectRegistryError, "does not allow markdown_write"):
+            registry.resolve("test-project", ProjectCapability.MARKDOWN_WRITE)
+
+    def test_markdown_write_requires_an_approved_root(self) -> None:
+        repository = self.root / "repo"
+        initialize_git_repository(repository)
+        config = self.root / "projects.json"
+        write_registry(
+            config,
+            [
+                project_payload(
+                    repository,
+                    capabilities=["repository_read", "markdown_write"],
+                    markdown_write_roots=[],
+                )
+            ],
+        )
+
+        with self.assertRaisesRegex(ProjectRegistryError, "approved write root"):
+            ProjectRegistry.load(config)
 
     def test_disabled_missing_project_does_not_block_startup(self) -> None:
         repository = self.root / "repo"
@@ -91,6 +111,20 @@ class ProjectRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectRegistryError, "self-managed"):
             ProjectRegistry.load(config)
 
+        write_registry(
+            config,
+            [
+                project_payload(
+                    repository,
+                    self_managed=True,
+                    capabilities=["repository_read", "markdown_write"],
+                    markdown_write_roots=["docs"],
+                )
+            ],
+        )
+        with self.assertRaisesRegex(ProjectRegistryError, "self-managed"):
+            ProjectRegistry.load(config)
+
     def test_rejects_policy_path_traversal(self) -> None:
         repository = self.root / "repo"
         initialize_git_repository(repository)
@@ -105,4 +139,3 @@ class ProjectRegistryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
