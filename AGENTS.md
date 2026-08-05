@@ -91,14 +91,14 @@ work, not additional product capabilities.
 - Fixed `rg` argument vector without shell execution
 - Milestone package version `0.2.0`; 23 tests passed in the prepared artifact
 
-### MCPB-003 — Markdown Writer (implemented locally; pending acceptance)
+### MCPB-003 — Markdown Writer (complete)
 
 Read these files completely before implementation:
 
 - `docs/NEXT-SESSION-MCPB-003.md`
 - `docs/MCPB-003-IMPLEMENTATION-BRIEF.md`
 
-The prepared MCPB-003 source delivers a project-aware
+The accepted MCPB-003 source delivers a project-aware
 `write_project_markdown` tool with:
 
 - approved write-root enforcement;
@@ -110,13 +110,19 @@ The prepared MCPB-003 source delivers a project-aware
 - structured before/after evidence;
 - no deletion, commit, shell, Claude invocation, or directory creation.
 
-The prepared package version is `0.3.0`; 36 core tests pass. It has not been
-committed, pushed, installed on the live bridge, or exercised through the live
-connector. Do not begin MCPB-004 until the user accepts this milestone.
+The package version is `0.3.0`; 36 core tests passed. The accepted source was
+pushed to `feature/updatingCapabilities` at
+`9cee986b4b62db6fc26e974642754793f7f71776`, and the MCPB-003 tools were
+confirmed through the live connector before MCPB-004 implementation.
 
-### MCPB-004 — Isolated development (planned)
+### MCPB-004 — Isolated development (implemented locally; pending acceptance)
 
-Implement only after MCPB-003 is accepted:
+Read these files completely before review or further implementation:
+
+- `docs/MCPB-004-IMPLEMENTATION-BRIEF.md`
+- `docs/NEXT-SESSION-MCPB-004.md`
+
+The prepared MCPB-004 source adds:
 
 - per-job Git worktrees;
 - clean-baseline checks;
@@ -126,8 +132,9 @@ Implement only after MCPB-003 is accepted:
 - candidate server health check on a separate port;
 - no autonomous production overwrite, restart, merge, or rollback switch.
 
-Write a dedicated MCPB-004 brief from the accepted conversation decisions and
-the actual MCPB-003 implementation before coding.
+The prepared package version is `0.4.0`. It has not been committed, pushed,
+installed on the live bridge, or exercised through a modifying live connector.
+Do not begin MCPB-005 until the user accepts this milestone.
 
 ### MCPB-005 — Verification and commit (planned)
 
@@ -234,13 +241,13 @@ core tests and must be identified as such. Do not fabricate their results.
 
 ## Current resume pointer
 
-Resume by reviewing and accepting **MCPB-003** using:
+Resume by reviewing and accepting **MCPB-004** using:
 
 ```text
-docs/NEXT-SESSION-MCPB-003.md
-docs/MCPB-003-IMPLEMENTATION-BRIEF.md
+docs/NEXT-SESSION-MCPB-004.md
+docs/MCPB-004-IMPLEMENTATION-BRIEF.md
 ```
 
-When MCPB-003 is accepted, write the MCPB-004 implementation brief from the
-accepted decisions and actual MCPB-003 source, then update this pointer without
+When MCPB-004 is accepted, write the MCPB-005 implementation brief from the
+accepted decisions and actual MCPB-004 source, then update this pointer without
 deleting the historical phase documents.

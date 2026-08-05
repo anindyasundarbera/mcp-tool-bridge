@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import time
 
 from fastmcp import Client
 
@@ -22,18 +23,39 @@ async def main(project_id: str, endpoint: str) -> None:
         print("\nProject status:")
         print(json.dumps(status.data, indent=2))
 
-        result = await client.call_tool(
+        started = await client.call_tool(
             "send_to_local_dev",
             {
                 "project_id": project_id,
                 "text": (
-                    "This is an MCPB-001 connectivity test. Do not inspect or "
-                    "modify files and do not use tools. Respond exactly: MCPB_001_OK"
+                    "This is an MCPB-004 connectivity test. Do not inspect or "
+                    "modify files and do not use tools. Respond exactly: MCPB_004_OK"
                 ),
                 "effort": "high",
             },
         )
-        print("\nDevelopment result:")
+        print("\nDevelopment job started:")
+        print(json.dumps(started.data, indent=2))
+
+        job_id = started.data["job_id"]
+        deadline = time.monotonic() + 1800
+        while True:
+            result = await client.call_tool(
+                "get_development_job",
+                {"project_id": project_id, "job_id": job_id},
+            )
+            if result.data["status"] in {
+                "completed",
+                "failed",
+                "timed_out",
+                "cancelled",
+            }:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError("development job did not finish within 1800 seconds")
+            await asyncio.sleep(1)
+
+        print("\nDevelopment job result:")
         print(json.dumps(result.data, indent=2))
 
 
@@ -43,4 +65,3 @@ if __name__ == "__main__":
     parser.add_argument("--endpoint", default="http://127.0.0.1:8000/mcp")
     arguments = parser.parse_args()
     asyncio.run(main(arguments.project, arguments.endpoint))
-

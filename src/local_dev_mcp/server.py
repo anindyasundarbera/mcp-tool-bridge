@@ -9,6 +9,7 @@ from pydantic import Field
 from .claude import ClaudeExecutor
 from .config import Settings
 from .git import project_status
+from .jobs import DevelopmentJobManager
 from .models import Effort, ProjectCapability
 from .reader import RepositoryReader
 from .registry import ProjectLockManager, ProjectRegistry
@@ -22,6 +23,7 @@ def create_server(
     reader: RepositoryReader | None = None,
     writer: RepositoryWriter | None = None,
     locks: ProjectLockManager | None = None,
+    jobs: DevelopmentJobManager | None = None,
 ) -> FastMCP:
     active_settings = settings or Settings.from_env()
     active_registry = registry or ProjectRegistry.load(
@@ -31,6 +33,12 @@ def create_server(
     active_executor = executor or ClaudeExecutor(active_settings)
     active_reader = reader or RepositoryReader(active_settings)
     active_writer = writer or RepositoryWriter(active_settings)
+    active_jobs = jobs or DevelopmentJobManager(
+        active_settings,
+        active_locks,
+        active_executor,
+        projects=active_registry.projects(),
+    )
 
     mcp = FastMCP(
         name="Local Development Bridge",
@@ -40,7 +48,8 @@ def create_server(
             "The server authorizes every project and capability. Use high for "
             "routine work and ultracode only for complex architecture, difficult "
             "reasoning, migrations, or substantial cross-module implementation. "
-            "An explicit user effort choice wins. Development calls may modify files."
+            "An explicit user effort choice wins. Development jobs may modify only "
+            "their bridge-created detached worktrees."
         ),
     )
 
@@ -296,11 +305,13 @@ def create_server(
     @mcp.tool(
         name="send_to_local_dev",
         description=(
-            "Delegate an approved work order to Claude Code in one exact allowed "
-            "project. Use high for routine analysis and implementation. Use "
+            "Start an asynchronous Claude Code job in a detached Git worktree "
+            "for one exact allowed project. Returns an opaque job ID immediately. "
+            "Use high for routine analysis and implementation. Use "
             "ultracode only for complex architecture, difficult reasoning, "
             "cross-module implementation, migrations, or explicit user requests. "
-            "Claude may modify files; Bash, web, and secondary MCP tools are disabled."
+            "The configured checkout is never edited directly; Bash, web, and "
+            "secondary MCP tools are disabled."
         ),
         annotations=ToolAnnotations(
             readOnlyHint=False,
@@ -335,9 +346,113 @@ def create_server(
         ] = "high",
     ) -> dict[str, Any]:
         project = active_registry.resolve(project_id, ProjectCapability.CLAUDE_EDIT)
-        lock = await active_locks.for_project(project.id)
-        async with lock:
-            return await active_executor.execute(project, text, effort)
+        return await active_jobs.start(project, text, effort)
+
+    @mcp.tool(
+        name="get_development_job",
+        description=(
+            "Get the current status and bounded result of one bridge-created "
+            "development job. The result never exposes its worktree path or raw "
+            "Claude session ID."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=False,
+        ),
+    )
+    async def get_development_job(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        job_id: Annotated[
+            str,
+            Field(
+                description="Opaque job ID returned by send_to_local_dev.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(project_id, ProjectCapability.CLAUDE_EDIT)
+        return await active_jobs.get(project, job_id)
+
+    @mcp.tool(
+        name="resume_development_job",
+        description=(
+            "Continue a terminal development job in its retained worktree using "
+            "only the Claude session ID previously captured by this bridge. "
+            "Callers provide a job ID and never provide a raw session ID."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=False,
+            openWorldHint=True,
+        ),
+    )
+    async def resume_development_job(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        job_id: Annotated[
+            str,
+            Field(
+                description="Opaque job ID returned by send_to_local_dev.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+        text: Annotated[
+            str,
+            Field(
+                description="Complete approved continuation instruction.",
+                min_length=1,
+            ),
+        ],
+        effort: Annotated[
+            Effort,
+            Field(
+                description=(
+                    "Use high for routine work; use ultracode only for complex "
+                    "reasoning or substantial implementation."
+                )
+            ),
+        ] = "high",
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(project_id, ProjectCapability.CLAUDE_EDIT)
+        return await active_jobs.resume(project, job_id, text, effort)
+
+    @mcp.tool(
+        name="cancel_development_job",
+        description=(
+            "Cancel one queued or running bridge-created development job and "
+            "terminate its process group. Candidate files and the isolated "
+            "worktree are retained for inspection."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
+    async def cancel_development_job(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        job_id: Annotated[
+            str,
+            Field(
+                description="Opaque job ID returned by send_to_local_dev.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(project_id, ProjectCapability.CLAUDE_EDIT)
+        return await active_jobs.cancel(project, job_id)
 
     return mcp
 

@@ -33,7 +33,8 @@
       "enabled": false,
       "require_git": true,
       "capabilities": [
-        "repository_read"
+        "repository_read",
+        "claude_edit"
       ],
       "markdown_write_roots": [
         "docs"
@@ -50,4 +51,3 @@
     }
   ]
 }
-

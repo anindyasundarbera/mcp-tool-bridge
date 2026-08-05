@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from local_dev_mcp.config import Settings
-from local_dev_mcp.models import Effort, ProjectPolicy
+from local_dev_mcp.models import ProjectPolicy
 from local_dev_mcp.registry import ProjectRegistry
 from local_dev_mcp.server import create_server
 
@@ -74,7 +74,39 @@ class ServerSchemaTests(unittest.TestCase):
             writer_schema["properties"]["expected_sha256"]["description"],
         )
 
-    def test_writer_and_claude_share_the_project_modifying_lock(self) -> None:
+        lifecycle = {
+            "send_to_local_dev",
+            "get_development_job",
+            "resume_development_job",
+            "cancel_development_job",
+        }
+        self.assertTrue(lifecycle.issubset(tools))
+        self.assertFalse(tools["send_to_local_dev"].annotations.readOnlyHint)
+        self.assertTrue(tools["send_to_local_dev"].annotations.openWorldHint)
+        self.assertTrue(tools["get_development_job"].annotations.readOnlyHint)
+        self.assertFalse(tools["get_development_job"].annotations.idempotentHint)
+        self.assertFalse(tools["resume_development_job"].annotations.readOnlyHint)
+        self.assertTrue(tools["resume_development_job"].annotations.openWorldHint)
+        self.assertTrue(tools["cancel_development_job"].annotations.idempotentHint)
+        self.assertFalse(tools["cancel_development_job"].annotations.openWorldHint)
+        for name in (
+            "get_development_job",
+            "resume_development_job",
+            "cancel_development_job",
+        ):
+            schema = tools[name].parameters
+            self.assertEqual(
+                schema["properties"]["job_id"]["pattern"], r"^[0-9a-f]{32}$"
+            )
+        self.assertNotIn(
+            "session_id", tools["resume_development_job"].parameters["properties"]
+        )
+        self.assertEqual(
+            tools["resume_development_job"].parameters["properties"]["effort"]["default"],
+            "high",
+        )
+
+    def test_writer_and_development_jobs_share_the_project_modifying_lock(self) -> None:
         class BlockingWriter:
             def __init__(self) -> None:
                 self.entered = asyncio.Event()
@@ -100,17 +132,19 @@ class ServerSchemaTests(unittest.TestCase):
                 self,
                 project: ProjectPolicy,
                 text: str,
-                effort: Effort,
+                effort: str,
+                *,
+                root: Path | None = None,
+                resume_session_id: str | None = None,
             ) -> dict[str, object]:
                 self.entered.set()
-                return {"operation": "claude"}
+                return {"status": "completed", "result": "done"}
 
         async def exercise() -> None:
             with tempfile.TemporaryDirectory() as directory:
                 base = Path(directory)
                 root = base / "repo"
                 initialize_git_repository(root)
-                (root / "docs").mkdir()
                 project = ProjectPolicy.model_validate(
                     {
                         "id": "test-project",
@@ -129,7 +163,10 @@ class ServerSchemaTests(unittest.TestCase):
                 observing_executor = ObservingExecutor()
                 server = create_server(
                     Settings.from_env(
-                        {"PROJECTS_CONFIG_PATH": str(base / "projects.json")}
+                        {
+                            "PROJECTS_CONFIG_PATH": str(base / "projects.json"),
+                            "JOB_WORKTREE_ROOT": str(base / "jobs"),
+                        }
                     ),
                     ProjectRegistry({"test-project": project}),
                     writer=blocking_writer,  # type: ignore[arg-type]
@@ -147,22 +184,20 @@ class ServerSchemaTests(unittest.TestCase):
                     )
                 )
                 await asyncio.wait_for(blocking_writer.entered.wait(), timeout=1)
-                claude_call = asyncio.create_task(
-                    server.call_tool(
-                        "send_to_local_dev",
-                        {
-                            "project_id": "test-project",
-                            "text": "approved work",
-                            "effort": "high",
-                        },
-                    )
+                await server.call_tool(
+                    "send_to_local_dev",
+                    {
+                        "project_id": "test-project",
+                        "text": "approved work",
+                        "effort": "high",
+                    },
                 )
                 await asyncio.sleep(0.05)
                 self.assertFalse(observing_executor.entered.is_set())
 
                 blocking_writer.release.set()
-                await asyncio.gather(writer_call, claude_call)
-                self.assertTrue(observing_executor.entered.is_set())
+                await writer_call
+                await asyncio.wait_for(observing_executor.entered.wait(), timeout=2)
 
         asyncio.run(exercise())
 

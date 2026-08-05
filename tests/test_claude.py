@@ -59,7 +59,28 @@ class ClaudeCommandTests(unittest.TestCase):
         self.assertEqual(command[command.index("--model") + 1], "custom:model")
         self.assertEqual(command[command.index("--max-turns") + 1], "17")
 
+    def test_resume_uses_stored_session_exactly_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = build_claude_command(
+                settings(root / "projects.json"),
+                policy(root),
+                "high",
+                "bridge-session",
+            )
+
+        self.assertEqual(command.count("--resume"), 1)
+        self.assertEqual(command[command.index("--resume") + 1], "bridge-session")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(ValueError, "session ID"):
+                build_claude_command(
+                    settings(root / "projects.json"),
+                    policy(root),
+                    "high",
+                    "bad\nsession",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import signal
+from pathlib import Path
 from typing import Any
 
 from .config import Settings
@@ -20,11 +21,12 @@ def build_claude_command(
     settings: Settings,
     project: ProjectPolicy,
     effort: Effort,
+    resume_session_id: str | None = None,
 ) -> list[str]:
     validate_effort(project, effort)
     model = project.claude_model or settings.claude_model
     max_turns = project.claude_max_turns or settings.claude_max_turns
-    return [
+    command = [
         "ollama",
         "launch",
         "claude",
@@ -33,6 +35,17 @@ def build_claude_command(
         "--yes",
         "--",
         "-p",
+    ]
+    if resume_session_id is not None:
+        if (
+            not resume_session_id
+            or len(resume_session_id) > 512
+            or any(ord(character) < 32 for character in resume_session_id)
+        ):
+            raise ValueError("stored Claude session ID is invalid")
+        command.extend(["--resume", resume_session_id])
+    command.extend(
+        [
         "--permission-mode",
         "acceptEdits",
         "--tools",
@@ -50,7 +63,9 @@ def build_claude_command(
         "json",
         "--effort",
         effort,
-    ]
+        ]
+    )
+    return command
 
 
 async def terminate_process_group(process: asyncio.subprocess.Process) -> None:
@@ -79,6 +94,9 @@ class ClaudeExecutor:
         project: ProjectPolicy,
         specification: str,
         effort: Effort,
+        *,
+        root: Path | None = None,
+        resume_session_id: str | None = None,
     ) -> dict[str, Any]:
         text = specification.strip()
         if not text:
@@ -88,14 +106,19 @@ class ClaudeExecutor:
                 f"text exceeds the {self.settings.max_input_chars}-character limit"
             )
 
-        before = await project_status(project.root)
-        command = build_claude_command(self.settings, project, effort)
+        execution_root = project.root if root is None else root
+        before = await project_status(
+            execution_root, self.settings.git_command_timeout_seconds
+        )
+        command = build_claude_command(
+            self.settings, project, effort, resume_session_id
+        )
         environment = os.environ.copy()
         environment["NO_COLOR"] = "1"
 
         process = await asyncio.create_subprocess_exec(
             *command,
-            cwd=str(project.root),
+            cwd=str(execution_root),
             env=environment,
             start_new_session=True,
             stdin=asyncio.subprocess.PIPE,
@@ -116,10 +139,17 @@ class ClaudeExecutor:
                 "model": project.claude_model or self.settings.claude_model,
                 "effort": effort,
                 "timeout_seconds": self.settings.claude_timeout_seconds,
-                "repository": await project_status(project.root),
+                "repository": await project_status(
+                    execution_root, self.settings.git_command_timeout_seconds
+                ),
             }
+        except asyncio.CancelledError:
+            await terminate_process_group(process)
+            raise
 
-        after = await project_status(project.root)
+        after = await project_status(
+            execution_root, self.settings.git_command_timeout_seconds
+        )
         if len(stdout_bytes) > self.settings.max_output_bytes:
             return {
                 "status": "failed",
@@ -161,4 +191,3 @@ class ClaudeExecutor:
         if stderr:
             response["stderr"] = stderr[-4000:]
         return response
-

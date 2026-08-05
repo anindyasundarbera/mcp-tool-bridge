@@ -100,7 +100,7 @@ class ProjectRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectRegistryError, "share a root"):
             ProjectRegistry.load(config)
 
-    def test_rejects_self_managed_direct_edit(self) -> None:
+    def test_self_managed_allows_isolated_claude_but_rejects_direct_writer(self) -> None:
         repository = self.root / "repo"
         initialize_git_repository(repository)
         config = self.root / "projects.json"
@@ -108,8 +108,8 @@ class ProjectRegistryTests(unittest.TestCase):
             config,
             [project_payload(repository, self_managed=True)],
         )
-        with self.assertRaisesRegex(ProjectRegistryError, "self-managed"):
-            ProjectRegistry.load(config)
+        registry = ProjectRegistry.load(config)
+        self.assertTrue(registry.resolve("test-project").self_managed)
 
         write_registry(
             config,

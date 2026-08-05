@@ -33,7 +33,7 @@ class ProjectRegistry:
         self._projects = projects
 
     @classmethod
-    def load(cls, config_path: Path) -> "ProjectRegistry":
+    def load(cls, config_path: Path) -> ProjectRegistry:
         try:
             payload = json.loads(config_path.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
@@ -81,6 +81,10 @@ class ProjectRegistry:
             for project_id in sorted(self._projects)
         ]
 
+    def projects(self) -> tuple[ProjectPolicy, ...]:
+        """Return enabled policies for internal cross-project safety checks."""
+        return tuple(self._projects[project_id] for project_id in sorted(self._projects))
+
     def resolve(
         self,
         project_id: str,
@@ -107,4 +111,3 @@ class ProjectLockManager:
     async def for_project(self, project_id: str) -> asyncio.Lock:
         async with self._guard:
             return self._locks.setdefault(project_id, asyncio.Lock())
-

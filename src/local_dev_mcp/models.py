@@ -71,12 +71,10 @@ class ProjectPolicy(BaseModel):
     def validate_policy(self) -> "ProjectPolicy":
         if self.default_effort == "ultracode" and not self.allow_ultracode:
             raise ValueError("default_effort cannot be ultracode when it is disabled")
-        if self.self_managed and self.capabilities.intersection(
-            {ProjectCapability.CLAUDE_EDIT, ProjectCapability.MARKDOWN_WRITE}
-        ):
+        if self.self_managed and ProjectCapability.MARKDOWN_WRITE in self.capabilities:
             raise ValueError(
-                "self-managed projects cannot use direct modifying capabilities before "
-                "worktree isolation is implemented"
+                "self-managed projects cannot use direct markdown_write against the "
+                "production checkout"
             )
         if (
             ProjectCapability.MARKDOWN_WRITE in self.capabilities

@@ -17,6 +17,20 @@ def _positive_int(environment: Mapping[str, str], name: str, default: int) -> in
     return value
 
 
+def _port(environment: Mapping[str, str], name: str, default: int) -> int:
+    value = _positive_int(environment, name, default)
+    if value > 65535:
+        raise RuntimeError(f"{name} must be at most 65535")
+    return value
+
+
+def _absolute_path(environment: Mapping[str, str], name: str, default: str) -> Path:
+    path = Path(environment.get(name, default)).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    return path
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     projects_config_path: Path
@@ -33,6 +47,10 @@ class Settings:
     max_markdown_range_lines: int
     max_markdown_write_bytes: int
     max_markdown_diff_bytes: int
+    job_worktree_root: Path
+    git_command_timeout_seconds: int
+    candidate_mcp_port: int
+    candidate_health_timeout_seconds: int
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str] | None = None) -> "Settings":
@@ -48,11 +66,16 @@ class Settings:
         if not host:
             raise RuntimeError("MCP_HOST must not be empty")
 
+        mcp_port = _port(env, "MCP_PORT", 8000)
+        candidate_mcp_port = _port(env, "CANDIDATE_MCP_PORT", 8001)
+        if candidate_mcp_port == mcp_port:
+            raise RuntimeError("CANDIDATE_MCP_PORT must differ from MCP_PORT")
+
         return cls(
             projects_config_path=config_path,
             claude_model=model,
             mcp_host=host,
-            mcp_port=_positive_int(env, "MCP_PORT", 8000),
+            mcp_port=mcp_port,
             claude_timeout_seconds=_positive_int(
                 env, "CLAUDE_TIMEOUT_SECONDS", 1800
             ),
@@ -76,5 +99,17 @@ class Settings:
             ),
             max_markdown_diff_bytes=_positive_int(
                 env, "MAX_MARKDOWN_DIFF_BYTES", 262144
+            ),
+            job_worktree_root=_absolute_path(
+                env,
+                "JOB_WORKTREE_ROOT",
+                "~/.local/state/local-dev-mcp/worktrees",
+            ),
+            git_command_timeout_seconds=_positive_int(
+                env, "GIT_COMMAND_TIMEOUT_SECONDS", 30
+            ),
+            candidate_mcp_port=candidate_mcp_port,
+            candidate_health_timeout_seconds=_positive_int(
+                env, "CANDIDATE_HEALTH_TIMEOUT_SECONDS", 30
             ),
         )
