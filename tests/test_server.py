@@ -27,8 +27,13 @@ class ServerSchemaTests(unittest.TestCase):
                         "repository_read",
                         "markdown_write",
                         "claude_edit",
+                        "verification_commit",
                     ],
                     "markdown_write_roots": ["docs"],
+                    "commit_roots": ["."],
+                    "verification_commands": [
+                        {"id": "core", "argv": ["{python}", "-m", "unittest"]}
+                    ],
                 }
             )
             server = create_server(
@@ -39,6 +44,7 @@ class ServerSchemaTests(unittest.TestCase):
             )
             tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
 
+        self.assertEqual(len(tools), 15)
         reader_tools = {
             "list_project_markdown",
             "search_project_markdown",
@@ -105,6 +111,40 @@ class ServerSchemaTests(unittest.TestCase):
             tools["resume_development_job"].parameters["properties"]["effort"]["default"],
             "high",
         )
+
+        verification_tools = {
+            "verify_development_job",
+            "commit_verified_development_job",
+        }
+        self.assertTrue(verification_tools.issubset(tools))
+        for name in verification_tools:
+            self.assertFalse(tools[name].annotations.readOnlyHint)
+            self.assertTrue(tools[name].annotations.destructiveHint)
+            self.assertFalse(tools[name].annotations.idempotentHint)
+            self.assertEqual(
+                tools[name].parameters["properties"]["job_id"]["pattern"],
+                r"^[0-9a-f]{32}$",
+            )
+            self.assertEqual(
+                tools[name].parameters["properties"]["expected_head"]["pattern"],
+                r"^[0-9a-f]{40}$",
+            )
+        self.assertTrue(tools["verify_development_job"].annotations.openWorldHint)
+        self.assertFalse(
+            tools["commit_verified_development_job"].annotations.openWorldHint
+        )
+        commit_schema = tools["commit_verified_development_job"].parameters
+        self.assertEqual(
+            commit_schema["properties"]["verification_id"]["pattern"],
+            r"^[0-9a-f]{32}$",
+        )
+        self.assertEqual(
+            commit_schema["properties"]["expected_diff_fingerprint"]["pattern"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertEqual(commit_schema["properties"]["paths"]["minItems"], 1)
+        self.assertEqual(commit_schema["properties"]["paths"]["maxItems"], 500)
+        self.assertNotIn("command", tools["verify_development_job"].parameters["properties"])
 
     def test_writer_and_development_jobs_share_the_project_modifying_lock(self) -> None:
         class BlockingWriter:

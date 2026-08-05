@@ -115,14 +115,14 @@ pushed to `feature/updatingCapabilities` at
 `9cee986b4b62db6fc26e974642754793f7f71776`, and the MCPB-003 tools were
 confirmed through the live connector before MCPB-004 implementation.
 
-### MCPB-004 — Isolated development (implemented locally; pending acceptance)
+### MCPB-004 — Isolated development (complete)
 
 Read these files completely before review or further implementation:
 
 - `docs/MCPB-004-IMPLEMENTATION-BRIEF.md`
 - `docs/NEXT-SESSION-MCPB-004.md`
 
-The prepared MCPB-004 source adds:
+The accepted MCPB-004 source adds:
 
 - per-job Git worktrees;
 - clean-baseline checks;
@@ -132,13 +132,20 @@ The prepared MCPB-004 source adds:
 - candidate server health check on a separate port;
 - no autonomous production overwrite, restart, merge, or rollback switch.
 
-The prepared package version is `0.4.0`. It has not been committed, pushed,
-installed on the live bridge, or exercised through a modifying live connector.
-Do not begin MCPB-005 until the user accepts this milestone.
+The package version is `0.4.0`; 51 core tests passed. The accepted source was
+pushed to `feature/updatingCapabilities` at
+`ca63a64f207c8e59207995b467244a98a5b92d4d`. The live connector exposed the
+MCPB-004 lifecycle tools, but the self-managed project was not yet enabled for
+a modifying live job.
 
-### MCPB-005 — Verification and commit (planned)
+### MCPB-005 — Verification and commit (implemented locally; pending acceptance)
 
-Implement only after MCPB-004 is accepted:
+Read these files completely before review or further implementation:
+
+- `docs/MCPB-005-IMPLEMENTATION-BRIEF.md`
+- `docs/NEXT-SESSION-MCPB-005.md`
+
+The prepared MCPB-005 source adds:
 
 - deterministic, fixed/allowlisted verification commands;
 - structured verification evidence and diff fingerprints;
@@ -147,6 +154,11 @@ Implement only after MCPB-004 is accepted:
 - expected-HEAD and allowed-path checks;
 - separate human approval before commit;
 - no unrestricted Bash, push, merge, tag, or branch publication.
+
+The prepared package version is `0.5.0`. It has not been committed, pushed,
+installed, restarted, or exercised through a modifying live connector. The
+source checkout remains unchanged; verification and commits operate only on
+retained detached job worktrees.
 
 The intended closure flow is:
 
@@ -241,13 +253,12 @@ core tests and must be identified as such. Do not fabricate their results.
 
 ## Current resume pointer
 
-Resume by reviewing and accepting **MCPB-004** using:
+Resume by reviewing and accepting **MCPB-005** using:
 
 ```text
-docs/NEXT-SESSION-MCPB-004.md
-docs/MCPB-004-IMPLEMENTATION-BRIEF.md
+docs/NEXT-SESSION-MCPB-005.md
+docs/MCPB-005-IMPLEMENTATION-BRIEF.md
 ```
 
-When MCPB-004 is accepted, write the MCPB-005 implementation brief from the
-accepted decisions and actual MCPB-004 source, then update this pointer without
-deleting the historical phase documents.
+After acceptance, explicitly authorize any desired commit/push, live
+installation/restart, or real self-managed smoke test as separate actions.

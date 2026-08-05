@@ -14,6 +14,7 @@ from .models import Effort, ProjectCapability
 from .reader import RepositoryReader
 from .registry import ProjectLockManager, ProjectRegistry
 from .writer import RepositoryWriter, WriteMode
+from .verification import VerificationCommitManager
 
 
 def create_server(
@@ -24,6 +25,7 @@ def create_server(
     writer: RepositoryWriter | None = None,
     locks: ProjectLockManager | None = None,
     jobs: DevelopmentJobManager | None = None,
+    verification: VerificationCommitManager | None = None,
 ) -> FastMCP:
     active_settings = settings or Settings.from_env()
     active_registry = registry or ProjectRegistry.load(
@@ -39,6 +41,12 @@ def create_server(
         active_executor,
         projects=active_registry.projects(),
     )
+    active_verification = verification or VerificationCommitManager(
+        active_settings,
+        active_locks,
+        active_jobs,
+        projects=active_registry.projects(),
+    )
 
     mcp = FastMCP(
         name="Local Development Bridge",
@@ -49,7 +57,10 @@ def create_server(
             "routine work and ultracode only for complex architecture, difficult "
             "reasoning, migrations, or substantial cross-module implementation. "
             "An explicit user effort choice wins. Development jobs may modify only "
-            "their bridge-created detached worktrees."
+            "their bridge-created detached worktrees. Verification may run only "
+            "registry-configured commands. Never commit until the user separately "
+            "approves the exact verification evidence, paths, and message. Detached "
+            "commits are not published or promoted."
         ),
     )
 
@@ -453,6 +464,124 @@ def create_server(
     ) -> dict[str, Any]:
         project = active_registry.resolve(project_id, ProjectCapability.CLAUDE_EDIT)
         return await active_jobs.cancel(project, job_id)
+
+    @mcp.tool(
+        name="verify_development_job",
+        description=(
+            "Run only the fixed verification commands configured for a completed "
+            "retained development job. Success binds structured command evidence "
+            "to the exact base HEAD, changed paths, and candidate fingerprint. "
+            "The caller cannot supply a command, argument, environment, or path."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=False,
+            openWorldHint=True,
+        ),
+    )
+    async def verify_development_job(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        job_id: Annotated[
+            str,
+            Field(
+                description="Opaque completed job ID returned by send_to_local_dev.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+        expected_head: Annotated[
+            str,
+            Field(
+                description="Exact lowercase base HEAD reported for the retained job.",
+                pattern=r"^[0-9a-f]{40}$",
+            ),
+        ],
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.VERIFICATION_COMMIT
+        )
+        return await active_verification.verify(project, job_id, expected_head)
+
+    @mcp.tool(
+        name="commit_verified_development_job",
+        description=(
+            "After separate human approval, create one detached commit from the "
+            "exact unchanged state that passed verify_development_job. Requires "
+            "the verification ID, base HEAD, fingerprint, and complete ordered "
+            "path list. It never updates a branch, pushes, merges, tags, promotes, "
+            "or restarts production."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=False,
+            openWorldHint=False,
+        ),
+    )
+    async def commit_verified_development_job(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        job_id: Annotated[
+            str,
+            Field(
+                description="Opaque completed job ID returned by send_to_local_dev.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+        verification_id: Annotated[
+            str,
+            Field(
+                description="Single-use ID returned by a successful verification.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+        expected_head: Annotated[
+            str,
+            Field(
+                description="Exact lowercase base HEAD from verification evidence.",
+                pattern=r"^[0-9a-f]{40}$",
+            ),
+        ],
+        expected_diff_fingerprint: Annotated[
+            str,
+            Field(
+                description="Exact lowercase SHA-256 from verification evidence.",
+                pattern=r"^[0-9a-f]{64}$",
+            ),
+        ],
+        paths: Annotated[
+            list[str],
+            Field(
+                description=(
+                    "Complete ordered changed-path list from verification evidence; "
+                    "the server requires exact equality and stages only these paths."
+                ),
+                min_length=1,
+                max_length=500,
+            ),
+        ],
+        message: Annotated[
+            str,
+            Field(description="Human-approved commit message.", min_length=1),
+        ],
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.VERIFICATION_COMMIT
+        )
+        return await active_verification.commit(
+            project,
+            job_id,
+            verification_id,
+            expected_head,
+            expected_diff_fingerprint,
+            paths,
+            message,
+        )
 
     return mcp
 

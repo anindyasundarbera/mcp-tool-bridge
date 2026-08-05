@@ -21,6 +21,8 @@ EXPECTED_CANDIDATE_TOOLS = frozenset(
         "get_development_job",
         "resume_development_job",
         "cancel_development_job",
+        "verify_development_job",
+        "commit_verified_development_job",
     }
 )
 

@@ -28,8 +28,8 @@ async def main(project_id: str, endpoint: str) -> None:
             {
                 "project_id": project_id,
                 "text": (
-                    "This is an MCPB-004 connectivity test. Do not inspect or "
-                    "modify files and do not use tools. Respond exactly: MCPB_004_OK"
+                    "This is an MCPB-005 connectivity test. Do not inspect or "
+                    "modify files and do not use tools. Respond exactly: MCPB_005_OK"
                 ),
                 "effort": "high",
             },

@@ -1,11 +1,11 @@
 # Local Development MCP v2
 
-This is the MCPB-004 project-aware ChatGPT-to-Claude Code development bridge.
+This is the MCPB-005 project-aware ChatGPT-to-Claude Code development bridge.
 ChatGPT addresses projects by stable `project_id`; the server resolves those
 IDs through a local allowlist and never accepts an arbitrary filesystem root,
 worktree path, or Claude session ID from a tool call.
 
-## Capabilities through MCPB-004
+## Capabilities through MCPB-005
 
 - Validated multi-project registry and exact capability authorization
 - Safe project discovery and Git status
@@ -21,12 +21,15 @@ worktree path, or Claude session ID from a tool call.
   session
 - Self-managed candidates started temporarily on a separate localhost port and
   health-checked through MCP
+- Registry-fixed verification commands with bounded structured evidence
+- SHA-256 candidate fingerprints bound to base HEAD and exact changed paths
+- Separate human-approved detached commits of only the unchanged verified state
+- Exact staging with `git add -- <paths>`; hooks, signing, and ref updates disabled
 - Existing Claude `acceptEdits` boundary with Bash, web, secondary MCP tools,
   slash commands, and `bypassPermissions` disabled
 
-Deterministic project verification, diff fingerprints, staging, commits,
-candidate promotion, restart, push, merge, and rollback switching remain
-deferred to MCPB-005 or later explicit authorization.
+Candidate promotion, production restart, branch/ref updates, push, merge, tags,
+worktree deletion, and rollback switching remain outside bridge authority.
 
 ## MCP tools
 
@@ -51,11 +54,16 @@ Isolated development lifecycle:
   callers provide the job ID, never a raw session ID.
 - `cancel_development_job` stops a queued or running job while retaining its
   worktree and candidate changes.
+- `verify_development_job` runs only the fixed command vectors configured for
+  the project, then binds passing evidence to the exact unchanged candidate.
+- `commit_verified_development_job` creates one detached commit only after a
+  separate human approval repeats the verification ID, HEAD, fingerprint, and
+  complete ordered path list.
 
 Job states are `queued`, `preparing_worktree`, `running`, optionally
 `validating_candidate`, and one of `completed`, `failed`, `timed_out`, or
-`cancelled`. Job records live in memory for MCPB-004. Restarting the server
-invalidates their IDs and resume authority but does not delete worktrees.
+`cancelled`. Job and verification records live in memory. Restarting the server
+invalidates their IDs and authority but does not delete retained worktrees.
 
 ## Isolation rules
 
@@ -68,13 +76,36 @@ JOB_WORKTREE_ROOT/<project_id>/<job_id>
 ```
 
 The worktree root must be private, symlink-free, and outside every configured
-project. Claude runs only in that detached worktree. Worktrees are retained for
-review and the MCPB-005 verification/commit workflow; MCPB-004 exposes no
-worktree deletion operation.
+project. Claude, verification, and any detached commit operate only in that
+worktree. Worktrees remain retained; the bridge exposes no deletion operation.
 
 All modifying bridge operations for one project use the same lock, so a
 Markdown write cannot overlap a Claude job. Jobs for different projects can run
 independently.
+
+## Verification and commit policy
+
+Projects opt in with `verification_commit`, `commit_roots`, and one or more
+`verification_commands`. These settings live only in the local registry. MCP
+callers cannot supply commands, arguments, environment variables, timeouts,
+working directories, or authorization roots. Commands use exact argv vectors
+without a shell; `{python}` means the interpreter running the bridge, and an
+optional relative `python_path` becomes a confined `PYTHONPATH`.
+
+Verification requires a completed retained job, a clean unchanged source
+checkout at the job's base HEAD, an empty candidate index, and changed paths
+that are symlink-free, outside protected paths, and beneath `commit_roots`.
+Hidden paths require a matching explicit hidden `commit_roots` entry; a broad
+`.` root does not authorize them.
+Every command must pass without changing the candidate. Output is bounded and
+hashed. Success returns a single-use verification ID, the exact changed paths,
+and a fingerprint covering the baseline and current file bytes/modes.
+
+Commit is a separate destructive call. The supplied verification ID, base
+HEAD, fingerprint, ordered path list, and commit message must match exactly.
+The bridge rechecks the candidate, stages only `git add -- <paths>`, proves the
+index content matches verification, disables hooks and signing, and creates a
+commit on detached HEAD. It never creates or updates a branch or remote ref.
 
 ## Self-managed bridge candidates
 
@@ -107,6 +138,9 @@ production.
 | `MAX_MARKDOWN_DIFF_BYTES` | 262,144 | Maximum returned writer diff |
 | `GIT_COMMAND_TIMEOUT_SECONDS` | 30 | Maximum fixed Git command time |
 | `CANDIDATE_HEALTH_TIMEOUT_SECONDS` | 30 | Candidate startup/probe deadline |
+| `VERIFICATION_COMMAND_TIMEOUT_SECONDS` | 600 | Per-command verification deadline |
+| `MAX_VERIFICATION_OUTPUT_BYTES` | 1,048,576 | Captured stdout/stderr per stream |
+| `MAX_COMMIT_MESSAGE_CHARS` | 500 | Maximum approved commit message length |
 
 `MCP_PORT` defaults to `8000`; `CANDIDATE_MCP_PORT` defaults to `8001` and must
 differ. `JOB_WORKTREE_ROOT` defaults to

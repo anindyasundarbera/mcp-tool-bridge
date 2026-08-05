@@ -83,6 +83,7 @@ class DevelopmentJob:
     result: dict[str, Any] | None = None
     candidate: dict[str, Any] | None = None
     error: str | None = None
+    committed_sha: str | None = None
     task: asyncio.Task[None] | None = None
 
 
@@ -156,6 +157,7 @@ class DevelopmentJobManager:
                 job.session_id is not None
                 and job.worktree is not None
                 and job.status in TERMINAL_STATUSES
+                and job.committed_sha is None
             ),
         }
         if job.worktree is not None:
@@ -166,6 +168,8 @@ class DevelopmentJobManager:
             snapshot["candidate"] = job.candidate
         if job.error is not None:
             snapshot["error"] = job.error
+        if job.committed_sha is not None:
+            snapshot["commit_sha"] = job.committed_sha
         return snapshot
 
     def _require_job(
@@ -220,6 +224,8 @@ class DevelopmentJobManager:
             job = self._require_job(project, job_id)
             if job.status not in TERMINAL_STATUSES or job.task is not None:
                 raise DevelopmentJobError("only a terminal development job can resume")
+            if job.committed_sha is not None:
+                raise DevelopmentJobError("a committed development job cannot resume")
             if job.session_id is None:
                 raise DevelopmentJobError(
                     "job has no bridge-created Claude session to resume"
@@ -263,6 +269,37 @@ class DevelopmentJobManager:
                 job.task = None
                 job.updated_at = _timestamp()
         return await self.get(project, job_id)
+
+    async def verification_worktree(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+    ) -> JobWorktree:
+        async with self._state_lock:
+            job = self._require_job(project, job_id)
+            if job.status != JobStatus.COMPLETED or job.task is not None:
+                raise DevelopmentJobError(
+                    "only a completed inactive development job can be verified"
+                )
+            if job.committed_sha is not None:
+                raise DevelopmentJobError("development job is already committed")
+            if job.worktree is None:
+                raise DevelopmentJobError("job has no retained worktree")
+            return job.worktree
+
+    async def record_commit(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        commit_sha: str,
+    ) -> None:
+        async with self._state_lock:
+            job = self._require_job(project, job_id)
+            if job.committed_sha is not None:
+                raise DevelopmentJobError("development job is already committed")
+            job.committed_sha = commit_sha
+            job.session_id = None
+            job.updated_at = _timestamp()
 
     async def _set_status(
         self,

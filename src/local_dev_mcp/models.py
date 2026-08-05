@@ -14,6 +14,7 @@ class ProjectCapability(StrEnum):
     REPOSITORY_READ = "repository_read"
     MARKDOWN_WRITE = "markdown_write"
     CLAUDE_EDIT = "claude_edit"
+    VERIFICATION_COMMIT = "verification_commit"
 
 
 def _policy_path(value: str) -> str:
@@ -22,6 +23,57 @@ def _policy_path(value: str) -> str:
     if not normalized or path.is_absolute() or ".." in path.parts:
         raise ValueError("policy paths must be non-empty relative paths without '..'")
     return path.as_posix()
+
+
+class VerificationCommand(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    argv: tuple[str, ...]
+    python_path: tuple[str, ...] = ()
+
+    @field_validator("argv", mode="before")
+    @classmethod
+    def validate_argv(cls, value: object) -> tuple[str, ...]:
+        if isinstance(value, (str, bytes)) or value is None:
+            raise ValueError("verification argv must be a list of arguments")
+        arguments = tuple(str(item) for item in value)  # type: ignore[arg-type]
+        if not 1 <= len(arguments) <= 64:
+            raise ValueError("verification argv must contain 1 through 64 arguments")
+        for argument in arguments:
+            if not argument or len(argument) > 2000 or "\x00" in argument:
+                raise ValueError(
+                    "verification arguments must be non-empty, NUL-free, and at "
+                    "most 2000 characters"
+                )
+        if "{python}" in arguments[1:]:
+            raise ValueError("{python} is allowed only as the verification executable")
+        executable = PurePosixPath(arguments[0].replace("\\", "/")).name.lower()
+        if executable.removesuffix(".exe") in {
+            "sh",
+            "bash",
+            "dash",
+            "zsh",
+            "ksh",
+            "fish",
+            "powershell",
+            "pwsh",
+            "cmd",
+        }:
+            raise ValueError("verification commands must not invoke a shell")
+        return arguments
+
+    @field_validator("python_path", mode="before")
+    @classmethod
+    def validate_python_path(cls, value: object) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if isinstance(value, (str, bytes)):
+            raise ValueError("python_path must be a list of relative directories")
+        paths = tuple(_policy_path(str(item)) for item in value)  # type: ignore[arg-type]
+        if len(paths) > 16:
+            raise ValueError("python_path may contain at most 16 entries")
+        return paths
 
 
 class ProjectPolicy(BaseModel):
@@ -35,6 +87,8 @@ class ProjectPolicy(BaseModel):
     require_git: bool = True
     capabilities: frozenset[ProjectCapability]
     markdown_write_roots: tuple[str, ...] = ()
+    commit_roots: tuple[str, ...] = ()
+    verification_commands: tuple[VerificationCommand, ...] = ()
     protected_paths: tuple[str, ...] = (".git", ".env")
     default_effort: Effort = "high"
     allow_ultracode: bool = True
@@ -50,7 +104,9 @@ class ProjectPolicy(BaseModel):
             raise ValueError("project root must be absolute")
         return path
 
-    @field_validator("markdown_write_roots", "protected_paths", mode="before")
+    @field_validator(
+        "markdown_write_roots", "commit_roots", "protected_paths", mode="before"
+    )
     @classmethod
     def validate_policy_paths(cls, value: object) -> tuple[str, ...]:
         if value is None:
@@ -81,6 +137,20 @@ class ProjectPolicy(BaseModel):
             and not self.markdown_write_roots
         ):
             raise ValueError("markdown_write requires at least one approved write root")
+        if ProjectCapability.VERIFICATION_COMMIT in self.capabilities:
+            if ProjectCapability.CLAUDE_EDIT not in self.capabilities:
+                raise ValueError("verification_commit requires claude_edit")
+            if not self.commit_roots:
+                raise ValueError(
+                    "verification_commit requires at least one approved commit root"
+                )
+            if not self.verification_commands:
+                raise ValueError(
+                    "verification_commit requires at least one verification command"
+                )
+        command_ids = [command.id for command in self.verification_commands]
+        if len(command_ids) != len(set(command_ids)):
+            raise ValueError("verification command IDs must be unique per project")
         return self
 
     def public_metadata(self) -> dict[str, object]:

@@ -51,6 +51,9 @@ class Settings:
     git_command_timeout_seconds: int
     candidate_mcp_port: int
     candidate_health_timeout_seconds: int
+    verification_command_timeout_seconds: int
+    max_verification_output_bytes: int
+    max_commit_message_chars: int
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str] | None = None) -> "Settings":
@@ -111,5 +114,14 @@ class Settings:
             candidate_mcp_port=candidate_mcp_port,
             candidate_health_timeout_seconds=_positive_int(
                 env, "CANDIDATE_HEALTH_TIMEOUT_SECONDS", 30
+            ),
+            verification_command_timeout_seconds=_positive_int(
+                env, "VERIFICATION_COMMAND_TIMEOUT_SECONDS", 600
+            ),
+            max_verification_output_bytes=_positive_int(
+                env, "MAX_VERIFICATION_OUTPUT_BYTES", 1048576
+            ),
+            max_commit_message_chars=_positive_int(
+                env, "MAX_COMMIT_MESSAGE_CHARS", 500
             ),
         )

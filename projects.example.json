@@ -34,7 +34,8 @@
       "require_git": true,
       "capabilities": [
         "repository_read",
-        "claude_edit"
+        "claude_edit",
+        "verification_commit"
       ],
       "markdown_write_roots": [
         "docs"
@@ -44,6 +45,28 @@
         ".env",
         ".venv",
         "openai-connectors-mtls-ca.pem"
+      ],
+      "commit_roots": [
+        ".",
+        ".env.example",
+        ".gitignore"
+      ],
+      "verification_commands": [
+        {
+          "id": "core-tests",
+          "argv": [
+            "{python}",
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "tests",
+            "-v"
+          ],
+          "python_path": [
+            "src"
+          ]
+        }
       ],
       "default_effort": "high",
       "allow_ultracode": true,

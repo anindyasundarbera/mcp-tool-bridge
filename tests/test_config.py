@@ -17,6 +17,9 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.git_command_timeout_seconds, 30)
         self.assertEqual(settings.candidate_mcp_port, 8001)
         self.assertEqual(settings.candidate_health_timeout_seconds, 30)
+        self.assertEqual(settings.verification_command_timeout_seconds, 600)
+        self.assertEqual(settings.max_verification_output_bytes, 1048576)
+        self.assertEqual(settings.max_commit_message_chars, 500)
         self.assertTrue(settings.projects_config_path.is_absolute())
         self.assertEqual(settings.projects_config_path.name, "projects.json")
 
@@ -31,6 +34,12 @@ class SettingsTests(unittest.TestCase):
             Settings.from_env({"MCP_PORT": "9000", "CANDIDATE_MCP_PORT": "9000"})
         with self.assertRaisesRegex(RuntimeError, "at most 65535"):
             Settings.from_env({"CANDIDATE_MCP_PORT": "65536"})
+        with self.assertRaisesRegex(RuntimeError, "greater than zero"):
+            Settings.from_env({"VERIFICATION_COMMAND_TIMEOUT_SECONDS": "0"})
+        with self.assertRaisesRegex(RuntimeError, "greater than zero"):
+            Settings.from_env({"MAX_VERIFICATION_OUTPUT_BYTES": "0"})
+        with self.assertRaisesRegex(RuntimeError, "greater than zero"):
+            Settings.from_env({"MAX_COMMIT_MESSAGE_CHARS": "0"})
 
     def test_accepts_absolute_config_path(self) -> None:
         settings = Settings.from_env({"PROJECTS_CONFIG_PATH": "/tmp/projects.json"})

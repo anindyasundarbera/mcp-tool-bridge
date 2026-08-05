@@ -136,6 +136,87 @@ class ProjectRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectRegistryError, "policy paths"):
             ProjectRegistry.load(config)
 
+    def test_verification_commit_requires_fixed_commands_roots_and_claude(self) -> None:
+        repository = self.root / "repo"
+        initialize_git_repository(repository)
+        config = self.root / "projects.json"
+        valid = project_payload(
+            repository,
+            capabilities=[
+                "repository_read",
+                "claude_edit",
+                "verification_commit",
+            ],
+            commit_roots=["."],
+            verification_commands=[
+                {
+                    "id": "core",
+                    "argv": ["{python}", "-m", "unittest"],
+                    "python_path": ["src"],
+                }
+            ],
+        )
+        write_registry(config, [valid])
+        project = ProjectRegistry.load(config).resolve(
+            "test-project", ProjectCapability.VERIFICATION_COMMIT
+        )
+        self.assertEqual(project.commit_roots, (".",))
+        self.assertEqual(project.verification_commands[0].id, "core")
+        self.assertNotIn("verification_commands", project.public_metadata())
+
+        for update, expected in (
+            ({"commit_roots": []}, "approved commit root"),
+            ({"verification_commands": []}, "verification command"),
+            (
+                {"capabilities": ["repository_read", "verification_commit"]},
+                "requires claude_edit",
+            ),
+            (
+                {
+                    "verification_commands": [
+                        {"id": "core", "argv": ["python"]},
+                        {"id": "core", "argv": ["python", "-V"]},
+                    ]
+                },
+                "IDs must be unique",
+            ),
+        ):
+            with self.subTest(update=update):
+                payload = dict(valid)
+                payload.update(update)
+                write_registry(config, [payload])
+                with self.assertRaisesRegex(ProjectRegistryError, expected):
+                    ProjectRegistry.load(config)
+
+    def test_rejects_invalid_verification_command_vectors(self) -> None:
+        repository = self.root / "repo"
+        initialize_git_repository(repository)
+        config = self.root / "projects.json"
+        base = project_payload(
+            repository,
+            capabilities=["repository_read", "claude_edit", "verification_commit"],
+            commit_roots=["."],
+        )
+        for commands, expected in (
+            ([{"id": "core", "argv": []}], "1 through 64"),
+            ([{"id": "core", "argv": "python"}], "list of arguments"),
+            (
+                [{"id": "core", "argv": ["python", "{python}"]}],
+                "only as the verification executable",
+            ),
+            ([{"id": "core", "argv": ["bash", "-c", "true"]}], "must not invoke a shell"),
+            (
+                [{"id": "core", "argv": ["python"], "python_path": ["../src"]}],
+                "policy paths",
+            ),
+        ):
+            with self.subTest(commands=commands):
+                payload = dict(base)
+                payload["verification_commands"] = commands
+                write_registry(config, [payload])
+                with self.assertRaisesRegex(ProjectRegistryError, expected):
+                    ProjectRegistry.load(config)
+
 
 if __name__ == "__main__":
     unittest.main()
