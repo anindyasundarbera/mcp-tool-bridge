@@ -1,4 +1,12 @@
 .env
 .venv/
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.coverage
+dist/
+build/
+*.egg-info/
+projects.json
+openai-connectors-mtls-ca.pem
+

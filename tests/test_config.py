@@ -1,0 +1,50 @@
+import unittest
+from pathlib import Path
+
+from local_dev_mcp.config import Settings
+
+
+class SettingsTests(unittest.TestCase):
+    def test_defaults_and_relative_registry_resolution(self) -> None:
+        settings = Settings.from_env({})
+        self.assertEqual(settings.claude_model, "glm-5.2:cloud")
+        self.assertEqual(settings.mcp_port, 8000)
+        self.assertEqual(settings.max_markdown_file_bytes, 1048576)
+        self.assertEqual(settings.max_markdown_range_lines, 1000)
+        self.assertEqual(settings.max_markdown_write_bytes, 1048576)
+        self.assertEqual(settings.max_markdown_diff_bytes, 262144)
+        self.assertEqual(settings.job_worktree_root.name, "worktrees")
+        self.assertEqual(settings.git_command_timeout_seconds, 30)
+        self.assertEqual(settings.candidate_mcp_port, 8001)
+        self.assertEqual(settings.candidate_health_timeout_seconds, 30)
+        self.assertEqual(settings.verification_command_timeout_seconds, 600)
+        self.assertEqual(settings.max_verification_output_bytes, 1048576)
+        self.assertEqual(settings.max_commit_message_chars, 500)
+        self.assertTrue(settings.projects_config_path.is_absolute())
+        self.assertEqual(settings.projects_config_path.name, "projects.json")
+
+    def test_rejects_non_positive_limits(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "greater than zero"):
+            Settings.from_env({"CLAUDE_MAX_TURNS": "0"})
+        with self.assertRaisesRegex(RuntimeError, "MAX_MARKDOWN_WRITE_BYTES"):
+            Settings.from_env({"MAX_MARKDOWN_WRITE_BYTES": "not-an-integer"})
+        with self.assertRaisesRegex(RuntimeError, "greater than zero"):
+            Settings.from_env({"MAX_MARKDOWN_DIFF_BYTES": "0"})
+        with self.assertRaisesRegex(RuntimeError, "must differ"):
+            Settings.from_env({"MCP_PORT": "9000", "CANDIDATE_MCP_PORT": "9000"})
+        with self.assertRaisesRegex(RuntimeError, "at most 65535"):
+            Settings.from_env({"CANDIDATE_MCP_PORT": "65536"})
+        with self.assertRaisesRegex(RuntimeError, "greater than zero"):
+            Settings.from_env({"VERIFICATION_COMMAND_TIMEOUT_SECONDS": "0"})
+        with self.assertRaisesRegex(RuntimeError, "greater than zero"):
+            Settings.from_env({"MAX_VERIFICATION_OUTPUT_BYTES": "0"})
+        with self.assertRaisesRegex(RuntimeError, "greater than zero"):
+            Settings.from_env({"MAX_COMMIT_MESSAGE_CHARS": "0"})
+
+    def test_accepts_absolute_config_path(self) -> None:
+        settings = Settings.from_env({"PROJECTS_CONFIG_PATH": "/tmp/projects.json"})
+        self.assertEqual(settings.projects_config_path, Path("/tmp/projects.json"))
+
+
+if __name__ == "__main__":
+    unittest.main()
