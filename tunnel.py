@@ -12,6 +12,9 @@ load_dotenv(ROOT / ".env")
 
 NGROK_AUTHTOKEN = os.environ["NGROK_AUTHTOKEN"]
 MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
+# Optional reserved ngrok domain (e.g. "swivel-aide-overprice.ngrok-free.dev").
+# When unset, ngrok hands out an ephemeral URL that changes every run.
+NGROK_DOMAIN = os.getenv("NGROK_DOMAIN")
 CA_PATH = Path(
     os.getenv("OPENAI_MTLS_CA_PATH", "openai-connectors-mtls-ca.pem")
 ).expanduser()
@@ -39,15 +42,20 @@ traffic_policy = {
     ]
 }
 
-listener = ngrok.forward(
-    MCP_PORT,
-    authtoken=NGROK_AUTHTOKEN,
-    traffic_policy=json.dumps(traffic_policy),
-)
+forward_kwargs = {
+    "authtoken": NGROK_AUTHTOKEN,
+    "traffic_policy": json.dumps(traffic_policy),
+}
+if NGROK_DOMAIN:
+    forward_kwargs["domain"] = NGROK_DOMAIN
+
+listener = ngrok.forward(MCP_PORT, **forward_kwargs)
 public_url = listener.url().rstrip("/")
 
 print()
 print("Protected ngrok endpoint established")
+if NGROK_DOMAIN:
+    print(f"Reserved domain: {NGROK_DOMAIN}")
 print(f"MCP connector URL: {public_url}/mcp")
 print("Press Ctrl+C to close the endpoint.")
 
