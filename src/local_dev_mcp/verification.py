@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import secrets
 import signal
@@ -12,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
+from . import store
 from .config import Settings
 from .git import GitCommandError, run_git
 from .jobs import DevelopmentJobError, DevelopmentJobManager
@@ -264,6 +266,52 @@ class VerificationRecord:
     verified_at: str
     commands: tuple[dict[str, Any], ...]
     used: bool = False
+
+
+def _record_json_loads(value: str | None) -> Any:
+    if value is None:
+        return None
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def record_to_row(record: VerificationRecord) -> dict[str, Any]:
+    """Serialize a verification record to a dict row for the durable store."""
+    return {
+        "verification_id": record.verification_id,
+        "project_id": record.project_id,
+        "job_id": record.job_id,
+        "base_head": record.base_head,
+        "diff_fingerprint": record.diff_fingerprint,
+        "paths_json": json.dumps(list(record.paths), ensure_ascii=False),
+        "verified_at": record.verified_at,
+        "used": 1 if record.used else 0,
+        "commands_json": json.dumps(list(record.commands), ensure_ascii=False),
+    }
+
+
+def record_from_row(row: dict[str, Any]) -> VerificationRecord | None:
+    """Rebuild a verification record from a dict row, or None if unparseable."""
+    paths = _record_json_loads(row.get("paths_json"))
+    commands = _record_json_loads(row.get("commands_json"))
+    if not isinstance(paths, list) or not isinstance(commands, list):
+        return None
+    try:
+        return VerificationRecord(
+            verification_id=row["verification_id"],
+            project_id=row["project_id"],
+            job_id=row["job_id"],
+            base_head=row["base_head"],
+            diff_fingerprint=row["diff_fingerprint"],
+            paths=tuple(paths),
+            verified_at=row["verified_at"],
+            commands=tuple(commands),
+            used=bool(row.get("used", 0)),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 async def _candidate_state(
@@ -605,6 +653,27 @@ class VerificationCommitManager:
         self._project_roots = tuple(project.root for project in projects)
         self._records: dict[str, VerificationRecord] = {}
         self._records_lock = asyncio.Lock()
+        # Durable state: re-hydrate verification records from disk so a restart
+        # does not invalidate the single-use verification authority a caller
+        # may still be holding. Opens a second connection to the same database
+        # the jobs manager uses; WAL serializes the two writers safely.
+        self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+        self._reload_records()
+
+    def _reload_records(self) -> None:
+        """Load persisted verification records, skipping unparseable rows."""
+        for row in store.load_record_rows(self._db):
+            record = record_from_row(row)
+            if record is not None:
+                self._records[record.verification_id] = record
+
+    def _persist_record(self, record: VerificationRecord) -> None:
+        """Persist one verification record as a single ACID transaction.
+
+        Call this inside ``async with self._records_lock`` after mutating a
+        record so the durable store mirrors the in-memory state.
+        """
+        store.upsert_record_row(self._db, record_to_row(record))
 
     def _new_verification_id(self) -> str:
         for _ in range(10):
@@ -679,6 +748,7 @@ class VerificationCommitManager:
             )
             async with self._records_lock:
                 self._records[record.verification_id] = record
+                self._persist_record(record)
             response["verification_id"] = record.verification_id
             response["verified_at"] = record.verified_at
             return response
@@ -891,6 +961,7 @@ class VerificationCommitManager:
 
             async with self._records_lock:
                 record.used = True
+                self._persist_record(record)
             await self._jobs.record_commit(project, job_id, new_head)
             return {
                 "status": "committed",

@@ -62,8 +62,9 @@ Isolated development lifecycle:
 
 Job states are `queued`, `preparing_worktree`, `running`, optionally
 `validating_candidate`, and one of `completed`, `failed`, `timed_out`, or
-`cancelled`. Job and verification records live in memory. Restarting the server
-invalidates their IDs and authority but does not delete retained worktrees.
+`cancelled`. Job and verification records are persisted durably to a local
+SQLite database (see [Durable state](#durable-state)) so a server restart
+re-hydrates them instead of wiping them.
 
 ## Isolation rules
 
@@ -82,6 +83,37 @@ worktree. Worktrees remain retained; the bridge exposes no deletion operation.
 All modifying bridge operations for one project use the same lock, so a
 Markdown write cannot overlap a Claude job. Jobs for different projects can run
 independently.
+
+## Durable state
+
+Job and verification records persist to a single local SQLite database so a
+server restart no longer amnesiates in-flight or completed work:
+
+```text
+JOB_WORKTREE_ROOT/.state/bridge.db
+```
+
+The `.state` directory is private (`0o700`) and lives under the same
+bridge-owned worktree root, outside every configured project. The database file
+is `0o600`, opened with WAL journaling and `synchronous=FULL` so each state
+transition commits crash-safely. On startup each manager re-hydrates its records
+synchronously before the event loop starts.
+
+Reconciliation is honest, not magical: a job that was not terminal when the
+previous process died is reloaded as `failed` (`bridge restarted while job was
+in progress`), because its asyncio task and Claude process are gone and cannot
+be reattached. A terminal job whose retained worktree directory has since
+vanished is reloaded as `failed` (`job worktree no longer exists`). Completed
+jobs with a surviving worktree and a bridge-captured Claude `session_id` remain
+resumable across restarts, and single-use verification IDs remain valid for a
+later commit. Unparseable rows are skipped (fail-closed) so one corrupt record
+never blocks startup. A database whose stored schema version is newer than this
+code supports is refused on open to avoid silent data loss.
+
+The bridge does not auto-prune an orphaned worktree whose row is missing or
+corrupt; manual cleanup is `git -C <project> worktree remove --force <path>`.
+Run only one bridge process per `JOB_WORKTREE_ROOT`; two processes would race on
+the same database.
 
 ## Verification and commit policy
 

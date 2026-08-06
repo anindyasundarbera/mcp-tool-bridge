@@ -45,7 +45,7 @@ Build a secure, multi-project MCP bridge through which ChatGPT can:
 - verify changes deterministically; and
 - commit only reviewed, verified, explicitly authorized paths.
 
-The final deliverable after MCPB-005 is a reviewed source package and ZIP. Each
+The final deliverable after MCPB-006 is a reviewed source package and ZIP. Each
 phase must remain independently testable and serve as the baseline for the next.
 
 ## Phase roadmap
@@ -63,6 +63,7 @@ conversation.
 | MCPB-003 — Markdown Writer | Restricted relative paths; create/update modes; SHA-256 concurrency control; protected-path enforcement; structured diff response. |
 | MCPB-004 — Isolated development | Per-job Git worktrees; clean-baseline checks; job status/cancellation; candidate handling for self-updates. |
 | MCPB-005 — Verification and commit | Fixed verification commands; diff fingerprints; explicit staging paths; human-approved commits; no unrestricted Bash. |
+| MCPB-006 — Durable state | SQLite-backed job and verification persistence; restart re-hydration; honest mid-flight reconciliation; no new tools or permissions. |
 
 The detailed sections below refine how to implement and verify these accepted
 items. They do not expand the authority of a phase. Supporting tests,
@@ -138,7 +139,7 @@ pushed to `feature/updatingCapabilities` at
 MCPB-004 lifecycle tools, but the self-managed project was not yet enabled for
 a modifying live job.
 
-### MCPB-005 — Verification and commit (implemented locally; pending acceptance)
+### MCPB-005 — Verification and commit (complete)
 
 Read these files completely before review or further implementation:
 
@@ -173,6 +174,35 @@ develop in isolated worktree
 
 After MCPB-005, run the complete verification and archive audit, then prepare
 the final ZIP requested by the user.
+
+### MCPB-006 — Durable state (implemented locally; pending acceptance)
+
+Read these files completely before review or further implementation:
+
+- `docs/MCPB-006-IMPLEMENTATION-BRIEF.md`
+- `docs/NEXT-SESSION-MCPB-006.md`
+
+The prepared MCPB-006 source adds:
+
+- a focused SQLite persistence layer (`src/local_dev_mcp/store.py`, stdlib
+  `sqlite3`, no new dependency) under a private bridge-owned `.state` directory
+  beneath `JOB_WORKTREE_ROOT`;
+- synchronous re-hydration of job and verification records in each manager's
+  `__init__`, before the event loop starts;
+- one ACID persist per state transition, inside the existing per-manager locks;
+- honest reconciliation: a non-terminal job at crash time is reloaded as
+  `failed` (`bridge restarted while job was in progress`); a terminal job whose
+  worktree directory has vanished is reloaded as `failed`
+  (`job worktree no longer exists`);
+- fail-closed loading (unparseable rows skipped; a newer-than-supported schema
+  version refuses to start) so one corrupt record never blocks startup;
+- no new MCP tool, tool parameter, schema, safety annotation, permission
+  broadening, or worktree auto-pruning.
+
+The prepared package version is `0.6.0`. It has not been committed, pushed,
+installed, restarted, or exercised through a modifying live connector. The
+source checkout remains unchanged; persistence is an internal side-effect of
+existing mutations.
 
 ## Non-negotiable security boundaries
 
@@ -253,12 +283,12 @@ core tests and must be identified as such. Do not fabricate their results.
 
 ## Current resume pointer
 
-Resume by reviewing and accepting **MCPB-005** using:
+Resume by reviewing and accepting **MCPB-006** using:
 
 ```text
-docs/NEXT-SESSION-MCPB-005.md
-docs/MCPB-005-IMPLEMENTATION-BRIEF.md
+docs/NEXT-SESSION-MCPB-006.md
+docs/MCPB-006-IMPLEMENTATION-BRIEF.md
 ```
 
 After acceptance, explicitly authorize any desired commit/push, live
-installation/restart, or real self-managed smoke test as separate actions.
+installation/restart, or real restart-survival smoke test as separate actions.

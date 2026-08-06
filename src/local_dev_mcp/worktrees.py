@@ -79,6 +79,29 @@ class GitWorktreeManager:
         self.settings = settings
         self._protected_project_roots = protected_project_roots
 
+    def ensure_state_root(self) -> Path:
+        """Create and validate the private ``.state`` directory.
+
+        ``.state`` lives beneath ``job_worktree_root`` and holds the durable
+        job/verification database. It must stay outside every configured project
+        root, exactly like the worktree root itself, and be a private directory
+        not accessible by group or other users. Validated eagerly at manager
+        construction so a misconfiguration is caught before the first job runs.
+        """
+        state_root = self.settings.job_worktree_root / ".state"
+        protected_roots = {
+            root.resolve(strict=False) for root in self._protected_project_roots
+        }
+        prospective = state_root.resolve(strict=False)
+        for protected_root in protected_roots:
+            if _is_within(prospective, protected_root) or _is_within(
+                protected_root, prospective
+            ):
+                raise WorktreeError(
+                    "JOB_WORKTREE_ROOT must be outside every configured project root"
+                )
+        return _ensure_private_directory(state_root)
+
     def _root_for(self, project: ProjectPolicy) -> Path:
         configured = self.settings.job_worktree_root
         project_root = project.root.resolve(strict=True)
