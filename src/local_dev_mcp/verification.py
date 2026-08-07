@@ -182,10 +182,15 @@ def _safe_path(
     allow_missing: bool,
     directory: bool = False,
 ) -> Path | None:
-    descriptor = os.open(
-        root,
-        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0),
-    )
+    try:
+        descriptor = os.open(
+            root,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as exc:
+        # Do not embed ``exc``: its ``.filename`` is the absolute worktree path,
+        # which must never reach tool output. Surface a path-free message.
+        raise VerificationError("candidate worktree could not be opened") from exc
     parts = PurePosixPath(relative).parts
     try:
         for component in parts[:-1]:
@@ -224,6 +229,90 @@ def _safe_path(
             kind = "directories" if directory else "regular files or deletions"
             raise VerificationError(f"candidate paths must be {kind}")
         return root.joinpath(*parts)
+    except OSError as exc:
+        raise VerificationError(f"candidate path could not be inspected: {exc}") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _open_candidate_read(
+    root: Path,
+    relative: str,
+    *,
+    allow_missing: bool,
+) -> int | None:
+    """Open one candidate regular file anchored end-to-end to ``root``.
+
+    Like ``_safe_path`` this walks the directory chain with
+    ``O_DIRECTORY|O_NOFOLLOW`` against a parent ``dir_fd`` so no parent can be a
+    symbolic link. Unlike ``_safe_path`` it does NOT return a path string for the
+    caller to re-resolve: it opens the leaf with ``O_NOFOLLOW`` *relative to the
+    already-validated parent directory descriptor*. The open therefore never
+    re-resolves from the filesystem root, so a parent directory swapped for a
+    symlink in the window between validation and the open cannot redirect the
+    read outside the worktree. ``O_NOFOLLOW`` on the leaf additionally refuses a
+    leaf that became a symlink in that window. Returns the open file descriptor,
+    or ``None`` for a deletion when ``allow_missing``. Raises ``VerificationError``
+    on a symlink, non-regular, or missing path (``allow_missing=False``); error
+    filenames are the relative leaf, never the absolute worktree path.
+    """
+    try:
+        descriptor = os.open(
+            root,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as exc:
+        # Do not embed ``exc``: its ``.filename`` is the absolute worktree path,
+        # which must never reach tool output. Surface a path-free message.
+        raise VerificationError("candidate worktree could not be opened") from exc
+    parts = PurePosixPath(relative).parts
+    try:
+        for component in parts[:-1]:
+            try:
+                metadata = os.stat(
+                    component, dir_fd=descriptor, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                if allow_missing:
+                    return None
+                raise VerificationError("candidate path no longer exists") from None
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise VerificationError(
+                    "candidate paths must not traverse symbolic links or non-directories"
+                )
+            next_descriptor = os.open(
+                component,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        leaf = parts[-1]
+        try:
+            metadata = os.stat(leaf, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            if allow_missing:
+                return None
+            raise VerificationError("candidate path no longer exists") from None
+        if stat.S_ISLNK(metadata.st_mode):
+            raise VerificationError("changed symbolic links are not allowed")
+        if not stat.S_ISREG(metadata.st_mode):
+            raise VerificationError("candidate paths must be regular files or deletions")
+        try:
+            return os.open(
+                leaf,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=descriptor,
+            )
+        except FileNotFoundError:
+            if allow_missing:
+                return None
+            raise VerificationError("candidate path no longer exists") from None
     except OSError as exc:
         raise VerificationError(f"candidate path could not be inspected: {exc}") from exc
     finally:
@@ -314,26 +403,20 @@ def record_from_row(row: dict[str, Any]) -> VerificationRecord | None:
         return None
 
 
-async def _candidate_state(
+async def candidate_changed_paths(
     settings: Settings,
-    project: ProjectPolicy,
     worktree: JobWorktree,
-) -> CandidateState:
-    timeout = settings.git_command_timeout_seconds
-    staged = await _git_bytes(
-        worktree.path,
-        "diff",
-        "--cached",
-        "--name-only",
-        "-z",
-        "--no-renames",
-        "HEAD",
-        "--",
-        timeout_seconds=timeout,
-    )
-    if staged:
-        raise VerificationError("candidate index must be empty before verification")
+) -> tuple[str, ...]:
+    """Discover the candidate's changed paths (tracked edits + untracked files).
 
+    The index-empty guard is intentionally NOT part of this helper: it is a
+    verification-specific precondition (``commit`` requires an empty index),
+    not a property of the changed-path set itself. Callers that need the
+    guard apply it separately. Returns paths in the same sorted, de-duplicated
+    order used by the candidate fingerprint so review and verification agree
+    on exactly one notion of "what the candidate changed".
+    """
+    timeout = settings.git_command_timeout_seconds
     tracked_payload, untracked_payload = await asyncio.gather(
         _git_bytes(
             worktree.path,
@@ -362,60 +445,97 @@ async def _candidate_state(
         raise VerificationError(
             f"candidate exceeds the {MAX_COMMIT_PATHS}-path verification limit"
         )
+    return paths
+
+
+async def _candidate_state(
+    settings: Settings,
+    project: ProjectPolicy,
+    worktree: JobWorktree,
+) -> CandidateState:
+    timeout = settings.git_command_timeout_seconds
+    staged = await _git_bytes(
+        worktree.path,
+        "diff",
+        "--cached",
+        "--name-only",
+        "-z",
+        "--no-renames",
+        "HEAD",
+        "--",
+        timeout_seconds=timeout,
+    )
+    if staged:
+        raise VerificationError("candidate index must be empty before verification")
+
+    paths = await candidate_changed_paths(settings, worktree)
 
     digest = hashlib.sha256()
     digest.update(_FINGERPRINT_MARKER)
     digest.update(_frame(worktree.base_head.encode("ascii")))
     for relative in paths:
         _validate_policy_path(project, relative)
-        current = _safe_path(worktree.path, relative, allow_missing=True)
-        baseline = await _git_bytes(
-            worktree.path,
-            "ls-tree",
-            "-z",
-            "HEAD",
-            "--",
-            relative,
-            timeout_seconds=timeout,
+        file_descriptor = _open_candidate_read(
+            worktree.path, relative, allow_missing=True
         )
-        if b"\0" in baseline:
-            baseline = baseline.split(b"\0", 1)[0]
-        if baseline.startswith((b"120000 ", b"160000 ")):
-            raise VerificationError("changed symbolic links and submodules are not allowed")
-        digest.update(_frame(relative.encode("utf-8")))
-        digest.update(_frame(baseline))
-        if current is None:
-            digest.update(_frame(b"deleted"))
-            continue
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        # ``file_descriptor`` is ours until ``os.fdopen`` takes ownership below.
+        # Close it on any error path in that window (e.g. an ``ls-tree`` timeout or
+        # a non-regular leaf) so the open never leaks; once ``consumed`` is set the
+        # ``with`` block owns the fd and the ``finally`` is a no-op.
+        consumed = False
         try:
-            file_descriptor = os.open(current, flags)
-        except OSError as exc:
-            raise VerificationError(f"candidate file could not be opened safely: {exc}") from exc
-        metadata = os.fstat(file_descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            os.close(file_descriptor)
-            raise VerificationError("changed paths must be regular files or deletions")
-        git_mode = b"100755" if metadata.st_mode & 0o111 else b"100644"
-        digest.update(_frame(git_mode))
-        digest.update(_frame(str(metadata.st_size).encode("ascii")))
-        content_hash = hashlib.sha256()
-        actual_size = 0
-        with os.fdopen(file_descriptor, "rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                actual_size += len(chunk)
-                content_hash.update(chunk)
-                digest.update(chunk)
-            after_metadata = os.fstat(handle.fileno())
-        if (
-            actual_size != metadata.st_size
-            or after_metadata.st_dev != metadata.st_dev
-            or after_metadata.st_ino != metadata.st_ino
-            or after_metadata.st_size != metadata.st_size
-            or after_metadata.st_mtime_ns != metadata.st_mtime_ns
-        ):
-            raise VerificationError("candidate file changed while it was fingerprinted")
-        digest.update(_frame(content_hash.hexdigest().encode("ascii")))
+            baseline = await _git_bytes(
+                worktree.path,
+                "ls-tree",
+                "-z",
+                "HEAD",
+                "--",
+                relative,
+                timeout_seconds=timeout,
+            )
+            if b"\0" in baseline:
+                baseline = baseline.split(b"\0", 1)[0]
+            if baseline.startswith((b"120000 ", b"160000 ")):
+                raise VerificationError(
+                    "changed symbolic links and submodules are not allowed"
+                )
+            digest.update(_frame(relative.encode("utf-8")))
+            digest.update(_frame(baseline))
+            if file_descriptor is None:
+                digest.update(_frame(b"deleted"))
+                continue
+            metadata = os.fstat(file_descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise VerificationError(
+                    "changed paths must be regular files or deletions"
+                )
+            git_mode = b"100755" if metadata.st_mode & 0o111 else b"100644"
+            digest.update(_frame(git_mode))
+            digest.update(_frame(str(metadata.st_size).encode("ascii")))
+            content_hash = hashlib.sha256()
+            actual_size = 0
+            handle = os.fdopen(file_descriptor, "rb")
+            consumed = True
+            with handle:
+                while chunk := handle.read(1024 * 1024):
+                    actual_size += len(chunk)
+                    content_hash.update(chunk)
+                    digest.update(chunk)
+                after_metadata = os.fstat(handle.fileno())
+            if (
+                actual_size != metadata.st_size
+                or after_metadata.st_dev != metadata.st_dev
+                or after_metadata.st_ino != metadata.st_ino
+                or after_metadata.st_size != metadata.st_size
+                or after_metadata.st_mtime_ns != metadata.st_mtime_ns
+            ):
+                raise VerificationError(
+                    "candidate file changed while it was fingerprinted"
+                )
+            digest.update(_frame(content_hash.hexdigest().encode("ascii")))
+        finally:
+            if not consumed and file_descriptor is not None:
+                os.close(file_descriptor)
     return CandidateState(
         base_head=worktree.base_head,
         fingerprint=digest.hexdigest(),

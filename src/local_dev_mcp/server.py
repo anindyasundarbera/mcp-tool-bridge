@@ -13,6 +13,7 @@ from .jobs import DevelopmentJobManager
 from .models import Effort, ProjectCapability
 from .reader import RepositoryReader
 from .registry import ProjectLockManager, ProjectRegistry
+from .review import ReviewError, ReviewManager
 from .writer import RepositoryWriter, WriteMode
 from .verification import VerificationCommitManager
 
@@ -26,6 +27,7 @@ def create_server(
     locks: ProjectLockManager | None = None,
     jobs: DevelopmentJobManager | None = None,
     verification: VerificationCommitManager | None = None,
+    review: ReviewManager | None = None,
 ) -> FastMCP:
     active_settings = settings or Settings.from_env()
     active_registry = registry or ProjectRegistry.load(
@@ -45,6 +47,13 @@ def create_server(
         active_settings,
         active_locks,
         active_jobs,
+        projects=active_registry.projects(),
+    )
+    active_review = review or ReviewManager(
+        active_settings,
+        active_locks,
+        active_jobs,
+        active_executor,
         projects=active_registry.projects(),
     )
 
@@ -506,13 +515,225 @@ def create_server(
         return await active_verification.verify(project, job_id, expected_head)
 
     @mcp.tool(
+        name="list_candidate_changes",
+        description=(
+            "List the changed paths of a completed development job's retained "
+            "candidate with bounded metadata (size, SHA-256, executable flag, or "
+            "deleted). Reads only the candidate's changed-path set, never the "
+            "worktree at large. Does not modify the candidate or run commands."
+        ),
+        annotations=read_only_annotations,
+    )
+    async def list_candidate_changes(
+        project_id: Annotated[
+            str, Field(description="Exact project ID returned by list_allowed_projects.")
+        ],
+        job_id: Annotated[
+            str,
+            Field(
+                description="Opaque completed job ID returned by send_to_local_dev.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.CANDIDATE_REVIEW
+        )
+        return await active_review.list_candidate_changes(project, job_id)
+
+    @mcp.tool(
+        name="read_candidate_file",
+        description=(
+            "Read one file from a completed job's retained candidate, scoped "
+            "strictly to the candidate's changed-path set. Supports an optional "
+            "bounded line range and an optional SHA-256 consistency check. "
+            "Deletions are reported without content. The worktree path and raw "
+            "session ID are never exposed."
+        ),
+        annotations=read_only_annotations,
+    )
+    async def read_candidate_file(
+        project_id: Annotated[
+            str, Field(description="Exact project ID returned by list_allowed_projects.")
+        ],
+        job_id: Annotated[
+            str,
+            Field(
+                description="Opaque completed job ID returned by send_to_local_dev.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+        path: Annotated[
+            str,
+            Field(
+                description=(
+                    "One changed path from list_candidate_changes; must be a "
+                    "normalized relative path without '.', '..', or empty segments."
+                ),
+                min_length=1,
+            ),
+        ],
+        start_line: Annotated[
+            int | None,
+            Field(description="Optional first 1-based line; requires end_line.", ge=1),
+        ] = None,
+        end_line: Annotated[
+            int | None,
+            Field(description="Optional last 1-based line, inclusive; requires start_line.", ge=1),
+        ] = None,
+        expected_sha256: Annotated[
+            str | None,
+            Field(
+                description="Optional 64-character SHA-256 requiring the file to be unchanged.",
+                pattern=r"^[0-9A-Fa-f]{64}$",
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.CANDIDATE_REVIEW
+        )
+        return await active_review.read_candidate_file(
+            project, job_id, path, start_line, end_line, expected_sha256
+        )
+
+    @mcp.tool(
+        name="record_candidate_review",
+        description=(
+            "Record a reviewer's structured verdict for a completed job's "
+            "candidate, bound to the exact current candidate state. The verdict "
+            "is a non-empty JSON object. The resulting review_id is single-use "
+            "and may be required by commit_verified_development_job for projects "
+            "that enable requires_review. Does not modify the candidate."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=False,
+        ),
+    )
+    async def record_candidate_review(
+        project_id: Annotated[
+            str, Field(description="Exact project ID returned by list_allowed_projects.")
+        ],
+        job_id: Annotated[
+            str,
+            Field(
+                description="Opaque completed job ID returned by send_to_local_dev.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+        verdict: Annotated[
+            dict[str, Any],
+            Field(
+                description=(
+                    "Non-empty structured verdict object, e.g. "
+                    "{\"summary\": ..., \"issues\": [...], \"recommendation\": ...}."
+                ),
+            ),
+        ],
+        reviewer_id: Annotated[
+            str | None,
+            Field(
+                description="Optional short reviewer label (at most 200 printable characters).",
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.CANDIDATE_REVIEW
+        )
+        return await active_review.record_candidate_review(
+            project, job_id, verdict, reviewer_id
+        )
+
+    @mcp.tool(
+        name="run_independent_review",
+        description=(
+            "Spawn a fresh, read-only Claude reviewer over a completed job's "
+            "candidate. The reviewer is a distinct session (never resumed from "
+            "the drafting session) with only Read, Glob, and Grep, so it can "
+            "inspect but not modify. Requires the project to allow a "
+            "bridge-spawned reviewer. Returns a single-use review_id bound to the "
+            "exact candidate state."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=True,
+        ),
+    )
+    async def run_independent_review(
+        project_id: Annotated[
+            str, Field(description="Exact project ID returned by list_allowed_projects.")
+        ],
+        job_id: Annotated[
+            str,
+            Field(
+                description="Opaque completed job ID returned by send_to_local_dev.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+        effort: Annotated[
+            Effort,
+            Field(
+                description=(
+                    "Use high for routine review; use ultracode only for complex "
+                    "review requiring deep reasoning."
+                )
+            ),
+        ] = "high",
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.CANDIDATE_REVIEW
+        )
+        return await active_review.run_independent_review(project, job_id, effort)
+
+    @mcp.tool(
+        name="get_candidate_review",
+        description=(
+            "Retrieve a previously recorded candidate review verdict by its "
+            "single-use review_id, without re-running a reviewer. Read-only."
+        ),
+        annotations=read_only_annotations,
+    )
+    async def get_candidate_review(
+        project_id: Annotated[
+            str, Field(description="Exact project ID returned by list_allowed_projects.")
+        ],
+        job_id: Annotated[
+            str,
+            Field(
+                description="Opaque completed job ID returned by send_to_local_dev.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+        review_id: Annotated[
+            str,
+            Field(
+                description="Single-use review ID from record_candidate_review or run_independent_review.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.CANDIDATE_REVIEW
+        )
+        return await active_review.get_candidate_review(project, job_id, review_id)
+
+    @mcp.tool(
         name="commit_verified_development_job",
         description=(
             "After separate human approval, create one detached commit from the "
             "exact unchanged state that passed verify_development_job. Requires "
             "the verification ID, base HEAD, fingerprint, and complete ordered "
             "path list. It never updates a branch, pushes, merges, tags, promotes, "
-            "or restarts production."
+            "or restarts production. For projects that enable requires_review, a "
+            "matching review_id is also required and is consumed once; the gate "
+            "enforces that a review record bound to this exact candidate exists, "
+            "not that the review was independent — independence is the operator's "
+            "choice of channel (run_independent_review, attested as reviewer_id "
+            "'bridge-reviewer', versus a caller-supplied record_candidate_review)."
         ),
         annotations=ToolAnnotations(
             readOnlyHint=False,
@@ -569,11 +790,39 @@ def create_server(
             str,
             Field(description="Human-approved commit message.", min_length=1),
         ],
+        review_id: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional single-use review ID. Required for projects with "
+                    "requires_review; binds the commit to a review record of the "
+                    "exact same candidate state. The gate checks the record matches "
+                    "and is single-use, not that the review was independent — a "
+                    "record whose reviewer_id is 'bridge-reviewer' was attested by "
+                    "run_independent_review; any other reviewer_id was caller-supplied."
+                ),
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ] = None,
     ) -> dict[str, Any]:
         project = active_registry.resolve(
             project_id, ProjectCapability.VERIFICATION_COMMIT
         )
-        return await active_verification.commit(
+        if project.requires_review:
+            if review_id is None:
+                raise ReviewError(
+                    "review_id is required: this project requires a candidate "
+                    "review before a verified commit"
+                )
+            await active_review.validate_for_commit(
+                project,
+                job_id,
+                review_id,
+                expected_head,
+                expected_diff_fingerprint,
+                paths,
+            )
+        committed = await active_verification.commit(
             project,
             job_id,
             verification_id,
@@ -582,6 +831,24 @@ def create_server(
             paths,
             message,
         )
+        if project.requires_review and review_id is not None:
+            try:
+                await active_review.mark_used(review_id)
+            except Exception:
+                # The commit already succeeded and verification's single-use
+                # verification_id prevents a second commit, so a review-
+                # bookkeeping failure must not discard the commit_sha the caller
+                # needs. mark_used is atomic, so the review stays reusable in
+                # memory and disk; surface the issue as a warning instead.
+                committed = {
+                    **committed,
+                    "review_mark_warning": (
+                        "commit succeeded but the review record could not be "
+                        "marked used; the single-use verification_id still "
+                        "prevents a second commit"
+                    ),
+                }
+        return committed
 
     return mcp
 

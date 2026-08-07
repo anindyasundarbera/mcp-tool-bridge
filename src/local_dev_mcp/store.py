@@ -57,6 +57,18 @@ CREATE TABLE IF NOT EXISTS verifications (
     used INTEGER NOT NULL,
     commands_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS reviews (
+    review_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    base_head TEXT NOT NULL,
+    diff_fingerprint TEXT NOT NULL,
+    paths_json TEXT NOT NULL,
+    reviewed_at TEXT NOT NULL,
+    reviewer_id TEXT,
+    verdict_json TEXT NOT NULL,
+    used INTEGER NOT NULL
+);
 """
 
 _UPSERT_JOB = """
@@ -103,6 +115,26 @@ ON CONFLICT(verification_id) DO UPDATE SET
     verified_at = excluded.verified_at,
     used = excluded.used,
     commands_json = excluded.commands_json
+"""
+
+_UPSERT_REVIEW = """
+INSERT INTO reviews (
+    review_id, project_id, job_id, base_head, diff_fingerprint,
+    paths_json, reviewed_at, reviewer_id, verdict_json, used
+) VALUES (
+    :review_id, :project_id, :job_id, :base_head, :diff_fingerprint,
+    :paths_json, :reviewed_at, :reviewer_id, :verdict_json, :used
+)
+ON CONFLICT(review_id) DO UPDATE SET
+    project_id = excluded.project_id,
+    job_id = excluded.job_id,
+    base_head = excluded.base_head,
+    diff_fingerprint = excluded.diff_fingerprint,
+    paths_json = excluded.paths_json,
+    reviewed_at = excluded.reviewed_at,
+    reviewer_id = excluded.reviewer_id,
+    verdict_json = excluded.verdict_json,
+    used = excluded.used
 """
 
 
@@ -153,6 +185,26 @@ def open_state_db(db_path: Path) -> sqlite3.Connection:
                 f"state database schema version {stored} is newer than supported "
                 f"{SCHEMA_VERSION}; refusing to start to avoid data loss"
             )
+        # Advance a stale stored version up to this code's SCHEMA_VERSION. The
+        # insert above uses ON CONFLICT DO NOTHING, so an existing row from an
+        # older schema never gets rewritten — without this an upgrade would
+        # silently leave the stored version pinned below SCHEMA_VERSION and a
+        # later downgrade would not be detected by the ``stored > SCHEMA_VERSION``
+        # fail-closed guard. No-op today (both are 1), correct for future bumps.
+        if stored < SCHEMA_VERSION:
+            connection.execute(
+                "UPDATE schema_meta SET value = ? WHERE key = 'version'",
+                (str(SCHEMA_VERSION),),
+            )
+            row = connection.execute(
+                "SELECT value FROM schema_meta WHERE key = 'version'"
+            ).fetchone()
+            if row is None:
+                raise StateStoreError("schema_meta is missing a version row")
+            try:
+                stored = int(row["value"])
+            except ValueError as exc:
+                raise StateStoreError("schema_meta version is not an integer") from exc
         connection.commit()
     except Exception:
         connection.close()
@@ -194,5 +246,25 @@ def upsert_record_row(connection: sqlite3.Connection, row: dict[str, Any]) -> No
 def job_id_exists(connection: sqlite3.Connection, job_id: str) -> bool:
     row = connection.execute(
         "SELECT 1 FROM jobs WHERE job_id = ?", (job_id,)
+    ).fetchone()
+    return row is not None
+
+
+def load_review_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Return every persisted review row as a dict."""
+    return [
+        dict(row) for row in connection.execute("SELECT * FROM reviews").fetchall()
+    ]
+
+
+def upsert_review_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
+    """Persist one review row as a single ACID transaction."""
+    with connection:
+        connection.execute(_UPSERT_REVIEW, row)
+
+
+def review_id_exists(connection: sqlite3.Connection, review_id: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM reviews WHERE review_id = ?", (review_id,)
     ).fetchone()
     return row is not None
