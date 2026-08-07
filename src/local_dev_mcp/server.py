@@ -15,7 +15,8 @@ from .reader import RepositoryReader
 from .registry import ProjectLockManager, ProjectRegistry
 from .review import ReviewError, ReviewManager
 from .writer import RepositoryWriter, WriteMode
-from .verification import VerificationCommitManager
+from .verification import PublicationManager, VerificationCommitManager
+from .sync import SyncError, SyncManager
 
 
 def create_server(
@@ -28,6 +29,8 @@ def create_server(
     jobs: DevelopmentJobManager | None = None,
     verification: VerificationCommitManager | None = None,
     review: ReviewManager | None = None,
+    publication: PublicationManager | None = None,
+    sync: SyncManager | None = None,
 ) -> FastMCP:
     active_settings = settings or Settings.from_env()
     active_registry = registry or ProjectRegistry.load(
@@ -56,6 +59,18 @@ def create_server(
         active_executor,
         projects=active_registry.projects(),
     )
+    active_publication = publication or PublicationManager(
+        active_settings,
+        active_locks,
+        active_jobs,
+        projects=active_registry.projects(),
+    )
+    active_sync = sync or SyncManager(
+        active_settings,
+        active_locks,
+        active_jobs,
+        projects=active_registry.projects(),
+    )
 
     mcp = FastMCP(
         name="Local Development Bridge",
@@ -68,8 +83,14 @@ def create_server(
             "An explicit user effort choice wins. Development jobs may modify only "
             "their bridge-created detached worktrees. Verification may run only "
             "registry-configured commands. Never commit until the user separately "
-            "approves the exact verification evidence, paths, and message. Detached "
-            "commits are not published or promoted."
+            "approves the exact verification evidence, paths, and message. A "
+            "detached commit may be published only to a brand-new remote branch "
+            "that is not the repository default, main, or master; never force-push, "
+            "merge, tag, move another ref, or update a trunk. The canonical "
+            "checkout may be synchronized only to the verified current tip of "
+            "origin's default branch, by fast-forward only, when clean and on the "
+            "default branch; sync never pushes, forces, merges, tags, or moves a "
+            "remote ref."
         ),
     )
 
@@ -849,6 +870,137 @@ def create_server(
                     ),
                 }
         return committed
+
+    @mcp.tool(
+        name="push_detached_development_commit",
+        description=(
+            "After separate human approval, publish the exact detached commit "
+            "created by commit_verified_development_job to one new remote branch "
+            "on origin. Requires the job ID, the exact commit SHA, the new "
+            "branch name, and the verified base HEAD and diff fingerprint. Rejects "
+            "the repository default branch, main, and master; requires the remote "
+            "branch not to exist; never force-pushes, merges, tags, or moves "
+            "another ref. Confirms the commit belongs to the retained job and "
+            "realizes the verified candidate fingerprint. One branch per job; "
+            "retrying the same commit and branch is idempotent. Returns the "
+            "remote branch name, commit SHA, and repository URL."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def push_detached_development_commit(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        job_id: Annotated[
+            str,
+            Field(
+                description="Opaque completed job ID returned by send_to_local_dev.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+        commit_sha: Annotated[
+            str,
+            Field(
+                description="Exact lowercase detached commit SHA from commit_verified_development_job.",
+                pattern=r"^[0-9a-f]{40}$",
+            ),
+        ],
+        branch_name: Annotated[
+            str,
+            Field(
+                description=(
+                    "Short name for a new remote branch; must not be a full ref, "
+                    "HEAD, the repository default, main, or master."
+                ),
+                min_length=1,
+                max_length=200,
+            ),
+        ],
+        expected_base_head: Annotated[
+            str,
+            Field(
+                description="Exact lowercase base HEAD from verification evidence.",
+                pattern=r"^[0-9a-f]{40}$",
+            ),
+        ],
+        expected_diff_fingerprint: Annotated[
+            str,
+            Field(
+                description="Exact lowercase SHA-256 from verification evidence.",
+                pattern=r"^[0-9a-f]{64}$",
+            ),
+        ],
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.PUSH_DEVELOPMENT_COMMIT
+        )
+        return await active_publication.publish(
+            project,
+            job_id,
+            commit_sha,
+            branch_name,
+            expected_base_head,
+            expected_diff_fingerprint,
+        )
+
+    @mcp.tool(
+        name="sync_canonical_checkout",
+        description=(
+            "After a pull request merges on the remote default branch, "
+            "fast-forward one exact allowed project's guarded canonical "
+            "checkout to the verified current tip of origin's default branch. "
+            "Requires the exact current HEAD (the stale commit, from "
+            "get_project_status) and the target commit. The canonical checkout "
+            "must be clean and on the repository default branch; the target "
+            "must equal origin/<default> after a fetch. Updates the local "
+            "default branch by fast-forward only; never pushes, forces, merges, "
+            "tags, deletes, or moves a remote ref. Refuses while a non-terminal "
+            "development job exists; warns about completed-uncommitted jobs "
+            "that will lose their verify/commit path after the base moves."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def sync_canonical_checkout(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        expected_current_head: Annotated[
+            str,
+            Field(
+                description=(
+                    "Exact lowercase 40-hex SHA the canonical checkout is "
+                    "currently at; obtain it from get_project_status."
+                ),
+                pattern=r"^[0-9a-f]{40}$",
+            ),
+        ],
+        target_commit: Annotated[
+            str,
+            Field(
+                description=(
+                    "Exact lowercase 40-hex SHA to synchronize to; must equal "
+                    "the current tip of origin's default branch."
+                ),
+                pattern=r"^[0-9a-f]{40}$",
+            ),
+        ],
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.SYNC_CANONICAL_CHECKOUT
+        )
+        return await active_sync.sync(project, expected_current_head, target_commit)
 
     return mcp
 

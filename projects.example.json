@@ -11,7 +11,8 @@
       "capabilities": [
         "repository_read",
         "markdown_write",
-        "claude_edit"
+        "claude_edit",
+        "sync_canonical_checkout"
       ],
       "markdown_write_roots": [
         "docs",

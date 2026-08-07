@@ -28,8 +28,15 @@ worktree path, or Claude session ID from a tool call.
 - Existing Claude `acceptEdits` boundary with Bash, web, secondary MCP tools,
   slash commands, and `bypassPermissions` disabled
 
-Candidate promotion, production restart, branch/ref updates, push, merge, tags,
-worktree deletion, and rollback switching remain outside bridge authority.
+Candidate promotion, production restart, branch/ref updates, merge, tags,
+worktree deletion, and rollback switching remain outside bridge authority. The
+one push surface is the opt-in `push_development_commit` capability: a single
+verified detached commit to a new non-trunk branch on `origin`, never a
+force-push, merge, tag, trunk update, or ref move. The one local-checkout
+update surface is the opt-in `sync_canonical_checkout` capability: a
+fast-forward only of the guarded canonical checkout to the verified current
+tip of `origin`'s default branch, never a push, force, merge-commit, tag,
+remote ref move, or trunk update.
 
 ## MCP tools
 
@@ -59,6 +66,26 @@ Isolated development lifecycle:
 - `commit_verified_development_job` creates one detached commit only after a
   separate human approval repeats the verification ID, HEAD, fingerprint, and
   complete ordered path list.
+- `push_detached_development_commit` publishes that exact detached commit to a
+  new non-trunk remote branch on `origin` after separate human approval repeats
+  the commit SHA, base HEAD, and fingerprint. It never force-pushes, merges,
+  tags, or moves another ref; one branch per job, with idempotent retry.
+- `sync_canonical_checkout` fast-forwards a project's guarded canonical
+  checkout to exactly the current tip of `origin`'s default branch after an
+  upstream merge, when the checkout is clean and on the default branch and the
+  caller repeats the exact current HEAD and target commit. It uses
+  `git merge --ff-only`; it never pushes, forces, merges (creates a merge
+  commit), tags, or moves a remote ref. It refuses while a non-terminal job
+  exists and warns about completed-uncommitted jobs that lose their
+  verify/commit path after the base moves.
+
+Candidate review (opt-in `candidate_review`):
+
+- `list_candidate_changes` and `read_candidate_file` expose a retained
+  candidate's changed paths to a reviewer, scoped to exactly the changed set.
+- `record_candidate_review` records a reviewer verdict bound to the candidate
+  state; `get_candidate_review` retrieves it. `run_independent_review` spawns a
+  fresh, read-only Claude reviewer distinct from the drafting session.
 
 Job states are `queued`, `preparing_worktree`, `running`, optionally
 `validating_candidate`, and one of `completed`, `failed`, `timed_out`, or
@@ -138,6 +165,29 @@ HEAD, fingerprint, ordered path list, and commit message must match exactly.
 The bridge rechecks the candidate, stages only `git add -- <paths>`, proves the
 index content matches verification, disables hooks and signing, and creates a
 commit on detached HEAD. It never creates or updates a branch or remote ref.
+
+Publication is a separate destructive call gated on the opt-in
+`push_development_commit` capability (which requires `verification_commit`).
+The supplied job ID, commit SHA, new branch name, base HEAD, and fingerprint
+must match exactly. The bridge confirms the commit is the one it created for
+that job, re-derives the fingerprint from the commit object, requires a used
+verification record for the exact evidence, rejects the default branch,
+`main`, and `master`, requires the remote branch not to exist, and pushes
+exactly that commit to `refs/heads/<branch>` on `origin` with no force flag. It
+never force-pushes, merges, tags, deletes, or moves another ref, and publishes
+one branch per job.
+
+Canonical-checkout synchronization is a separate destructive call gated on the
+opt-in `sync_canonical_checkout` capability (which requires
+`repository_read`). The supplied `expected_current_head` and `target_commit`
+must match exactly; the bridge requires the canonical checkout to be clean and
+on the repository default branch, fetches `origin`, resolves the default
+branch, and requires `target_commit` to equal the current
+`refs/remotes/origin/<default>` tip. It advances the local default branch with
+`git merge --ff-only <target_commit>`, so it never pushes, forces, creates a
+merge commit, tags, deletes, or moves a remote ref. It refuses while a
+non-terminal job exists and warns about completed-uncommitted jobs that lose
+their verify/commit path after the base moves.
 
 ## Self-managed bridge candidates
 
