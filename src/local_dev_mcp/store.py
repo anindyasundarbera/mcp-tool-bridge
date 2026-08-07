@@ -88,6 +88,39 @@ CREATE TABLE IF NOT EXISTS syncs (
     remote_url TEXT NOT NULL,
     idempotent INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS job_checkpoints (
+    checkpoint_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    recorded_at TEXT NOT NULL,
+    changed_paths_json TEXT NOT NULL,
+    partial_fingerprint TEXT,
+    tokens_json TEXT,
+    event_json TEXT,
+    milestone TEXT
+);
+CREATE TABLE IF NOT EXISTS job_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    detail_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS job_progress (
+    job_id TEXT PRIMARY KEY,
+    pause_reason TEXT,
+    turns_used INTEGER NOT NULL,
+    tokens_used INTEGER NOT NULL,
+    extensions_granted INTEGER NOT NULL,
+    no_progress_turns INTEGER NOT NULL,
+    tool_failures INTEGER NOT NULL,
+    soft_warned INTEGER NOT NULL,
+    milestones_json TEXT,
+    updated_at TEXT NOT NULL
+);
 """
 
 _UPSERT_JOB = """
@@ -176,6 +209,44 @@ INSERT INTO syncs (
     :project_id, :synced_at, :from_head, :to_head, :branch, :remote_url,
     :idempotent
 )
+"""
+
+_INSERT_CHECKPOINT = """
+INSERT INTO job_checkpoints (
+    job_id, project_id, kind, seq, recorded_at, changed_paths_json,
+    partial_fingerprint, tokens_json, event_json, milestone
+) VALUES (
+    :job_id, :project_id, :kind, :seq, :recorded_at, :changed_paths_json,
+    :partial_fingerprint, :tokens_json, :event_json, :milestone
+)
+"""
+
+_INSERT_EVENT = """
+INSERT INTO job_events (
+    job_id, project_id, occurred_at, event_type, detail_json
+) VALUES (
+    :job_id, :project_id, :occurred_at, :event_type, :detail_json
+)
+"""
+
+_UPSERT_PROGRESS = """
+INSERT INTO job_progress (
+    job_id, pause_reason, turns_used, tokens_used, extensions_granted,
+    no_progress_turns, tool_failures, soft_warned, milestones_json, updated_at
+) VALUES (
+    :job_id, :pause_reason, :turns_used, :tokens_used, :extensions_granted,
+    :no_progress_turns, :tool_failures, :soft_warned, :milestones_json, :updated_at
+)
+ON CONFLICT(job_id) DO UPDATE SET
+    pause_reason = excluded.pause_reason,
+    turns_used = excluded.turns_used,
+    tokens_used = excluded.tokens_used,
+    extensions_granted = excluded.extensions_granted,
+    no_progress_turns = excluded.no_progress_turns,
+    tool_failures = excluded.tool_failures,
+    soft_warned = excluded.soft_warned,
+    milestones_json = excluded.milestones_json,
+    updated_at = excluded.updated_at
 """
 
 
@@ -381,3 +452,136 @@ def insert_sync_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None
     """
     with connection:
         connection.execute(_INSERT_SYNC, row)
+
+
+def insert_checkpoint_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
+    """Append one checkpoint row as a single ACID transaction.
+
+    Checkpoints are an append-only, turn-level mission-state ledger: each
+    sample/turn/boundary/extension/milestone adds a row, keyed by an
+    autoincrement ``checkpoint_id`` and ordered per job by the monotonic
+    ``seq``. A crashed job's last checkpoint is what makes it resumable rather
+    than discarded. No single-use bound; the table exists for restart-safe
+    resumability and progress intelligence.
+    """
+    with connection:
+        connection.execute(_INSERT_CHECKPOINT, row)
+
+
+def load_checkpoint_rows(
+    connection: sqlite3.Connection, job_id: str
+) -> list[dict[str, Any]]:
+    """Return one job's checkpoint rows as dicts, ordered by ``seq`` then id."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM job_checkpoints WHERE job_id = ? "
+            "ORDER BY seq ASC, checkpoint_id ASC",
+            (job_id,),
+        ).fetchall()
+    ]
+
+
+def load_latest_checkpoint(
+    connection: sqlite3.Connection, job_id: str
+) -> dict[str, Any] | None:
+    """Return the most recent checkpoint row for one job, or None."""
+    row = connection.execute(
+        "SELECT * FROM job_checkpoints WHERE job_id = ? "
+        "ORDER BY seq DESC, checkpoint_id DESC LIMIT 1",
+        (job_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def checkpoint_count(connection: sqlite3.Connection, job_id: str) -> int:
+    """Return the number of checkpoint rows for one job."""
+    row = connection.execute(
+        "SELECT COUNT(*) FROM job_checkpoints WHERE job_id = ?", (job_id,)
+    ).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def compact_checkpoints(
+    connection: sqlite3.Connection,
+    job_id: str,
+    keep_kinds: tuple[str, ...] = ("boundary", "extension", "milestone"),
+    keep_latest_n: int = 50,
+) -> int:
+    """Prune per-job checkpoint rows, keeping structural rows and the recent tail.
+
+    All rows whose ``kind`` is in ``keep_kinds`` are retained (they mark
+    boundaries, extensions, and milestone closures — small in number and
+    structurally important). Of the remaining ``turn``/``sample``/``tool`` rows,
+    only the most recent ``keep_latest_n`` (by ``seq``) are kept; the rest are
+    deleted. Returns the number of rows deleted. Promoted evidence
+    (verifications/reviews/publications) is never touched — only checkpoints.
+    """
+    placeholders = ",".join("?" for _ in keep_kinds)
+    with connection:
+        cursor = connection.execute(
+            f"DELETE FROM job_checkpoints WHERE job_id = ? "
+            f"AND kind NOT IN ({placeholders}) "
+            f"AND seq NOT IN ("
+            f"  SELECT seq FROM job_checkpoints WHERE job_id = ? "
+            f"  AND kind NOT IN ({placeholders}) "
+            f"  ORDER BY seq DESC LIMIT ?"
+            f")",
+            (
+                job_id,
+                *keep_kinds,
+                job_id,
+                *keep_kinds,
+                keep_latest_n,
+            ),
+        )
+        return int(cursor.rowcount or 0)
+
+
+def insert_event_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
+    """Append one audit-event row as a single ACID transaction.
+
+    The event ledger is append-only (autoincrement ``event_id``): every job
+    state transition, checkpoint, extension grant, pause, and terminal outcome
+    appends a row. It is the durable audit source of truth, distinct from the
+    in-place ``jobs`` row.
+    """
+    with connection:
+        connection.execute(_INSERT_EVENT, row)
+
+
+def load_event_rows(
+    connection: sqlite3.Connection, job_id: str
+) -> list[dict[str, Any]]:
+    """Return one job's audit-event rows as dicts, oldest first."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM job_events WHERE job_id = ? ORDER BY event_id ASC",
+            (job_id,),
+        ).fetchall()
+    ]
+
+
+def upsert_progress_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
+    """Persist one job's progress/budget sidecar row as a single ACID transaction.
+
+    ``job_progress`` is a sidecar to ``jobs`` keyed by ``job_id``: the
+    turn-level budget counters (turns/tokens/extensions/no-progress), the
+    pause reason, and the milestone plan. Keeping it separate from the
+    ``jobs`` row makes the schema change purely additive (no column added to
+    ``jobs``, so existing rows and tests are untouched) while still
+    SCHEMA_VERSION 1. Re-hydrated synchronously in ``DevelopmentJobManager``.
+    """
+    with connection:
+        connection.execute(_UPSERT_PROGRESS, row)
+
+
+def load_progress_row(
+    connection: sqlite3.Connection, job_id: str
+) -> dict[str, Any] | None:
+    """Return one job's progress/budget row, or None if it has none yet."""
+    row = connection.execute(
+        "SELECT * FROM job_progress WHERE job_id = ?", (job_id,)
+    ).fetchone()
+    return dict(row) if row is not None else None

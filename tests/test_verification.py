@@ -55,6 +55,7 @@ class EditingExecutor:
         *,
         root: Path | None = None,
         resume_session_id: str | None = None,
+        max_turns: int | None = None,
     ) -> dict[str, object]:
         assert root is not None
         self.edit(root)

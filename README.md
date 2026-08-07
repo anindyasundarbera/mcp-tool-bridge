@@ -209,7 +209,16 @@ production.
 | Setting | Default | Purpose |
 |---|---:|---|
 | `CLAUDE_TIMEOUT_SECONDS` | 1,800 | Maximum Claude run time |
-| `CLAUDE_MAX_TURNS` | 30 | Default Claude turn limit |
+| `CLAUDE_MAX_TURNS` | 30 | Default per-slice Claude turn limit |
+| `CLAUDE_SOFT_TURNS` | 30 | Soft warn at this cumulative turn count |
+| `CLAUDE_EXTENSION_TURNS` | 30 | Turns granted per in-place extension slice |
+| `CLAUDE_MAX_EXTENSIONS` | 3 | Maximum in-place extensions before pausing |
+| `CLAUDE_HARD_TURNS` | 120 | Absolute bridge-enforced cumulative turn cap |
+| `CLAUDE_MAX_NO_PROGRESS_TURNS` | 6 | Pause when the changed-path set is unchanged for this many turns |
+| `CLAUDE_MAX_TOOL_FAILURES` | 5 | Terminate as `failed_infrastructure` above this many tool failures |
+| `CLAUDE_CHECKPOINT_INTERVAL_SECONDS` | 30 | Progress-sampler cadence (seconds, may be fractional) |
+| `CLAUDE_CHECKPOINT_MAX` | 500 | Checkpoint count that triggers compaction |
+| `CLAUDE_STREAM_JSON` | off | Drive Claude with `--output-format stream-json --verbose` for real turn/tool counts |
 | `MAX_INPUT_CHARS` | 100,000 | Maximum job instruction length |
 | `MAX_OUTPUT_BYTES` | 2,097,152 | Maximum Claude stdout |
 | `MAX_MARKDOWN_FILE_BYTES` | 1,048,576 | Maximum reader file size |
