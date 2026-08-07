@@ -16,6 +16,7 @@ from .registry import ProjectLockManager, ProjectRegistry
 from .review import ReviewError, ReviewManager
 from .writer import RepositoryWriter, WriteMode
 from .verification import PublicationManager, VerificationCommitManager
+from .sync import SyncError, SyncManager
 
 
 def create_server(
@@ -29,6 +30,7 @@ def create_server(
     verification: VerificationCommitManager | None = None,
     review: ReviewManager | None = None,
     publication: PublicationManager | None = None,
+    sync: SyncManager | None = None,
 ) -> FastMCP:
     active_settings = settings or Settings.from_env()
     active_registry = registry or ProjectRegistry.load(
@@ -63,6 +65,12 @@ def create_server(
         active_jobs,
         projects=active_registry.projects(),
     )
+    active_sync = sync or SyncManager(
+        active_settings,
+        active_locks,
+        active_jobs,
+        projects=active_registry.projects(),
+    )
 
     mcp = FastMCP(
         name="Local Development Bridge",
@@ -78,7 +86,11 @@ def create_server(
             "approves the exact verification evidence, paths, and message. A "
             "detached commit may be published only to a brand-new remote branch "
             "that is not the repository default, main, or master; never force-push, "
-            "merge, tag, move another ref, or update a trunk."
+            "merge, tag, move another ref, or update a trunk. The canonical "
+            "checkout may be synchronized only to the verified current tip of "
+            "origin's default branch, by fast-forward only, when clean and on the "
+            "default branch; sync never pushes, forces, merges, tags, or moves a "
+            "remote ref."
         ),
     )
 
@@ -936,6 +948,59 @@ def create_server(
             expected_base_head,
             expected_diff_fingerprint,
         )
+
+    @mcp.tool(
+        name="sync_canonical_checkout",
+        description=(
+            "After a pull request merges on the remote default branch, "
+            "fast-forward one exact allowed project's guarded canonical "
+            "checkout to the verified current tip of origin's default branch. "
+            "Requires the exact current HEAD (the stale commit, from "
+            "get_project_status) and the target commit. The canonical checkout "
+            "must be clean and on the repository default branch; the target "
+            "must equal origin/<default> after a fetch. Updates the local "
+            "default branch by fast-forward only; never pushes, forces, merges, "
+            "tags, deletes, or moves a remote ref. Refuses while a non-terminal "
+            "development job exists; warns about completed-uncommitted jobs "
+            "that will lose their verify/commit path after the base moves."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def sync_canonical_checkout(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        expected_current_head: Annotated[
+            str,
+            Field(
+                description=(
+                    "Exact lowercase 40-hex SHA the canonical checkout is "
+                    "currently at; obtain it from get_project_status."
+                ),
+                pattern=r"^[0-9a-f]{40}$",
+            ),
+        ],
+        target_commit: Annotated[
+            str,
+            Field(
+                description=(
+                    "Exact lowercase 40-hex SHA to synchronize to; must equal "
+                    "the current tip of origin's default branch."
+                ),
+                pattern=r"^[0-9a-f]{40}$",
+            ),
+        ],
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.SYNC_CANONICAL_CHECKOUT
+        )
+        return await active_sync.sync(project, expected_current_head, target_commit)
 
     return mcp
 

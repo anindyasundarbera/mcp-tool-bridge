@@ -498,6 +498,55 @@ class DevelopmentJobManager:
                 worktree=job.worktree,
             )
 
+    async def has_active_jobs(self, project_id: str) -> bool:
+        """True if the project has any non-terminal job (queued/preparing/
+        running/validating).
+
+        Used by the canonical-checkout sync manager to refuse to move the
+        guarded checkout's HEAD while in-flight work depends on the current
+        base. The per-project lock is held for the whole job run, so a running
+        job blocks sync at the lock; this check catches jobs that are queued
+        but have not yet acquired the lock.
+        """
+        async with self._state_lock:
+            return any(
+                job.project_id == project_id and job.status not in TERMINAL_STATUSES
+                for job in self._jobs.values()
+            )
+
+    async def stale_resumable_job_summaries(
+        self, project_id: str
+    ) -> list[dict[str, Any]]:
+        """Completed-but-uncommitted jobs for a project that still retain a
+        worktree, as ``{job_id, base_head}``.
+
+        These jobs can still pass ``verify_development_job`` /
+        ``commit_verified_development_job`` only while the canonical checkout
+        HEAD remains at their ``base_head``. After a canonical-checkout sync
+        moves HEAD to a new commit, ``validate_resume`` will reject them. The
+        sync manager surfaces these as warnings so the operator knows which
+        outstanding candidates lose their verify/commit path. Only ``job_id``
+        and ``base_head`` are returned; no worktree path or session ID leaks.
+        """
+        async with self._state_lock:
+            summaries: list[dict[str, Any]] = []
+            for job in self._jobs.values():
+                if (
+                    job.project_id != project_id
+                    or job.status != JobStatus.COMPLETED
+                    or job.task is not None
+                    or job.committed_sha is not None
+                    or job.worktree is None
+                ):
+                    continue
+                summaries.append(
+                    {
+                        "job_id": job.job_id,
+                        "base_head": job.worktree.base_head,
+                    }
+                )
+            return summaries
+
     async def _set_status(
         self,
         job: DevelopmentJob,

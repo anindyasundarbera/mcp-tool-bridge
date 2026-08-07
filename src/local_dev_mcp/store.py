@@ -78,6 +78,16 @@ CREATE TABLE IF NOT EXISTS publications (
     published_at TEXT NOT NULL,
     PRIMARY KEY (project_id, job_id)
 );
+CREATE TABLE IF NOT EXISTS syncs (
+    sync_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    synced_at TEXT NOT NULL,
+    from_head TEXT NOT NULL,
+    to_head TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    remote_url TEXT NOT NULL,
+    idempotent INTEGER NOT NULL
+);
 """
 
 _UPSERT_JOB = """
@@ -157,6 +167,15 @@ ON CONFLICT(project_id, job_id) DO UPDATE SET
     branch_name = excluded.branch_name,
     remote_url = excluded.remote_url,
     published_at = excluded.published_at
+"""
+
+_INSERT_SYNC = """
+INSERT INTO syncs (
+    project_id, synced_at, from_head, to_head, branch, remote_url, idempotent
+) VALUES (
+    :project_id, :synced_at, :from_head, :to_head, :branch, :remote_url,
+    :idempotent
+)
 """
 
 
@@ -339,3 +358,26 @@ def used_verification_record(
         (project_id, job_id, base_head, diff_fingerprint),
     ).fetchone()
     return dict(row) if row is not None else None
+
+
+def load_sync_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Return every persisted sync-audit row as a dict, oldest first."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM syncs ORDER BY sync_id ASC"
+        ).fetchall()
+    ]
+
+
+def insert_sync_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
+    """Append one sync-audit row as a single ACID transaction.
+
+    Syncs are an append-only audit log: each successful synchronization adds a
+    row, keyed by an autoincrement ``sync_id`` rather than a natural key, so a
+    project may be synchronized many times over its lifetime. Unlike jobs or
+    publications, no single-use bound is enforced from this table; it exists
+    for restart-safe auditability, mirroring the durable-state philosophy.
+    """
+    with connection:
+        connection.execute(_INSERT_SYNC, row)

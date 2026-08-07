@@ -65,6 +65,7 @@ conversation.
 | MCPB-005 — Verification and commit | Fixed verification commands; diff fingerprints; explicit staging paths; human-approved commits; no unrestricted Bash. |
 | MCPB-006 — Durable state | SQLite-backed job and verification persistence; restart re-hydration; honest mid-flight reconciliation; no new tools or permissions. |
 | MCPB-008 — Bounded publication | Opt-in `push_development_commit` capability and `push_detached_development_commit` tool: push exactly the verified detached commit to a new non-trunk remote branch on `origin`; no force/merge/tag/ref-move; one branch per job; fingerprint re-derived from the commit object. |
+| MCPB-009 — Canonical checkout synchronization | Opt-in `sync_canonical_checkout` capability and tool: fast-forward the guarded canonical checkout to exactly the verified current tip of `origin/<default>`; clean + default-branch + exact-expected-head required; `git merge --ff-only`; no push/force/merge-commit/tag/ref-move; additive `syncs` audit table; refuses while a non-terminal job exists, warns about completed-uncommitted jobs that lose verify/commit. |
 
 The detailed sections below refine how to implement and verify these accepted
 items. They do not expand the authority of a phase. Supporting tests,
@@ -237,6 +238,38 @@ The prepared package version is `0.8.0`; 127 core tests pass. The capability
 is dormant unless a project opts in; `cairn-knowledge-store` is granted
 `push_development_commit` in `projects.json`.
 
+### MCPB-009 — Canonical checkout synchronization (implemented locally; pending acceptance)
+
+Read these files completely before review or further implementation:
+
+- `docs/MCPB-009.md`
+- `docs/MCPB-009-IMPLEMENTATION-BRIEF.md`
+
+The prepared MCPB-009 source adds:
+
+- an opt-in `sync_canonical_checkout` capability (requires `repository_read`)
+  and a `sync_canonical_checkout` MCP tool;
+- fast-forward of the guarded canonical checkout to **exactly** the current
+  tip of `origin`'s default branch (`git fetch origin` → require
+  `target_commit == refs/remotes/origin/<default>`) via `git merge --ff-only
+  <target_commit>`, with no force flag and no merge commit;
+- a required clean checkout (tracked and untracked), a required default-branch
+  checkout (detached HEAD and other branches refused), and a required
+  `expected_current_head` that must equal the canonical HEAD;
+- refusal while any non-terminal development job exists, and warnings about
+  completed-but-uncommitted jobs that lose their verify/commit path after the
+  base moves (sync still proceeds);
+- an additive `syncs` audit table in `bridge.db` (`SCHEMA_VERSION` stays 1),
+  re-hydrated synchronously in `SyncManager.__init__`, one append-only ACID
+  row per synchronization;
+- no push, merge-commit creation, tag, deletion, remote ref move, or
+  configurable remote (`origin` only).
+
+The prepared package version is `0.9.0`; 143 core tests pass. The capability
+is dormant unless a project opts in; `cairn-knowledge-store` is granted
+`sync_canonical_checkout` in `projects.json`. It has not been committed,
+pushed, installed, restarted, or exercised against a live repository.
+
 ## Non-negotiable security boundaries
 
 - OpenAI connector mTLS protects the public ngrok endpoint.
@@ -319,14 +352,15 @@ core tests and must be identified as such. Do not fabricate their results.
 
 ## Current resume pointer
 
-Resume by reviewing and accepting **MCPB-008** using:
+Resume by reviewing and accepting **MCPB-009** using:
 
 ```text
-docs/MCPB-008.md
-docs/MCPB-008-IMPLEMENTATION-BRIEF.md
+docs/MCPB-009.md
+docs/MCPB-009-IMPLEMENTATION-BRIEF.md
 ```
 
 MCPB-007 (independent candidate review) is accepted and committed; MCPB-008
-adds the bounded publication capability on top of it. After acceptance,
-explicitly authorize any desired commit/push, live installation/restart, or
-real-repository smoke test as separate actions.
+adds the bounded publication capability; MCPB-009 adds the canonical-checkout
+synchronization capability. After acceptance, explicitly authorize any desired
+commit/push, live installation/restart, or real-repository smoke test as
+separate actions.
