@@ -195,11 +195,24 @@ Only exact IDs and capabilities from that file can be used through MCP. Ensure
 
 ## Run
 
+Single command — starts the MCP server and the ngrok tunnel together, with
+prefixed logs (`[server]` / `[tunnel]`) and clean shutdown on Ctrl+C:
+
+```bash
+./run.sh
+```
+
+`run.sh` activates `.venv`, validates `.env`, `projects.json`, and the mTLS CA,
+then launches `server.py` and `tunnel.py` as child processes. When
+`NGROK_DOMAIN` is set in `.env` (e.g. `swivel-aide-overprice.ngrok-free.dev`)
+the tunnel binds to that reserved domain for a stable connector URL; otherwise
+ngrok issues an ephemeral URL that changes every run.
+
+The two can also be run separately in two terminals:
+
 ```bash
 python server.py
 ```
-
-In a second terminal:
 
 ```bash
 python tunnel.py

@@ -454,6 +454,62 @@ class VerificationCommitTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_candidate_state_closes_fd_when_ls_tree_fails(self) -> None:
+        # Regression guard: the candidate file descriptor is opened before the
+        # per-path ``ls-tree HEAD`` baseline call. If that call raises (timeout
+        # or non-zero git), the already-open fd must be closed by the
+        # ``try/finally`` around the open->``os.fdopen`` window — otherwise the
+        # fd leaks on every such failure.
+        async def exercise() -> None:
+            policy = project(self.root, ["{python}", "-c", "pass"])
+            jobs, manager, completed = await self.prepare(
+                policy,
+                lambda root: (root / "candidate.txt").write_text(
+                    "candidate", encoding="utf-8"
+                ),
+            )
+            worktree = await jobs.verification_worktree(
+                policy, str(completed["job_id"])
+            )
+
+            tracked_fd, tracked_path = tempfile.mkstemp(dir=self.base)
+            os.write(tracked_fd, b"x")
+            os.lseek(tracked_fd, 0, os.SEEK_SET)
+            self.addCleanup(lambda: self._silently_close(tracked_fd))
+
+            original_git_bytes = verification_module._git_bytes
+
+            async def fail_ls_tree(root: Path, *arguments: str, **kwargs: Any) -> bytes:
+                if "ls-tree" in arguments:
+                    raise VerificationError("injected ls-tree failure")
+                return await original_git_bytes(root, *arguments, **kwargs)
+
+            with patch.object(verification_module, "_git_bytes", new=fail_ls_tree):
+                with patch.object(
+                    verification_module, "_open_candidate_read", return_value=tracked_fd
+                ):
+                    with self.assertRaisesRegex(
+                        VerificationError, "injected ls-tree failure"
+                    ):
+                        await verification_module._candidate_state(
+                            self.settings, policy, worktree
+                        )
+
+            # The finally must have closed the tracked fd: fstat now fails
+            # with EBADF. If the leak returned, this fd would still be open.
+            with self.assertRaises(OSError):
+                os.fstat(tracked_fd)
+            os.unlink(tracked_path)
+
+        asyncio.run(exercise())
+
+    @staticmethod
+    def _silently_close(fd: int) -> None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
     def test_verification_waits_for_shared_project_lock(self) -> None:
         async def exercise() -> None:
             marker = self.base / "command-ran"

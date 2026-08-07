@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "local-dev-mcp"
-version = "0.6.0"
+version = "0.7.0"
 description = "A project-aware ChatGPT-to-Claude Code MCP development bridge"
 requires-python = ">=3.11"
 dependencies = [

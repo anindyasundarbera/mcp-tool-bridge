@@ -11,7 +11,7 @@ from local_dev_mcp.jobs import DevelopmentJobError, DevelopmentJobManager
 from local_dev_mcp.models import ProjectPolicy
 from local_dev_mcp.registry import ProjectLockManager, ProjectRegistry
 from local_dev_mcp.server import create_server
-from local_dev_mcp.store import StateStoreError
+from local_dev_mcp.store import StateStoreError, open_state_db
 from local_dev_mcp.verification import VerificationCommitManager, VerificationError
 
 from tests.support import initialize_git_repository
@@ -330,7 +330,7 @@ class PersistenceTests(unittest.TestCase):
             tools = {tool.name for tool in asyncio.run(server.list_tools())}
 
         # Persistence is internal; it must not add any MCP tool.
-        self.assertEqual(len(tools), 15)
+        self.assertEqual(len(tools), 20)
         for leaked in ("persist_job", "list_development_jobs", "reload_jobs"):
             self.assertNotIn(leaked, tools)
         # resume still takes job_id, never session_id.
@@ -347,6 +347,123 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(int(synchronous), 2)  # FULL
 
         asyncio.run(exercise())
+
+    def _fresh_db_path(self) -> Path:
+        db_path = self.base / "state" / "bridge.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        return db_path
+
+    def test_review_row_round_trips_through_persistence(self) -> None:
+        import json as _json
+
+        from local_dev_mcp.store import (
+            load_review_rows,
+            open_state_db,
+            upsert_review_row,
+        )
+
+        db_path = self._fresh_db_path()
+        connection = open_state_db(db_path)
+        try:
+            row = {
+                "review_id": "rev-1",
+                "project_id": "test-project",
+                "job_id": "job-1",
+                "base_head": "abc123",
+                "diff_fingerprint": "sha256:deadbeef",
+                "paths_json": _json.dumps(["src/a.py", "src/b.py"]),
+                "reviewed_at": "2026-08-06T00:00:00Z",
+                "reviewer_id": "claude-opus",
+                "verdict_json": _json.dumps({"approved": True, "notes": "ok"}),
+                "used": 0,
+            }
+            upsert_review_row(connection, row)
+
+            reloaded = load_review_rows(connection)
+            self.assertEqual(len(reloaded), 1)
+            self.assertEqual(reloaded[0], row)
+            # Every field survives, including ``used``.
+            self.assertEqual(reloaded[0]["review_id"], "rev-1")
+            self.assertEqual(reloaded[0]["used"], 0)
+            self.assertEqual(reloaded[0]["verdict_json"], row["verdict_json"])
+            self.assertEqual(reloaded[0]["reviewer_id"], "claude-opus")
+
+            # Upserting again with new values updates the single row in place.
+            row["used"] = 1
+            row["reviewer_id"] = "claude-sonnet"
+            upsert_review_row(connection, row)
+            reloaded = load_review_rows(connection)
+            self.assertEqual(len(reloaded), 1)
+            self.assertEqual(reloaded[0]["used"], 1)
+            self.assertEqual(reloaded[0]["reviewer_id"], "claude-sonnet")
+        finally:
+            connection.close()
+
+    def test_review_id_exists_reports_presence(self) -> None:
+        from local_dev_mcp.store import open_state_db, review_id_exists, upsert_review_row
+
+        db_path = self._fresh_db_path()
+        connection = open_state_db(db_path)
+        try:
+            row = {
+                "review_id": "rev-exists",
+                "project_id": "test-project",
+                "job_id": "job-1",
+                "base_head": "abc123",
+                "diff_fingerprint": "sha256:deadbeef",
+                "paths_json": "[]",
+                "reviewed_at": "2026-08-06T00:00:00Z",
+                "reviewer_id": None,
+                "verdict_json": "{}",
+                "used": 0,
+            }
+            self.assertFalse(review_id_exists(connection, "rev-exists"))
+            self.assertFalse(review_id_exists(connection, "missing"))
+            upsert_review_row(connection, row)
+            self.assertTrue(review_id_exists(connection, "rev-exists"))
+            self.assertFalse(review_id_exists(connection, "missing"))
+        finally:
+            connection.close()
+
+    def test_stale_schema_version_is_advanced_on_open(self) -> None:
+        from local_dev_mcp import store
+
+        db_path = self._fresh_db_path()
+        # First open creates the schema at SCHEMA_VERSION (1).
+        connection = open_state_db(db_path)
+        connection.close()
+        # Simulate a DB written by an older revision: pin the version below
+        # SCHEMA_VERSION and re-open. open_state_db must advance it.
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE schema_meta SET value = '0' WHERE key = 'version'")
+        conn.commit()
+        conn.close()
+
+        connection = open_state_db(db_path)
+        try:
+            row = connection.execute(
+                "SELECT value FROM schema_meta WHERE key = 'version'"
+            ).fetchone()
+            self.assertEqual(int(row["value"]), store.SCHEMA_VERSION)
+        finally:
+            connection.close()
+
+    def test_newer_schema_version_still_refuses_to_open(self) -> None:
+        from local_dev_mcp import store
+
+        db_path = self._fresh_db_path()
+        connection = open_state_db(db_path)
+        connection.close()
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "UPDATE schema_meta SET value = ? WHERE key = 'version'",
+            (str(store.SCHEMA_VERSION + 1),),
+        )
+        conn.commit()
+        conn.close()
+
+        with self.assertRaisesRegex(StateStoreError, "newer than supported"):
+            open_state_db(db_path)
 
 
 if __name__ == "__main__":

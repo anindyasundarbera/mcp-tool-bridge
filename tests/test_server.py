@@ -44,7 +44,7 @@ class ServerSchemaTests(unittest.TestCase):
             )
             tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
 
-        self.assertEqual(len(tools), 15)
+        self.assertEqual(len(tools), 20)
         reader_tools = {
             "list_project_markdown",
             "search_project_markdown",
@@ -145,6 +145,38 @@ class ServerSchemaTests(unittest.TestCase):
         self.assertEqual(commit_schema["properties"]["paths"]["minItems"], 1)
         self.assertEqual(commit_schema["properties"]["paths"]["maxItems"], 500)
         self.assertNotIn("command", tools["verify_development_job"].parameters["properties"])
+
+        review_tools = {
+            "list_candidate_changes",
+            "read_candidate_file",
+            "record_candidate_review",
+            "run_independent_review",
+            "get_candidate_review",
+        }
+        self.assertTrue(review_tools.issubset(tools))
+        for name in (
+            "list_candidate_changes",
+            "read_candidate_file",
+            "get_candidate_review",
+        ):
+            self.assertTrue(tools[name].annotations.readOnlyHint)
+            self.assertFalse(tools[name].annotations.destructiveHint)
+            self.assertFalse(tools[name].annotations.openWorldHint)
+            self.assertEqual(
+                tools[name].parameters["properties"]["job_id"]["pattern"],
+                r"^[0-9a-f]{32}$",
+            )
+        self.assertFalse(tools["record_candidate_review"].annotations.readOnlyHint)
+        self.assertFalse(tools["record_candidate_review"].annotations.destructiveHint)
+        self.assertFalse(tools["record_candidate_review"].annotations.openWorldHint)
+        self.assertFalse(tools["run_independent_review"].annotations.readOnlyHint)
+        self.assertTrue(tools["run_independent_review"].annotations.openWorldHint)
+        commit_schema = tools["commit_verified_development_job"].parameters
+        self.assertIn("review_id", commit_schema["properties"])
+        self.assertIn(
+            "requires_review",
+            commit_schema["properties"]["review_id"]["description"],
+        )
 
     def test_writer_and_development_jobs_share_the_project_modifying_lock(self) -> None:
         class BlockingWriter:

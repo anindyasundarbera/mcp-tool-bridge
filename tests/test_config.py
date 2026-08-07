@@ -1,7 +1,12 @@
 import unittest
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from local_dev_mcp.config import Settings
+from local_dev_mcp.models import ProjectPolicy
+
+from tests.support import project_payload
 
 
 class SettingsTests(unittest.TestCase):
@@ -44,6 +49,100 @@ class SettingsTests(unittest.TestCase):
     def test_accepts_absolute_config_path(self) -> None:
         settings = Settings.from_env({"PROJECTS_CONFIG_PATH": "/tmp/projects.json"})
         self.assertEqual(settings.projects_config_path, Path("/tmp/projects.json"))
+
+
+def _policy(**overrides: object) -> ProjectPolicy:
+    return ProjectPolicy(**project_payload(Path("/tmp/repo"), **overrides))
+
+
+class CandidateReviewPolicyTests(unittest.TestCase):
+    def test_candidate_review_alone_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "candidate_review requires claude_edit"):
+            _policy(
+                capabilities=["repository_read", "candidate_review"],
+            )
+
+    def test_candidate_review_with_claude_edit_is_accepted(self) -> None:
+        policy = _policy(
+            capabilities=[
+                "repository_read",
+                "claude_edit",
+                "candidate_review",
+            ],
+        )
+        self.assertIn("candidate_review", {c.value for c in policy.capabilities})
+
+    def test_requires_review_without_verification_commit_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError, "requires_review requires verification_commit"
+        ):
+            _policy(
+                capabilities=["repository_read", "claude_edit"],
+                requires_review=True,
+            )
+
+    def test_requires_review_without_candidate_review_is_rejected(self) -> None:
+        # requires_review must imply candidate_review: without it no review can
+        # ever be recorded, so the commit gate would deadlock the project.
+        with self.assertRaisesRegex(
+            ValidationError, "requires_review requires candidate_review"
+        ):
+            _policy(
+                capabilities=[
+                    "repository_read",
+                    "claude_edit",
+                    "verification_commit",
+                ],
+                commit_roots=["."],
+                verification_commands=[
+                    {"id": "core", "argv": ["{python}", "-m", "unittest"]},
+                ],
+                requires_review=True,
+            )
+
+    def test_requires_review_with_verification_commit_and_candidate_review_is_accepted(
+        self,
+    ) -> None:
+        policy = _policy(
+            capabilities=[
+                "repository_read",
+                "claude_edit",
+                "verification_commit",
+                "candidate_review",
+            ],
+            commit_roots=["."],
+            verification_commands=[
+                {"id": "core", "argv": ["{python}", "-m", "unittest"]},
+            ],
+            requires_review=True,
+        )
+        self.assertTrue(policy.requires_review)
+
+    def test_allow_bridge_reviewer_without_candidate_review_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError, "allow_bridge_reviewer requires candidate_review"
+        ):
+            _policy(
+                capabilities=["repository_read", "claude_edit"],
+                allow_bridge_reviewer=True,
+            )
+
+    def test_allow_bridge_reviewer_with_candidate_review_is_accepted(self) -> None:
+        policy = _policy(
+            capabilities=[
+                "repository_read",
+                "claude_edit",
+                "candidate_review",
+            ],
+            allow_bridge_reviewer=True,
+        )
+        self.assertTrue(policy.allow_bridge_reviewer)
+
+    def test_existing_style_project_still_validates(self) -> None:
+        policy = _policy()
+        self.assertFalse(policy.requires_review)
+        self.assertFalse(policy.allow_bridge_reviewer)
+        self.assertNotIn("candidate_review", {c.value for c in policy.capabilities})
 
 
 if __name__ == "__main__":

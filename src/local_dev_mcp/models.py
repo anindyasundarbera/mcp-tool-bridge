@@ -15,6 +15,7 @@ class ProjectCapability(StrEnum):
     MARKDOWN_WRITE = "markdown_write"
     CLAUDE_EDIT = "claude_edit"
     VERIFICATION_COMMIT = "verification_commit"
+    CANDIDATE_REVIEW = "candidate_review"
 
 
 def _policy_path(value: str) -> str:
@@ -93,6 +94,8 @@ class ProjectPolicy(BaseModel):
     default_effort: Effort = "high"
     allow_ultracode: bool = True
     self_managed: bool = False
+    requires_review: bool = False
+    allow_bridge_reviewer: bool = False
     claude_model: str | None = None
     claude_max_turns: int | None = Field(default=None, ge=1, le=200)
 
@@ -132,6 +135,29 @@ class ProjectPolicy(BaseModel):
                 "self-managed projects cannot use direct markdown_write against the "
                 "production checkout"
             )
+        if (
+            ProjectCapability.CANDIDATE_REVIEW in self.capabilities
+            and ProjectCapability.CLAUDE_EDIT not in self.capabilities
+        ):
+            raise ValueError("candidate_review requires claude_edit")
+        if (
+            self.requires_review
+            and ProjectCapability.VERIFICATION_COMMIT not in self.capabilities
+        ):
+            raise ValueError("requires_review requires verification_commit")
+        if (
+            self.requires_review
+            and ProjectCapability.CANDIDATE_REVIEW not in self.capabilities
+        ):
+            raise ValueError(
+                "requires_review requires candidate_review "
+                "(otherwise no review can be recorded and the gate deadlocks)"
+            )
+        if (
+            self.allow_bridge_reviewer
+            and ProjectCapability.CANDIDATE_REVIEW not in self.capabilities
+        ):
+            raise ValueError("allow_bridge_reviewer requires candidate_review")
         if (
             ProjectCapability.MARKDOWN_WRITE in self.capabilities
             and not self.markdown_write_roots
