@@ -623,6 +623,98 @@ async def _staged_state(
     )
 
 
+async def committed_state(
+    settings: Settings,
+    project: ProjectPolicy,
+    worktree: JobWorktree,
+    commit_sha: str,
+    base_head: str,
+    paths: tuple[str, ...],
+) -> CandidateState:
+    """Re-derive the candidate fingerprint directly from a committed git object.
+
+    This is the publication counterpart of ``_staged_state``: instead of reading
+    the index, it reads the commit's tree with ``git ls-tree -z <commit_sha> --
+    <path>`` and frames each entry against the ``base_head`` baseline exactly as
+    ``_staged_state`` frames the staged index against ``HEAD``. A path absent
+    from the commit is a deletion. Because ``commit_verified_development_job``
+    stages the verified paths and commits a tree equal to that staged state, the
+    fingerprint computed here equals the one bound to the verification record, so
+    publication can prove the committed object realizes the verified candidate
+    without trusting the jobs table's ``committed_sha`` alone.
+    """
+    timeout = settings.git_command_timeout_seconds
+    digest = hashlib.sha256()
+    digest.update(_FINGERPRINT_MARKER)
+    digest.update(_frame(base_head.encode("ascii")))
+    for relative in paths:
+        _validate_policy_path(project, relative)
+        baseline = await _git_bytes(
+            worktree.path,
+            "ls-tree",
+            "-z",
+            base_head,
+            "--",
+            relative,
+            timeout_seconds=timeout,
+        )
+        if b"\0" in baseline:
+            baseline = baseline.split(b"\0", 1)[0]
+        if baseline.startswith((b"120000 ", b"160000 ")):
+            raise VerificationError("changed symbolic links and submodules are not allowed")
+        digest.update(_frame(relative.encode("utf-8")))
+        digest.update(_frame(baseline))
+
+        entry = await _git_bytes(
+            worktree.path,
+            "ls-tree",
+            "-z",
+            commit_sha,
+            "--",
+            relative,
+            timeout_seconds=timeout,
+        )
+        if b"\0" in entry:
+            entry = entry.split(b"\0", 1)[0]
+        if entry.startswith((b"120000 ", b"160000 ")):
+            raise VerificationError("commit contains a symbolic link or submodule")
+        if not entry:
+            digest.update(_frame(b"deleted"))
+            continue
+        metadata, _, _indexed_path = entry.rstrip(b"\0").partition(b"\t")
+        fields = metadata.split()
+        # ``git ls-tree`` emits "<mode> <type> <oid>\t<path>".
+        if len(fields) != 3:
+            raise VerificationError("commit contains an unexpected tree entry")
+        if fields[0] not in {b"100644", b"100755"}:
+            raise VerificationError("commit contains an unexpected path type")
+        digest.update(_frame(fields[0]))
+        object_id = fields[2].decode("ascii")
+        size_payload = await _git_bytes(
+            worktree.path,
+            "cat-file",
+            "-s",
+            object_id,
+            timeout_seconds=timeout,
+        )
+        try:
+            blob_size = int(size_payload.strip())
+        except ValueError as exc:
+            raise VerificationError("Git returned an invalid committed blob size") from exc
+        digest.update(_frame(str(blob_size).encode("ascii")))
+        actual_size, content_sha256 = await _digest_git_blob(
+            worktree.path, object_id, digest, timeout_seconds=timeout
+        )
+        if actual_size != blob_size:
+            raise VerificationError("Git committed blob size changed while it was read")
+        digest.update(_frame(content_sha256.encode("ascii")))
+    return CandidateState(
+        base_head=base_head,
+        fingerprint=digest.hexdigest(),
+        paths=paths,
+    )
+
+
 async def _read_stream(
     stream: asyncio.StreamReader,
     limit: int,
@@ -1095,3 +1187,444 @@ class VerificationCommitManager:
                 "detached": True,
                 "published": False,
             }
+
+
+class PublicationError(RuntimeError):
+    """Raised when a detached development commit cannot be safely published."""
+
+
+_MAX_BRANCH_LENGTH = 200
+_FORBIDDEN_BRANCH_NAMES = frozenset({"main", "master", "head"})
+_BRANCH_FORBIDDEN_CHARS = frozenset(" \t\n~^:?*[\\")
+
+
+def _validate_branch_name(branch_name: str) -> None:
+    """Reject anything that is not a safe, non-trunk short branch name.
+
+    The caller supplies the short name only; the bridge forms
+    ``refs/heads/<branch_name>``. This guard refuses full refs, ``HEAD``, the
+    trunk branches (``main``/``master`` and the repo default, checked later),
+    leading/trailing or consecutive slashes, leading dots, ``..``, ``.lock``
+    suffixes, ``@{``/``@``, and any control or git-refname-forbidden characters.
+    """
+    if not branch_name or len(branch_name) > _MAX_BRANCH_LENGTH:
+        raise PublicationError("branch_name must be between 1 and 200 characters")
+    if branch_name.startswith("refs/"):
+        raise PublicationError("branch_name must be a short branch name, not a full ref")
+    if branch_name == "HEAD" or branch_name.startswith("HEAD/"):
+        raise PublicationError("branch_name must not be or start with 'HEAD'")
+    if branch_name.startswith("/") or branch_name.endswith("/"):
+        raise PublicationError("branch_name must not start or end with '/'")
+    if branch_name == "@" or "@{" in branch_name:
+        raise PublicationError("branch_name must not be '@' or contain '@{'")
+    parts = branch_name.split("/")
+    for part in parts:
+        if not part:
+            raise PublicationError("branch_name must not contain consecutive '/' segments")
+        if part.startswith("."):
+            raise PublicationError("branch_name components must not start with '.'")
+        if part.endswith(".lock"):
+            raise PublicationError("branch_name components must not end with '.lock'")
+        if ".." in part:
+            raise PublicationError("branch_name must not contain '..'")
+        for character in part:
+            if character in _BRANCH_FORBIDDEN_CHARS or ord(character) < 32:
+                raise PublicationError("branch_name contains forbidden characters")
+    if parts[-1].lower() in _FORBIDDEN_BRANCH_NAMES:
+        raise PublicationError(
+            "branch_name must not target a protected trunk branch (main, master, or HEAD)"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationRecord:
+    project_id: str
+    job_id: str
+    commit_sha: str
+    branch_name: str
+    remote_url: str
+    published_at: str
+
+
+def publication_to_row(record: PublicationRecord) -> dict[str, Any]:
+    return {
+        "project_id": record.project_id,
+        "job_id": record.job_id,
+        "commit_sha": record.commit_sha,
+        "branch_name": record.branch_name,
+        "remote_url": record.remote_url,
+        "published_at": record.published_at,
+    }
+
+
+def publication_from_row(row: dict[str, Any]) -> PublicationRecord | None:
+    try:
+        return PublicationRecord(
+            project_id=row["project_id"],
+            job_id=row["job_id"],
+            commit_sha=row["commit_sha"],
+            branch_name=row["branch_name"],
+            remote_url=row["remote_url"],
+            published_at=row["published_at"],
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+async def _remote_branch_sha(
+    root: Path,
+    branch_name: str,
+    *,
+    timeout_seconds: int,
+) -> str | None:
+    """Return the SHA ``refs/heads/<branch_name>`` points at on origin, or None."""
+    payload = await _git_bytes(
+        root,
+        "ls-remote",
+        "--heads",
+        "origin",
+        branch_name,
+        timeout_seconds=timeout_seconds,
+    )
+    payload = payload.strip()
+    if not payload:
+        return None
+    sha, _, _ = payload.partition(b"\t")
+    return sha.decode("ascii")
+
+
+async def _remote_default_branch(root: Path, *, timeout_seconds: int) -> str | None:
+    """Best-effort origin default branch name, or None if it cannot be resolved.
+
+    ``git symbolic-ref refs/remotes/origin/HEAD`` yields the full target
+    (``refs/remotes/origin/<name>``); ``--short`` would yield ``origin/<name>``,
+    so the full form is parsed and the ``refs/remotes/origin/`` prefix stripped.
+    """
+    try:
+        full = await run_git(
+            root,
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            timeout_seconds=timeout_seconds,
+        )
+    except GitCommandError:
+        return None
+    prefix = "refs/remotes/origin/"
+    return full[len(prefix):] if full.startswith(prefix) else None
+
+
+def _paths_from_verification_row(row: dict[str, Any]) -> tuple[str, ...]:
+    try:
+        loaded = json.loads(row["paths_json"])
+    except (json.JSONDecodeError, TypeError, KeyError) as exc:
+        raise PublicationError("verification record paths are corrupt") from exc
+    if not isinstance(loaded, list) or not loaded:
+        raise PublicationError("verification record has no paths")
+    if not all(isinstance(item, str) and item for item in loaded):
+        raise PublicationError("verification record paths are invalid")
+    return tuple(loaded)
+
+
+class PublicationManager:
+    """Publishes a verified detached development commit to a new remote branch.
+
+    The manager owns the additive ``publications`` table in ``bridge.db`` (one
+    row per ``(project_id, job_id)``) and re-hydrates it synchronously in
+    ``__init__`` so a restart preserves the single-branch-per-job bound.
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        locks: ProjectLockManager,
+        jobs: DevelopmentJobManager,
+        worktrees: GitWorktreeManager | None = None,
+        projects: tuple[ProjectPolicy, ...] = (),
+    ) -> None:
+        self.settings = settings
+        self._locks = locks
+        self._jobs = jobs
+        self._worktrees = worktrees or GitWorktreeManager(
+            settings, tuple(project.root for project in projects)
+        )
+        self._project_roots = tuple(project.root for project in projects)
+        self._publications: dict[tuple[str, str], PublicationRecord] = {}
+        self._publications_lock = asyncio.Lock()
+        self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+        self._reload_publications()
+
+    def _reload_publications(self) -> None:
+        for row in store.load_publication_rows(self._db):
+            record = publication_from_row(row)
+            if record is not None:
+                self._publications[(record.project_id, record.job_id)] = record
+
+    def _persist_publication(self, record: PublicationRecord) -> None:
+        store.upsert_publication_row(self._db, publication_to_row(record))
+
+    def _redaction_paths(
+        self, project: ProjectPolicy, worktree: JobWorktree
+    ) -> tuple[Path, ...]:
+        return (
+            worktree.path,
+            project.root,
+            self.settings.job_worktree_root,
+            self.settings.projects_config_path,
+            *self._project_roots,
+        )
+
+    async def _push_and_verify(
+        self,
+        worktree: JobWorktree,
+        commit_sha: str,
+        branch_name: str,
+        *,
+        timeout: int,
+    ) -> None:
+        await run_git(
+            worktree.path,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "push",
+            "origin",
+            f"{commit_sha}:refs/heads/{branch_name}",
+            timeout_seconds=timeout,
+        )
+        remote_sha = await _remote_branch_sha(
+            worktree.path, branch_name, timeout_seconds=timeout
+        )
+        if remote_sha != commit_sha:
+            raise PublicationError(
+                "push did not create a remote branch pointing at the requested commit"
+            )
+
+    def _response(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        commit_sha: str,
+        branch_name: str,
+        remote_url: str,
+        *,
+        idempotent: bool,
+    ) -> dict[str, Any]:
+        return {
+            "status": "published",
+            "project_id": project.id,
+            "job_id": job_id,
+            "commit_sha": commit_sha,
+            "branch_name": branch_name,
+            "remote_ref": f"refs/heads/{branch_name}",
+            "remote_url": remote_url,
+            "published": True,
+            "idempotent": idempotent,
+        }
+
+    async def publish(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        commit_sha: str,
+        branch_name: str,
+        expected_base_head: str,
+        expected_diff_fingerprint: str,
+    ) -> dict[str, Any]:
+        commit_sha = commit_sha.lower()
+        expected_base_head = expected_base_head.lower()
+        expected_diff_fingerprint = expected_diff_fingerprint.lower()
+        _validate_branch_name(branch_name)
+
+        lock = await self._locks.for_project(project.id)
+        async with lock:
+            try:
+                candidate = await self._jobs.committed_candidate(project, job_id)
+            except DevelopmentJobError as exc:
+                raise PublicationError(str(exc)) from exc
+            if candidate.committed_sha != commit_sha:
+                raise PublicationError(
+                    "commit_sha does not match the detached commit created for this job"
+                )
+            worktree = candidate.worktree
+            if expected_base_head != worktree.base_head:
+                raise PublicationError("expected_base_head does not match the job base HEAD")
+            timeout = self.settings.git_command_timeout_seconds
+
+            # Authorization: a used verification record for this exact evidence.
+            record_row = store.used_verification_record(
+                self._db,
+                project.id,
+                job_id,
+                expected_base_head,
+                expected_diff_fingerprint,
+            )
+            if record_row is None:
+                raise PublicationError(
+                    "no matching used verification record for this base HEAD and fingerprint"
+                )
+            paths = _paths_from_verification_row(record_row)
+
+            try:
+                resolved = await run_git(
+                    worktree.path,
+                    "rev-parse",
+                    "--verify",
+                    f"{commit_sha}^{{commit}}",
+                    timeout_seconds=timeout,
+                )
+                if resolved != commit_sha:
+                    raise PublicationError("commit_sha did not resolve to itself")
+                parent = await run_git(
+                    worktree.path,
+                    "rev-parse",
+                    "--verify",
+                    f"{commit_sha}^",
+                    timeout_seconds=timeout,
+                )
+                if parent != expected_base_head:
+                    raise PublicationError(
+                        "commit_sha parent does not match the verified base HEAD"
+                    )
+                committed_paths = tuple(
+                    sorted(
+                        _decode_paths(
+                            await _git_bytes(
+                                worktree.path,
+                                "diff-tree",
+                                "--no-commit-id",
+                                "--name-only",
+                                "-r",
+                                "-z",
+                                "--no-renames",
+                                commit_sha,
+                                "--",
+                                timeout_seconds=timeout,
+                            )
+                        )
+                    )
+                )
+                if committed_paths != paths:
+                    raise PublicationError(
+                        "commit changes a different path set than the verification record"
+                    )
+                rederived = await committed_state(
+                    self.settings,
+                    project,
+                    worktree,
+                    commit_sha,
+                    expected_base_head,
+                    paths,
+                )
+                if rederived.fingerprint != expected_diff_fingerprint:
+                    raise PublicationError(
+                        "commit_sha does not realize the verified candidate fingerprint"
+                    )
+            except (GitCommandError, VerificationError, WorktreeError) as exc:
+                raise PublicationError(str(exc)) from exc
+
+            try:
+                remote_url = await run_git(
+                    worktree.path,
+                    "remote",
+                    "get-url",
+                    "origin",
+                    timeout_seconds=timeout,
+                )
+            except GitCommandError as exc:
+                raise PublicationError(
+                    "origin remote is not configured for this project"
+                ) from exc
+
+            default_branch = await _remote_default_branch(
+                worktree.path, timeout_seconds=timeout
+            )
+            if default_branch is not None and branch_name == default_branch:
+                raise PublicationError(
+                    "branch_name must not target the repository default branch"
+                )
+
+            async with self._publications_lock:
+                existing = self._publications.get((project.id, job_id))
+            if existing is not None:
+                if (
+                    existing.commit_sha != commit_sha
+                    or existing.branch_name != branch_name
+                ):
+                    raise PublicationError(
+                        "development job has already been published to a different branch"
+                    )
+                remote_sha = await _remote_branch_sha(
+                    worktree.path, branch_name, timeout_seconds=timeout
+                )
+                if remote_sha == commit_sha:
+                    return _redact(
+                        self._response(
+                            project,
+                            job_id,
+                            commit_sha,
+                            branch_name,
+                            remote_url,
+                            idempotent=True,
+                        ),
+                        self._redaction_paths(project, worktree),
+                    )
+                if remote_sha is not None:
+                    raise PublicationError(
+                        "remote branch no longer points at the published commit"
+                    )
+                # The remote branch vanished since the prior publish: re-push to
+                # recover the published ref. The branch is absent, so the new-branch
+                # pre-check below does not apply.
+                try:
+                    await self._push_and_verify(
+                        worktree, commit_sha, branch_name, timeout=timeout
+                    )
+                except (GitCommandError, VerificationError) as exc:
+                    raise PublicationError(str(exc)) from exc
+                return _redact(
+                    self._response(
+                        project,
+                        job_id,
+                        commit_sha,
+                        branch_name,
+                        remote_url,
+                        idempotent=False,
+                    ),
+                    self._redaction_paths(project, worktree),
+                )
+
+            # No prior publication: the remote branch must not already exist.
+            remote_sha = await _remote_branch_sha(
+                worktree.path, branch_name, timeout_seconds=timeout
+            )
+            if remote_sha is not None:
+                raise PublicationError(
+                    "remote branch already exists; publication requires a new branch"
+                )
+            try:
+                await self._push_and_verify(
+                    worktree, commit_sha, branch_name, timeout=timeout
+                )
+            except (GitCommandError, VerificationError) as exc:
+                raise PublicationError(str(exc)) from exc
+            record = PublicationRecord(
+                project_id=project.id,
+                job_id=job_id,
+                commit_sha=commit_sha,
+                branch_name=branch_name,
+                remote_url=remote_url,
+                published_at=_timestamp(),
+            )
+            async with self._publications_lock:
+                self._publications[(project.id, job_id)] = record
+                self._persist_publication(record)
+            return _redact(
+                self._response(
+                    project,
+                    job_id,
+                    commit_sha,
+                    branch_name,
+                    remote_url,
+                    idempotent=False,
+                ),
+                self._redaction_paths(project, worktree),
+            )

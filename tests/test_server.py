@@ -44,7 +44,7 @@ class ServerSchemaTests(unittest.TestCase):
             )
             tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
 
-        self.assertEqual(len(tools), 20)
+        self.assertEqual(len(tools), 21)
         reader_tools = {
             "list_project_markdown",
             "search_project_markdown",
@@ -177,6 +177,22 @@ class ServerSchemaTests(unittest.TestCase):
             "requires_review",
             commit_schema["properties"]["review_id"]["description"],
         )
+
+        push = tools["push_detached_development_commit"]
+        self.assertFalse(push.annotations.readOnlyHint)
+        self.assertTrue(push.annotations.destructiveHint)
+        self.assertTrue(push.annotations.idempotentHint)
+        self.assertTrue(push.annotations.openWorldHint)
+        push_schema = push.parameters
+        for field_name, pattern in (
+            ("job_id", r"^[0-9a-f]{32}$"),
+            ("commit_sha", r"^[0-9a-f]{40}$"),
+            ("expected_base_head", r"^[0-9a-f]{40}$"),
+            ("expected_diff_fingerprint", r"^[0-9a-f]{64}$"),
+        ):
+            self.assertEqual(push_schema["properties"][field_name]["pattern"], pattern)
+        self.assertEqual(push_schema["properties"]["branch_name"]["minLength"], 1)
+        self.assertEqual(push_schema["properties"]["branch_name"]["maxLength"], 200)
 
     def test_writer_and_development_jobs_share_the_project_modifying_lock(self) -> None:
         class BlockingWriter:

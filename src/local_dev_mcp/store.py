@@ -69,6 +69,15 @@ CREATE TABLE IF NOT EXISTS reviews (
     verdict_json TEXT NOT NULL,
     used INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS publications (
+    project_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    branch_name TEXT NOT NULL,
+    remote_url TEXT NOT NULL,
+    published_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, job_id)
+);
 """
 
 _UPSERT_JOB = """
@@ -135,6 +144,19 @@ ON CONFLICT(review_id) DO UPDATE SET
     reviewer_id = excluded.reviewer_id,
     verdict_json = excluded.verdict_json,
     used = excluded.used
+"""
+
+_UPSERT_PUBLICATION = """
+INSERT INTO publications (
+    project_id, job_id, commit_sha, branch_name, remote_url, published_at
+) VALUES (
+    :project_id, :job_id, :commit_sha, :branch_name, :remote_url, :published_at
+)
+ON CONFLICT(project_id, job_id) DO UPDATE SET
+    commit_sha = excluded.commit_sha,
+    branch_name = excluded.branch_name,
+    remote_url = excluded.remote_url,
+    published_at = excluded.published_at
 """
 
 
@@ -268,3 +290,52 @@ def review_id_exists(connection: sqlite3.Connection, review_id: str) -> bool:
         "SELECT 1 FROM reviews WHERE review_id = ?", (review_id,)
     ).fetchone()
     return row is not None
+
+
+def load_publication_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Return every persisted publication row as a dict."""
+    return [
+        dict(row)
+        for row in connection.execute("SELECT * FROM publications").fetchall()
+    ]
+
+
+def upsert_publication_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
+    """Persist one publication row as a single ACID transaction."""
+    with connection:
+        connection.execute(_UPSERT_PUBLICATION, row)
+
+
+def publication_for(
+    connection: sqlite3.Connection,
+    project_id: str,
+    job_id: str,
+) -> dict[str, Any] | None:
+    """Return the publication row for one (project, job), or None."""
+    row = connection.execute(
+        "SELECT * FROM publications WHERE project_id = ? AND job_id = ?",
+        (project_id, job_id),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def used_verification_record(
+    connection: sqlite3.Connection,
+    project_id: str,
+    job_id: str,
+    base_head: str,
+    diff_fingerprint: str,
+) -> dict[str, Any] | None:
+    """Return the used verification record matching the exact evidence, or None.
+
+    A publication is authorized by a verification record that the bridge
+    consumed during ``commit_verified_development_job`` (``used = 1``) and whose
+    ``(base_head, diff_fingerprint)`` match the evidence the caller asserts.
+    """
+    row = connection.execute(
+        "SELECT * FROM verifications "
+        "WHERE project_id = ? AND job_id = ? AND base_head = ? "
+        "AND diff_fingerprint = ? AND used = 1",
+        (project_id, job_id, base_head, diff_fingerprint),
+    ).fetchone()
+    return dict(row) if row is not None else None

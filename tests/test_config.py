@@ -144,6 +144,39 @@ class CandidateReviewPolicyTests(unittest.TestCase):
         self.assertFalse(policy.allow_bridge_reviewer)
         self.assertNotIn("candidate_review", {c.value for c in policy.capabilities})
 
+    def test_push_development_commit_without_verification_commit_is_rejected(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            ValidationError, "push_development_commit requires verification_commit"
+        ):
+            _policy(
+                capabilities=[
+                    "repository_read",
+                    "claude_edit",
+                    "push_development_commit",
+                ],
+            )
+
+    def test_push_development_commit_with_verification_commit_is_accepted(
+        self,
+    ) -> None:
+        policy = _policy(
+            capabilities=[
+                "repository_read",
+                "claude_edit",
+                "verification_commit",
+                "push_development_commit",
+            ],
+            commit_roots=["."],
+            verification_commands=[
+                {"id": "core", "argv": ["{python}", "-m", "unittest"]},
+            ],
+        )
+        self.assertIn(
+            "push_development_commit", {c.value for c in policy.capabilities}
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

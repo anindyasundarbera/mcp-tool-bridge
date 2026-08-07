@@ -91,6 +91,19 @@ class DevelopmentJob:
     task: asyncio.Task[None] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class CommittedCandidate:
+    """A completed job's detached commit and its retained worktree.
+
+    Returned by ``committed_candidate`` for publication: ``committed_sha`` is the
+    exact object ``commit_verified_development_job`` created, and ``worktree`` is
+    the retained isolated worktree whose ``base_head`` is the verified base.
+    """
+
+    committed_sha: str
+    worktree: JobWorktree
+
+
 _VALID_EFFORTS = frozenset({"high", "ultracode"})
 
 
@@ -454,6 +467,36 @@ class DevelopmentJobManager:
             job.session_id = None
             job.updated_at = _timestamp()
             self._persist_job(job)
+
+    async def committed_candidate(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+    ) -> CommittedCandidate:
+        """Return the detached commit SHA and retained worktree for a published job.
+
+        Publication operates on a job that has already passed
+        ``commit_verified_development_job``: it is completed, inactive, has a
+        bridge-created ``committed_sha``, and still retains its worktree (whose
+        ``base_head`` is the verified base). This method never exposes the raw
+        Claude session ID; it returns only what publication needs.
+        """
+        async with self._state_lock:
+            job = self._require_job(project, job_id)
+            if job.status != JobStatus.COMPLETED or job.task is not None:
+                raise DevelopmentJobError(
+                    "only a completed inactive development job can be published"
+                )
+            if job.committed_sha is None:
+                raise DevelopmentJobError(
+                    "development job has no committed detached commit to publish"
+                )
+            if job.worktree is None:
+                raise DevelopmentJobError("job has no retained worktree")
+            return CommittedCandidate(
+                committed_sha=job.committed_sha,
+                worktree=job.worktree,
+            )
 
     async def _set_status(
         self,

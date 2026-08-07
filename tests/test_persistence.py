@@ -330,7 +330,7 @@ class PersistenceTests(unittest.TestCase):
             tools = {tool.name for tool in asyncio.run(server.list_tools())}
 
         # Persistence is internal; it must not add any MCP tool.
-        self.assertEqual(len(tools), 20)
+        self.assertEqual(len(tools), 21)
         for leaked in ("persist_job", "list_development_jobs", "reload_jobs"):
             self.assertNotIn(leaked, tools)
         # resume still takes job_id, never session_id.
@@ -422,6 +422,87 @@ class PersistenceTests(unittest.TestCase):
             upsert_review_row(connection, row)
             self.assertTrue(review_id_exists(connection, "rev-exists"))
             self.assertFalse(review_id_exists(connection, "missing"))
+        finally:
+            connection.close()
+
+    def test_publication_row_round_trips_and_is_unique_per_job(self) -> None:
+        from local_dev_mcp.store import (
+            load_publication_rows,
+            open_state_db,
+            publication_for,
+            upsert_publication_row,
+        )
+
+        db_path = self._fresh_db_path()
+        connection = open_state_db(db_path)
+        try:
+            row = {
+                "project_id": "test-project",
+                "job_id": "job-1",
+                "commit_sha": "c0ffee",
+                "branch_name": "agent/cks-002b",
+                "remote_url": "git@example:repo.git",
+                "published_at": "2026-08-07T00:00:00Z",
+            }
+            upsert_publication_row(connection, row)
+            reloaded = load_publication_rows(connection)
+            self.assertEqual(len(reloaded), 1)
+            self.assertEqual(reloaded[0], row)
+            self.assertEqual(
+                publication_for(connection, "test-project", "job-1"), row
+            )
+            self.assertIsNone(
+                publication_for(connection, "test-project", "job-2")
+            )
+            # Upserting the same (project, job) with a new branch replaces the row.
+            row["branch_name"] = "agent/cks-002c"
+            upsert_publication_row(connection, row)
+            reloaded = load_publication_rows(connection)
+            self.assertEqual(len(reloaded), 1)
+            self.assertEqual(reloaded[0]["branch_name"], "agent/cks-002c")
+        finally:
+            connection.close()
+
+    def test_used_verification_record_matches_exact_evidence_only(self) -> None:
+        import json as _json
+
+        from local_dev_mcp.store import (
+            open_state_db,
+            upsert_record_row,
+            used_verification_record,
+        )
+
+        db_path = self._fresh_db_path()
+        connection = open_state_db(db_path)
+        try:
+            base = "b" * 40
+            fingerprint = "f" * 64
+            connection.execute(
+                "INSERT INTO verifications (verification_id, project_id, job_id, "
+                "base_head, diff_fingerprint, paths_json, verified_at, used, "
+                "commands_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "ver-1", "test-project", "job-1", base, fingerprint,
+                    _json.dumps(["docs/a.md"]), "2026-08-07T00:00:00Z", 1, "[]",
+                ),
+            )
+            connection.commit()
+            self.assertIsNone(
+                used_verification_record(
+                    connection, "test-project", "job-1", base, "0" * 64
+                )
+            )
+            self.assertIsNone(
+                used_verification_record(
+                    connection, "test-project", "job-1", "0" * 40, fingerprint
+                )
+            )
+            matched = used_verification_record(
+                connection, "test-project", "job-1", base, fingerprint
+            )
+            self.assertIsNotNone(matched)
+            self.assertEqual(matched["verification_id"], "ver-1")
+            self.assertEqual(matched["used"], 1)
         finally:
             connection.close()
 

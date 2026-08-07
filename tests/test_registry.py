@@ -188,6 +188,41 @@ class ProjectRegistryTests(unittest.TestCase):
                 with self.assertRaisesRegex(ProjectRegistryError, expected):
                     ProjectRegistry.load(config)
 
+    def test_push_development_commit_requires_verification_commit(self) -> None:
+        repository = self.root / "repo"
+        initialize_git_repository(repository)
+        config = self.root / "projects.json"
+        valid = project_payload(
+            repository,
+            capabilities=[
+                "repository_read",
+                "claude_edit",
+                "verification_commit",
+                "push_development_commit",
+            ],
+            commit_roots=["."],
+            verification_commands=[
+                {"id": "core", "argv": ["{python}", "-m", "unittest"]},
+            ],
+        )
+        write_registry(config, [valid])
+        project = ProjectRegistry.load(config).resolve(
+            "test-project", ProjectCapability.PUSH_DEVELOPMENT_COMMIT
+        )
+        self.assertIn(
+            "push_development_commit", project.public_metadata()["capabilities"]
+        )
+
+        payload = dict(valid)
+        payload.update(
+            {"capabilities": ["repository_read", "claude_edit", "push_development_commit"]}
+        )
+        write_registry(config, [payload])
+        with self.assertRaisesRegex(
+            ProjectRegistryError, "push_development_commit requires verification_commit"
+        ):
+            ProjectRegistry.load(config)
+
     def test_rejects_invalid_verification_command_vectors(self) -> None:
         repository = self.root / "repo"
         initialize_git_repository(repository)
