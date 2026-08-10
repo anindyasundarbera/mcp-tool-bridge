@@ -448,33 +448,37 @@ async def candidate_changed_paths(
     return paths
 
 
-async def _candidate_state(
+async def _digest_candidate_paths(
     settings: Settings,
-    project: ProjectPolicy,
+    project: ProjectPolicy | None,
     worktree: JobWorktree,
-) -> CandidateState:
+    paths: tuple[str, ...],
+    *,
+    validate_policy: bool,
+) -> str:
+    """Content-address the current working-tree state of ``paths``.
+
+    Computes the canonical SHA-256 candidate fingerprint over the worktree's
+    ``base_head`` plus each path's ``HEAD`` baseline and current working-tree
+    bytes/mode/size. This is the shared core of ``_candidate_state`` (full
+    verification) and ``partial_fingerprint`` (mid-flight progress sampler).
+    It does NOT enforce the empty-index guard or the empty-paths guard — those
+    are verification preconditions owned by the callers.
+
+    When ``validate_policy`` is true and ``project`` is given, each path is
+    checked against ``commit_roots``/``protected_paths`` exactly as
+    verification requires. A symlink or submodule entry, a non-regular leaf,
+    or a file that changes while it is read raises ``VerificationError`` so a
+    verification caller fails closed; a progress-sampling caller passes
+    ``validate_policy=False`` and wraps the call in its own try/except.
+    """
     timeout = settings.git_command_timeout_seconds
-    staged = await _git_bytes(
-        worktree.path,
-        "diff",
-        "--cached",
-        "--name-only",
-        "-z",
-        "--no-renames",
-        "HEAD",
-        "--",
-        timeout_seconds=timeout,
-    )
-    if staged:
-        raise VerificationError("candidate index must be empty before verification")
-
-    paths = await candidate_changed_paths(settings, worktree)
-
     digest = hashlib.sha256()
     digest.update(_FINGERPRINT_MARKER)
     digest.update(_frame(worktree.base_head.encode("ascii")))
     for relative in paths:
-        _validate_policy_path(project, relative)
+        if validate_policy and project is not None:
+            _validate_policy_path(project, relative)
         file_descriptor = _open_candidate_read(
             worktree.path, relative, allow_missing=True
         )
@@ -536,10 +540,60 @@ async def _candidate_state(
         finally:
             if not consumed and file_descriptor is not None:
                 os.close(file_descriptor)
+    return digest.hexdigest()
+
+
+async def _candidate_state(
+    settings: Settings,
+    project: ProjectPolicy,
+    worktree: JobWorktree,
+) -> CandidateState:
+    timeout = settings.git_command_timeout_seconds
+    staged = await _git_bytes(
+        worktree.path,
+        "diff",
+        "--cached",
+        "--name-only",
+        "-z",
+        "--no-renames",
+        "HEAD",
+        "--",
+        timeout_seconds=timeout,
+    )
+    if staged:
+        raise VerificationError("candidate index must be empty before verification")
+
+    paths = await candidate_changed_paths(settings, worktree)
+    fingerprint = await _digest_candidate_paths(
+        settings, project, worktree, paths, validate_policy=True
+    )
     return CandidateState(
         base_head=worktree.base_head,
-        fingerprint=digest.hexdigest(),
+        fingerprint=fingerprint,
         paths=paths,
+    )
+
+
+async def partial_fingerprint(
+    settings: Settings,
+    worktree: JobWorktree,
+    paths: tuple[str, ...],
+    *,
+    project: ProjectPolicy | None = None,
+) -> str:
+    """Best-effort content-addressed snapshot of the current changed set.
+
+    Computes the same digest as ``_candidate_state`` over ``base_head`` plus
+    each path's working-tree bytes, but is lenient: it never enforces the
+    empty-index or empty-paths guards and (when ``project`` is omitted) skips
+    policy validation, so the progress sampler can record a checkpoint
+    mid-flight without aborting the job. When ``paths`` is empty the digest
+    covers only ``base_head`` (a stable "no changes yet" value). A caller that
+    needs crash-safety wraps this in try/except and records
+    ``partial_fingerprint=None`` on failure.
+    """
+    return await _digest_candidate_paths(
+        settings, project, worktree, paths, validate_policy=False
     )
 
 

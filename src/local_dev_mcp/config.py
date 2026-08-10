@@ -17,6 +17,17 @@ def _positive_int(environment: Mapping[str, str], name: str, default: int) -> in
     return value
 
 
+def _positive_float(environment: Mapping[str, str], name: str, default: float) -> float:
+    raw = environment.get(name, str(default))
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be greater than zero")
+    return value
+
+
 def _port(environment: Mapping[str, str], name: str, default: int) -> int:
     value = _positive_int(environment, name, default)
     if value > 65535:
@@ -54,6 +65,15 @@ class Settings:
     verification_command_timeout_seconds: int
     max_verification_output_bytes: int
     max_commit_message_chars: int
+    claude_soft_turns: int
+    claude_extension_turns: int
+    claude_max_extensions: int
+    claude_hard_turns: int
+    claude_max_no_progress_turns: int
+    claude_max_tool_failures: int
+    claude_checkpoint_interval_seconds: float
+    claude_checkpoint_max: int
+    claude_stream_json: bool
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str] | None = None) -> "Settings":
@@ -124,4 +144,26 @@ class Settings:
             max_commit_message_chars=_positive_int(
                 env, "MAX_COMMIT_MESSAGE_CHARS", 500
             ),
+            claude_soft_turns=_positive_int(env, "CLAUDE_SOFT_TURNS", 30),
+            claude_extension_turns=_positive_int(
+                env, "CLAUDE_EXTENSION_TURNS", 30
+            ),
+            claude_max_extensions=_positive_int(
+                env, "CLAUDE_MAX_EXTENSIONS", 3
+            ),
+            claude_hard_turns=_positive_int(env, "CLAUDE_HARD_TURNS", 120),
+            claude_max_no_progress_turns=_positive_int(
+                env, "CLAUDE_MAX_NO_PROGRESS_TURNS", 6
+            ),
+            claude_max_tool_failures=_positive_int(
+                env, "CLAUDE_MAX_TOOL_FAILURES", 5
+            ),
+            claude_checkpoint_interval_seconds=_positive_float(
+                env, "CLAUDE_CHECKPOINT_INTERVAL_SECONDS", 30
+            ),
+            claude_checkpoint_max=_positive_int(
+                env, "CLAUDE_CHECKPOINT_MAX", 500
+            ),
+            claude_stream_json=env.get("CLAUDE_STREAM_JSON", "").strip()
+            in ("1", "true", "yes", "on"),
         )

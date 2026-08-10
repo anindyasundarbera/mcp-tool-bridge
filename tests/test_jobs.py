@@ -60,6 +60,7 @@ class ImmediateExecutor:
         *,
         root: Path | None = None,
         resume_session_id: str | None = None,
+        max_turns: int | None = None,
     ) -> dict[str, Any]:
         assert root is not None
         self.calls.append(
@@ -68,6 +69,7 @@ class ImmediateExecutor:
                 "text": specification,
                 "effort": effort,
                 "resume_session_id": resume_session_id,
+                "max_turns": max_turns,
             }
         )
         (root / "candidate.txt").write_text(
@@ -96,6 +98,7 @@ class BlockingExecutor(ImmediateExecutor):
         *,
         root: Path | None = None,
         resume_session_id: str | None = None,
+        max_turns: int | None = None,
     ) -> dict[str, Any]:
         assert root is not None
         self.calls.append({"root": root, "resume_session_id": resume_session_id})
@@ -139,6 +142,7 @@ class ParallelExecutor:
         *,
         root: Path | None = None,
         resume_session_id: str | None = None,
+        max_turns: int | None = None,
     ) -> dict[str, Any]:
         self.projects.add(project.id)
         if len(self.projects) == 2:

@@ -22,10 +22,17 @@ def build_claude_command(
     project: ProjectPolicy,
     effort: Effort,
     resume_session_id: str | None = None,
+    *,
+    max_turns_override: int | None = None,
 ) -> list[str]:
     validate_effort(project, effort)
     model = project.claude_model or settings.claude_model
-    max_turns = project.claude_max_turns or settings.claude_max_turns
+    if max_turns_override is not None:
+        if max_turns_override <= 0:
+            raise ValueError("max_turns_override must be positive")
+        max_turns = max_turns_override
+    else:
+        max_turns = project.claude_max_turns or settings.claude_max_turns
     command = [
         "ollama",
         "launch",
@@ -60,11 +67,17 @@ def build_claude_command(
         "--max-turns",
         str(max_turns),
         "--output-format",
-        "json",
+        "stream-json" if settings.claude_stream_json else "json",
         "--effort",
         effort,
         ]
     )
+    if settings.claude_stream_json:
+        # ``--verbose`` makes stream-json emit the full event sequence (system/
+        # user/assistant/result) so the bridge can count turns and tool errors as
+        # they happen. Omitted in plain ``json`` mode, where only the final
+        # envelope is produced and the bridge relies on the progress sampler.
+        command.append("--verbose")
     return command
 
 
@@ -130,6 +143,59 @@ async def terminate_process_group(process: asyncio.subprocess.Process) -> None:
         await process.wait()
 
 
+def _parse_output(stdout: str, *, stream: bool) -> dict[str, Any]:
+    """Parse Claude's stdout into a result envelope.
+
+    In plain ``json`` mode ``stdout`` is one JSON object. In ``stream-json``
+    mode it is newline-delimited JSON events whose terminal ``type == "result"``
+    event carries the same envelope fields (``result``, ``session_id``,
+    ``num_turns``, ``usage``, ``subtype``, ``is_error``, ``terminal_reason``);
+    ``type == "assistant"`` events are counted as turns and ``type == "user"``
+    tool-result items with ``is_error`` as tool failures. Malformed lines are
+    skipped so one bad event never loses the whole run. Falls back to a
+    best-effort envelope (mirroring the json path) if no result event is found.
+    """
+    if not stream:
+        try:
+            return json.loads(stdout)
+        except json.JSONDecodeError:
+            return {"is_error": True, "result": stdout}
+
+    envelope: dict[str, Any] = {}
+    assistant_turns = 0
+    tool_failures = 0
+    saw_result = False
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("type")
+        if event_type == "assistant":
+            assistant_turns += 1
+        elif event_type == "user":
+            for item in event.get("content") or []:
+                if isinstance(item, dict) and item.get("is_error"):
+                    tool_failures += 1
+        elif event_type == "result":
+            saw_result = True
+            envelope = event
+    if not saw_result:
+        # No terminal result event: treat as an error with whatever was emitted.
+        return {"is_error": True, "result": stdout, "num_turns": assistant_turns}
+    # Surface turn/tool counts derived from the event stream alongside the
+    # envelope so callers can use them even when the result event omits them.
+    if "num_turns" not in envelope:
+        envelope["num_turns"] = assistant_turns
+    envelope.setdefault("tool_failures", tool_failures)
+    return envelope
+
+
 class ClaudeExecutor:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -141,13 +207,17 @@ class ClaudeExecutor:
         effort: Effort,
         execution_root: Path,
         text: str,
+        *,
+        stream: bool = False,
     ) -> dict[str, Any]:
         """Shared bounded-subprocess core for the drafter and the reviewer.
 
         Spawns the given Claude command, pipes ``text`` to stdin, bounds wall
-        clock and output size, and parses the JSON result. The caller shapes
-        the public response; this method only reports what happened. On
-        timeout the process group is killed and ``timed_out`` is reported.
+        clock and output size, and parses the result envelope (one JSON object
+        in plain ``json`` mode, or a newline-delimited event stream in
+        ``stream-json`` mode). The caller shapes the public response; this
+        method only reports what happened. On timeout the process group is
+        killed and ``timed_out`` is reported.
         """
         before = await project_status(
             execution_root, self.settings.git_command_timeout_seconds
@@ -193,9 +263,8 @@ class ClaudeExecutor:
         oversized = len(stdout_bytes) > self.settings.max_output_bytes
         stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
         stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
-        try:
-            claude_result = json.loads(stdout)
-        except json.JSONDecodeError:
+        claude_result = _parse_output(stdout, stream=stream)
+        if not stream and not claude_result:
             claude_result = {
                 "is_error": process.returncode != 0,
                 "result": stdout,
@@ -218,6 +287,7 @@ class ClaudeExecutor:
         *,
         root: Path | None = None,
         resume_session_id: str | None = None,
+        max_turns: int | None = None,
     ) -> dict[str, Any]:
         text = specification.strip()
         if not text:
@@ -229,10 +299,19 @@ class ClaudeExecutor:
 
         execution_root = project.root if root is None else root
         command = build_claude_command(
-            self.settings, project, effort, resume_session_id
+            self.settings,
+            project,
+            effort,
+            resume_session_id,
+            max_turns_override=max_turns,
         )
         outcome = await self._run_claude(
-            command, project, effort, execution_root, text
+            command,
+            project,
+            effort,
+            execution_root,
+            text,
+            stream=self.settings.claude_stream_json,
         )
         model = project.claude_model or self.settings.claude_model
 
@@ -271,6 +350,9 @@ class ClaudeExecutor:
             "terminal_reason": claude_result.get("terminal_reason"),
             "subtype": claude_result.get("subtype"),
             "errors": claude_result.get("errors", []),
+            "usage": claude_result.get("usage"),
+            "num_turns": claude_result.get("num_turns"),
+            "tool_failures": claude_result.get("tool_failures", 0),
             "repository_before": outcome["before"],
             "repository_after": outcome["after"],
         }
@@ -311,7 +393,12 @@ class ClaudeExecutor:
             self.settings, project, effort, resume_session_id=None
         )
         outcome = await self._run_claude(
-            command, project, effort, execution_root, text
+            command,
+            project,
+            effort,
+            execution_root,
+            text,
+            stream=False,
         )
         model = project.claude_model or self.settings.claude_model
 

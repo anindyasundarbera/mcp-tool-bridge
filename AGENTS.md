@@ -66,6 +66,7 @@ conversation.
 | MCPB-006 — Durable state | SQLite-backed job and verification persistence; restart re-hydration; honest mid-flight reconciliation; no new tools or permissions. |
 | MCPB-008 — Bounded publication | Opt-in `push_development_commit` capability and `push_detached_development_commit` tool: push exactly the verified detached commit to a new non-trunk remote branch on `origin`; no force/merge/tag/ref-move; one branch per job; fingerprint re-derived from the commit object. |
 | MCPB-009 — Canonical checkout synchronization | Opt-in `sync_canonical_checkout` capability and tool: fast-forward the guarded canonical checkout to exactly the verified current tip of `origin/<default>`; clean + default-branch + exact-expected-head required; `git merge --ff-only`; no push/force/merge-commit/tag/ref-move; additive `syncs` audit table; refuses while a non-terminal job exists, warns about completed-uncommitted jobs that lose verify/commit. |
+| MCPB-010 — Continuity release | Internal turn-level mission state: durable `job_checkpoints`/`job_events`/`job_progress` tables (additive, `SCHEMA_VERSION` stays 1); a `paused_*` family of `JobStatus` (resumable) plus `failed_infrastructure`/`quarantined_provenance` (terminal, non-resumable); crash-with-checkpoints → `paused_interrupted` instead of `failed`; soft/multi-dimensional/progress-gated budgets (`CLAUDE_SOFT_TURNS`/`CLAUDE_EXTENSION_TURNS`/`CLAUDE_MAX_EXTENSIONS`/`CLAUDE_HARD_TURNS`/`CLAUDE_MAX_NO_PROGRESS_TURNS`/`CLAUDE_MAX_TOOL_FAILURES`); in-place `--resume <session_id>` extension slices; checkpoint compaction; opt-in `CLAUDE_STREAM_JSON` turn counting; structured terminal report in `get_development_job`. Zero new MCP tools, parameters, or permissions. |
 
 The detailed sections below refine how to implement and verify these accepted
 items. They do not expand the authority of a phase. Supporting tests,
@@ -270,6 +271,57 @@ is dormant unless a project opts in; `cairn-knowledge-store` is granted
 `sync_canonical_checkout` in `projects.json`. It has not been committed,
 pushed, installed, restarted, or exercised against a live repository.
 
+### MCPB-010 — Continuity release (implemented locally; pending acceptance)
+
+Read these files completely before review or further implementation:
+
+- `docs/MCPB-010.md`
+- `docs/MCPB-010-IMPLEMENTATION-BRIEF.md`
+
+The prepared MCPB-010 source adds **internal** turn-level mission state — zero
+new MCP tools, parameters, or permissions (mirroring MCPB-006's
+`test_durable_state_adds_no_new_mcp_tools`):
+
+- three additive tables in `bridge.db` — `job_checkpoints`, `job_events`
+  (append-only audit ledger), and a sidecar `job_progress` table — created with
+  `CREATE TABLE IF NOT EXISTS`; `SCHEMA_VERSION` stays 1, no `ALTER TABLE` on
+  the existing `jobs` table, existing databases upgrade in place;
+- a `paused_*` family of `JobStatus` — `paused_budget_exhausted`,
+  `paused_interrupted`, `blocked_input_required` (resumable) and
+  `failed_infrastructure`, `quarantined_provenance` (terminal, non-resumable) —
+  so budget exhaustion and a stalled run pause rather than fail; genuine
+  candidate failures stay `failed`;
+- crash reconciliation that preserves progress: a non-terminal job **with**
+  checkpoint rows reloads as `paused_interrupted` (resumable from the last
+  checkpoint); **without** checkpoints it reloads as `failed` (unchanged);
+- soft, multi-dimensional, progress-gated budgets via `CLAUDE_SOFT_TURNS`,
+  `CLAUDE_EXTENSION_TURNS`, `CLAUDE_MAX_EXTENSIONS`, `CLAUDE_HARD_TURNS`,
+  `CLAUDE_MAX_NO_PROGRESS_TURNS`, `CLAUDE_MAX_TOOL_FAILURES`; progress is a
+  changed-path delta reusing `verification.candidate_changed_paths` +
+  `partial_fingerprint`; a progressing run gets an in-place `--resume
+  <session_id>` extension slice, a stalled run pauses, a tool-failure storm
+  terminates as `failed_infrastructure`;
+- `resume_development_job` accepts `paused_*` jobs, keeps the cumulative
+  budget, and seeds the drafter from the last checkpoint's changed-path set;
+  non-resumable states are rejected;
+- checkpoint compaction (`compact_checkpoints` keeps all
+  boundary/extension/milestone rows + the most recent N sample rows), triggered
+  at terminal transitions and above `CLAUDE_CHECKPOINT_MAX`;
+- opt-in `CLAUDE_STREAM_JSON` drives Claude with `--output-format stream-json
+  --verbose` and a pure `_parse_output` that derives real `num_turns`/
+  `tool_failures`/`usage`; the default path stays `json` with the sampler
+  driving progress (turn counts are then sample counts); the reviewer never
+  streams;
+- a structured terminal report in `get_development_job` (`_snapshot`): always
+  present `prohibited_actions`, full `budget` object, `checkpoint_count`,
+  `milestones`, `blockers`, `pause_reason`, and the latest checkpoint's
+  `candidate_fingerprint`/`changed_path_count`/`changed_paths` — additive, no
+  new tool.
+
+The prepared package version is `0.10.0`; 167 core tests pass (143 prior + 11
+new `test_claude` + 13 new `test_checkpoints`). It has not been committed,
+pushed, installed, restarted, or exercised against a live repository.
+
 ## Non-negotiable security boundaries
 
 - OpenAI connector mTLS protects the public ngrok endpoint.
@@ -352,15 +404,17 @@ core tests and must be identified as such. Do not fabricate their results.
 
 ## Current resume pointer
 
-Resume by reviewing and accepting **MCPB-009** using:
+Resume by reviewing and accepting **MCPB-010** using:
 
 ```text
-docs/MCPB-009.md
-docs/MCPB-009-IMPLEMENTATION-BRIEF.md
+docs/MCPB-010.md
+docs/MCPB-010-IMPLEMENTATION-BRIEF.md
 ```
 
 MCPB-007 (independent candidate review) is accepted and committed; MCPB-008
 adds the bounded publication capability; MCPB-009 adds the canonical-checkout
-synchronization capability. After acceptance, explicitly authorize any desired
-commit/push, live installation/restart, or real-repository smoke test as
-separate actions.
+synchronization capability; MCPB-010 adds internal turn-level continuity state
+(durable checkpoints, paused states, soft/progress-gated budgets, structured
+terminal report) with zero new MCP tools. After acceptance, explicitly
+authorize any desired commit/push, live installation/restart, or
+real-repository smoke test as separate actions.
