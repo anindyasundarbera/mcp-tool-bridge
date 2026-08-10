@@ -121,6 +121,23 @@ CREATE TABLE IF NOT EXISTS job_progress (
     milestones_json TEXT,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS requirements (
+    requirement_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    source_line INTEGER NOT NULL,
+    normative BOOLEAN NOT NULL
+);
+CREATE TABLE IF NOT EXISTS requirement_links (
+    link_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    requirement_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    link_type TEXT NOT NULL,
+    link_value TEXT NOT NULL,
+    FOREIGN KEY (requirement_id) REFERENCES requirements(requirement_id),
+    FOREIGN KEY (job_id) REFERENCES jobs(job_id)
+);
 """
 
 _UPSERT_JOB = """
@@ -247,6 +264,28 @@ ON CONFLICT(job_id) DO UPDATE SET
     soft_warned = excluded.soft_warned,
     milestones_json = excluded.milestones_json,
     updated_at = excluded.updated_at
+"""
+
+_UPSERT_REQUIREMENT = """
+INSERT INTO requirements (
+    requirement_id, project_id, text, source_path, source_line, normative
+) VALUES (
+    :requirement_id, :project_id, :text, :source_path, :source_line, :normative
+)
+ON CONFLICT(requirement_id) DO UPDATE SET
+    project_id = excluded.project_id,
+    text = excluded.text,
+    source_path = excluded.source_path,
+    source_line = excluded.source_line,
+    normative = excluded.normative
+"""
+
+_UPSERT_REQUIREMENT_LINK = """
+INSERT INTO requirement_links (
+    requirement_id, job_id, link_type, link_value
+) VALUES (
+    :requirement_id, :job_id, :link_type, :link_value
+)
 """
 
 
@@ -585,3 +624,35 @@ def load_progress_row(
         "SELECT * FROM job_progress WHERE job_id = ?", (job_id,)
     ).fetchone()
     return dict(row) if row is not None else None
+
+
+def upsert_requirement_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
+    """Persist one requirement row as a single ACID transaction."""
+    with connection:
+        connection.execute(_UPSERT_REQUIREMENT, row)
+
+
+def upsert_requirement_link_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
+    """Persist one requirement link row as a single ACID transaction."""
+    with connection:
+        connection.execute(_UPSERT_REQUIREMENT_LINK, row)
+
+
+def load_requirement_links_for_job(connection: sqlite3.Connection, job_id: str) -> list[dict[str, Any]]:
+    """Return all requirement links for a given job."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM requirement_links WHERE job_id = ?", (job_id,)
+        ).fetchall()
+    ]
+
+
+def load_requirement_links_for_requirement(connection: sqlite3.Connection, requirement_id: str) -> list[dict[str, Any]]:
+    """Return all requirement links for a given requirement."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM requirement_links WHERE requirement_id = ?", (requirement_id,)
+        ).fetchall()
+    ]

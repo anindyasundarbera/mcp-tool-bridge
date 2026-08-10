@@ -1,0 +1,453 @@
+<title>BridgeLab → Super Developer Level</title>
+<meta name="description" content="Open-source capability elevation map for the BridgeLab MCP dev bridge — patterns to adopt, mapped to its 33-milestone roadmap.">
+
+<style>
+  :root {
+    --bg: #EEF1F4;
+    --surface: #FBFCFD;
+    --surface-2: #F3F6F9;
+    --ink: #16202B;
+    --ink-soft: #44505C;
+    --ink-faint: #6B7782;
+    --rule: #D3D9E0;
+    --rule-soft: #E2E7EC;
+    --accent: #1F6F6B;
+    --accent-ink: #15514E;
+    --accent-soft: #E2EEED;
+    --done: #2E7D5B;
+    --warn: #B8862A;
+    --miss: #A8423A;
+    --code-bg: #E6EAEE;
+    --font-display: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, "Helvetica Neue", sans-serif;
+    --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0E151C;
+      --surface: #141E28;
+      --surface-2: #0B141C;
+      --ink: #DCE3EA;
+      --ink-soft: #93A1AD;
+      --ink-faint: #6E7C88;
+      --rule: #243340;
+      --rule-soft: #1A2832;
+      --accent: #4FB3AE;
+      --accent-ink: #76D1CC;
+      --accent-soft: #1A2E2D;
+      --done: #5BBB85;
+      --warn: #D4A24A;
+      --miss: #D26B61;
+      --code-bg: #0B141C;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0E151C; --surface: #141E28; --surface-2: #0B141C;
+    --ink: #DCE3EA; --ink-soft: #93A1AD; --ink-faint: #6E7C88;
+    --rule: #243340; --rule-soft: #1A2832;
+    --accent: #4FB3AE; --accent-ink: #76D1CC; --accent-soft: #1A2E2D;
+    --done: #5BBB85; --warn: #D4A24A; --miss: #D26B61; --code-bg: #0B141C;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--font-body); font-size: 15.5px; line-height: 1.62;
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+  }
+  .wrap { max-width: 780px; margin: 0 auto; padding: 0 20px 96px; }
+
+  /* header */
+  header {
+    border-bottom: 1px solid var(--rule);
+    padding: 44px 20px 28px; background: var(--bg);
+  }
+  .header-inner { max-width: 780px; margin: 0 auto; }
+  .eyebrow {
+    font-family: var(--font-display); font-size: 11px; letter-spacing: 0.16em;
+    text-transform: uppercase; color: var(--accent); margin: 0 0 14px; font-weight: 600;
+  }
+  h1 {
+    font-family: var(--font-display); font-weight: 600; font-size: clamp(26px, 4.2vw, 34px);
+    line-height: 1.16; letter-spacing: -0.01em; margin: 0 0 12px; text-wrap: balance;
+    color: var(--ink);
+  }
+  .lede { font-size: 16px; color: var(--ink-soft); max-width: 62ch; margin: 0; }
+  .meta-row {
+    display: flex; flex-wrap: wrap; gap: 10px; margin-top: 22px;
+    font-family: var(--font-display); font-size: 11px; letter-spacing: 0.04em;
+  }
+  .chip {
+    border: 1px solid var(--rule); border-radius: 999px; padding: 4px 10px;
+    color: var(--ink-soft); background: var(--surface);
+  }
+  .chip b { color: var(--ink); font-weight: 600; }
+
+  /* sections */
+  section { margin-top: 56px; }
+  h2 {
+    font-family: var(--font-display); font-weight: 600; font-size: 20px;
+    letter-spacing: -0.01em; margin: 0 0 6px; color: var(--ink); text-wrap: balance;
+  }
+  .sec-label {
+    font-family: var(--font-display); font-size: 11px; letter-spacing: 0.16em;
+    text-transform: uppercase; color: var(--accent); margin: 0 0 16px; font-weight: 600;
+  }
+  h3 {
+    font-family: var(--font-display); font-weight: 600; font-size: 15px;
+    letter-spacing: 0.01em; margin: 30px 0 10px; color: var(--ink);
+  }
+  p { margin: 0 0 14px; max-width: 66ch; }
+  a { color: var(--accent-ink); text-decoration: none; border-bottom: 1px solid color-mix(in srgb, var(--accent) 40%, transparent); }
+  a:hover { border-bottom-color: var(--accent); }
+  code, .mono { font-family: var(--font-mono); font-size: 0.88em; }
+  .ic { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; color: var(--ink); }
+
+  /* status legend + tags */
+  .legend { display: flex; flex-wrap: wrap; gap: 18px; font-size: 13px; color: var(--ink-soft); margin: 0 0 20px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+  .d-done { background: var(--done); } .d-warn { background: var(--warn); } .d-miss { background: var(--miss); }
+  .tag {
+    font-family: var(--font-display); font-size: 10.5px; letter-spacing: 0.05em;
+    padding: 2px 7px; border-radius: 4px; white-space: nowrap; font-weight: 600;
+  }
+  .t-done { color: var(--done); background: color-mix(in srgb, var(--done) 16%, transparent); }
+  .t-warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 16%, transparent); }
+  .t-miss { color: var(--miss); background: color-mix(in srgb, var(--miss) 16%, transparent); }
+  .t-surf { color: var(--accent-ink); background: var(--accent-soft); }
+
+  /* tables */
+  .table-scroll { overflow-x: auto; margin: 0 0 14px; border: 1px solid var(--rule); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; min-width: 560px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+  thead th {
+    font-family: var(--font-display); font-size: 10.5px; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--ink-faint); font-weight: 600;
+    background: var(--surface-2); border-bottom: 1px solid var(--rule);
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:nth-child(even) { background: var(--surface); }
+  td.num { font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--ink-soft); }
+  td.repo { font-family: var(--font-mono); font-size: 12.5px; white-space: nowrap; }
+  td.repo a { color: var(--ink); border-bottom: none; }
+  td.repo a:hover { color: var(--accent-ink); }
+
+  /* adoption callout */
+  .adopt {
+    border-left: 3px solid var(--accent); background: var(--surface);
+    padding: 14px 16px; border-radius: 0 8px 8px 0; margin: 14px 0 18px;
+  }
+  .adopt .head {
+    font-family: var(--font-display); font-size: 11px; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--accent); font-weight: 600; margin: 0 0 6px;
+  }
+  .adopt p { margin: 0; font-size: 14px; color: var(--ink-soft); max-width: none; }
+  .adopt p + p { margin-top: 8px; }
+  .adopt b { color: var(--ink); }
+
+  /* phase cards */
+  .phase-grid { display: grid; gap: 14px; }
+  .phase {
+    border: 1px solid var(--rule); border-radius: 8px; padding: 16px 18px; background: var(--surface);
+  }
+  .phase .ph-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+  .phase .ph-id { font-family: var(--font-mono); font-size: 12.5px; color: var(--accent-ink); font-weight: 600; }
+  .phase .ph-title { font-family: var(--font-display); font-size: 15px; font-weight: 600; color: var(--ink); }
+  .phase .ph-source { margin-left: auto; font-family: var(--font-mono); font-size: 11.5px; color: var(--ink-faint); }
+  .phase p { margin: 4px 0 0; font-size: 13.5px; color: var(--ink-soft); max-width: none; }
+  .phase .tags { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
+
+  /* target comparison */
+  .target th, .target td { font-size: 13px; }
+  .target td.dim { font-family: var(--font-display); font-weight: 600; color: var(--ink); white-space: nowrap; }
+
+  hr.rule { border: 0; border-top: 1px solid var(--rule); margin: 40px 0 0; }
+  .footnote { font-size: 12.5px; color: var(--ink-faint); max-width: 66ch; }
+  ul.tight { margin: 6px 0 14px; padding-left: 20px; max-width: 64ch; }
+  ul.tight li { margin-bottom: 5px; }
+  .note { font-size: 13px; color: var(--ink-soft); background: var(--surface-2); border: 1px solid var(--rule-soft); padding: 11px 14px; border-radius: 6px; max-width: 66ch; }
+  .note b { color: var(--ink); }
+  @media (max-width: 560px) { .phase .ph-source { margin-left: 0; } .meta-row { font-size: 10px; } }
+</style>
+
+<header>
+  <div class="header-inner">
+    <p class="eyebrow">Capability elevation map · 2026-08-10</p>
+    <h1>BridgeLab → Super Developer Level</h1>
+    <p class="lede">An open-source scan of the MCP / agentic-dev / sandbox / supply-chain ecosystem, mapped onto BridgeLab's own 149-item capability roadmap — the patterns worth adopting, in the order that unblocks the most.</p>
+    <div class="meta-row">
+      <span class="chip">BridgeLab <b>v0.10.0</b> (MCPB-010, PR #5)</span>
+      <span class="chip"><b>44</b> done · <b>53</b> partial · <b>52</b> missing</span>
+      <span class="chip"><b>33</b> milestones</span>
+      <span class="chip">research via <b>GitHub API + SearXNG</b></span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <section>
+    <p class="sec-label">Context</p>
+    <h2>What BridgeLab is, and the shape of the gap</h2>
+    <p>BridgeLab (<span class="ic">anindyasundarbera/mcp-tool-bridge</span>) is an MCP bridge: ChatGPT reaches it over an ngrok+mTLS tunnel and drives a <b>local</b> Claude Code CLI to do isolated engineering on the user's own allowlisted projects. Its spine is a security discipline, not a feature list — validated multi-project registry, detached-git-worktree isolation per job, fixed-argv verification (no shell), SHA-256 candidate fingerprints, separate human-approved commits, opt-in non-trunk push, durable SQLite state with resumable checkpoints, soft/hard turn budgets, and an append-only job event ledger.</p>
+    <p>A 12-agent audit (recorded in <span class="ic">docs/MCPB-ROADMAP.md</span>) scored all 149 capability items against the source: <b>44 done, 53 partial, 52 missing — 105 open</b>. MCPB-010 closed the P0 continuity core. Most of P1 (evidence, requirements, orchestration), most of P2 (verification lab, governance, security, recovery), and all of P3 remain. The question this report answers: <b>which open-source projects already solve these gaps in a way BridgeLab can adopt without breaking its security spine?</b></p>
+    <div class="legend">
+      <span><span class="dot d-done"></span> done / adoptable as-is</span>
+      <span><span class="dot d-warn"></span> partial — needs the named piece</span>
+      <span><span class="dot d-miss"></span> missing — nothing delivers it</span>
+      <span><span class="tag t-surf" style="font-size:10px">NEW SURFACE</span> needs authorization, dormant by default</span>
+    </div>
+  </section>
+
+  <section>
+    <p class="sec-label">The landscape</p>
+    <h2>Open-source projects by domain</h2>
+    <p>Star counts and last-activity pulled directly from the GitHub API (2026-08-10); qualitative patterns from SearXNG reads of each project's docs. Listed because each offers a capability pattern BridgeLab currently lacks — not as integration recommendations. BridgeLab's constraints (no <span class="ic">shell=True</span>, no <span class="ic">bypassPermissions</span>, fixed argv, path redaction, worktree isolation) rule out wholesale adoption of most of these; the value is the <b>pattern</b>, adopted behind BridgeLab's own fixed-argv boundary.</p>
+
+    <h3>Agentic dev loops — BridgeLab's direct peers</h3>
+    <div class="table-scroll"><table>
+      <thead><tr><th>Project</th><th class="num">★</th><th>Pattern BridgeLab lacks</th></tr></thead>
+      <tbody>
+        <tr><td class="repo"><a href="https://github.com/All-Hands-AI/OpenHands">All-Hands-AI/OpenHands</a></td><td class="num">major</td><td>Sandboxed runtime per task; RBAC + multi-user; GitHub/GitLab/Bitbucket + Slack/Jira/Linear wiring; hooks/skills/plugins/MCP as first-class extension points</td></tr>
+        <tr><td class="repo"><a href="https://github.com/Aider-AI/aider">Aider-AI/aider</a></td><td class="num">48k</td><td>Edit→test→commit loop with repo-aware diff tracking; lightweight, single-process</td></tr>
+        <tr><td class="repo"><a href="https://github.com/SWE-agent/SWE-agent">SWE-agent/SWE-agent</a></td><td class="num">20k</td><td>Issue→fix loop with bounded action space; NeurIPS'24 validated</td></tr>
+        <tr><td class="repo"><a href="https://github.com/cline/cline">cline/cline</a></td><td class="num">66k</td><td>Autonomous coding agent shipped as SDK + IDE + CLI; checkpoint/resume UX</td></tr>
+        <tr><td class="repo"><a href="https://github.com/aaif-goose/goose">aaif-goose/goose</a></td><td class="num">OSS</td><td>Machine-local agent; tool-calling; explicit per-tool permission gating</td></tr>
+        <tr><td class="repo"><a href="https://github.com/ruvnet/ruflo">ruvnet/ruflo</a></td><td class="num">67k</td><td>Multi-agent swarm harness, Claude Code / Codex native; adaptive memory</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>Multi-agent orchestration &amp; durable state</h3>
+    <div class="table-scroll"><table>
+      <thead><tr><th>Project</th><th class="num">★</th><th>Pattern BridgeLab lacks</th></tr></thead>
+      <tbody>
+        <tr><td class="repo"><a href="https://github.com/langchain-ai/langgraph">langchain-ai/langgraph</a></td><td class="num">39k</td><td><b>Checkpointers</b> (thread-state snapshots), <b>Stores</b> (long-term memory), fault tolerance, interrupts, time-travel, <b>subgraphs</b> — the canonical durable-agent-state model</td></tr>
+        <tr><td class="repo"><a href="https://github.com/microsoft/autogen">microsoft/autogen</a></td><td class="num">60k</td><td>Conversational multi-agent; bounded delegation + group-chat</td></tr>
+        <tr><td class="repo"><a href="https://github.com/crewAIInc/crewAI">crewAIInc/crewAI</a></td><td class="num">57k</td><td>Role-based crews (Planner / Researcher / Reviewer) — direct model for BridgeLab's Planner / Evidence-officer / Supervisor</td></tr>
+        <tr><td class="repo"><a href="https://github.com/openai/openai-agents-python">openai/openai-agents-python</a></td><td class="num">28.5k</td><td>Lightweight handoffs between specialist agents</td></tr>
+        <tr><td class="repo"><a href="https://github.com/huggingface/smolagents">huggingface/smolagents</a></td><td class="num">29k</td><td>Code-thinking agents; minimal, inspectable</td></tr>
+        <tr><td class="repo"><a href="https://github.com/letta-ai/letta">letta-ai/letta</a></td><td class="num">24k</td><td>Stateful agents with persistent memory + self-improvement</td></tr>
+        <tr><td class="repo"><a href="https://github.com/pydantic/pydantic-ai">pydantic/pydantic-ai</a></td><td class="num">19k</td><td>Type-safe, validated agent I/O — fits BridgeLab's pydantic models.py</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>Hermetic / sandboxed execution</h3>
+    <div class="table-scroll"><table>
+      <thead><tr><th>Project</th><th class="num">★</th><th>Pattern BridgeLab lacks</th></tr></thead>
+      <tbody>
+        <tr><td class="repo"><a href="https://github.com/daytonaio/daytona">daytonaio/daytona</a></td><td class="num">72k</td><td>"Secure elastic infra for AI-generated code" — per-task sandboxed envs, on-mission</td></tr>
+        <tr><td class="repo"><a href="https://github.com/firecracker-microvm/firecracker">firecracker-microvm/firecracker</a></td><td class="num">36k</td><td>microVM-per-task for hermetic, oversubscribable isolation</td></tr>
+        <tr><td class="repo"><a href="https://github.com/google/gvisor">google/gvisor</a></td><td class="num">19k</td><td>Application-kernel sandbox (<span class="ic">runsc</span>) — network/fs syscall filtering without a full VM</td></tr>
+        <tr><td class="repo"><a href="https://github.com/e2b-dev/E2B">e2b-dev/E2B</a></td><td class="num">13k</td><td>Secure sandboxed env as a service for agents</td></tr>
+        <tr><td class="repo"><a href="https://github.com/NixOS/nix">NixOS/nix</a></td><td class="num">17k</td><td>Bit-for-bit reproducible toolchains — the real <b>PIN_TOOLCHAIN</b></td></tr>
+        <tr><td class="repo"><a href="https://github.com/bazelbuild/bazel">bazelbuild/bazel</a></td><td class="num">26k</td><td>Hermetic, cached, sandboxed build actions with action-cache</td></tr>
+        <tr><td class="repo"><a href="https://github.com/jetify-com/devbox">jetify-com/devbox</a></td><td class="num">12k</td><td>Nix-backed instant reproducible dev envs without learning Nix</td></tr>
+        <tr><td class="repo"><a href="https://github.com/nextest-rs/nextest">nextest-rs/nextest</a></td><td class="num">3.2k</td><td>Test runner with native <b>flaky-test detection</b> (retries + JUnit + retry-classification)</td></tr>
+        <tr><td class="repo"><a href="https://github.com/pytest-dev/pytest-rerunfailures">pytest-dev/pytest-rerunfailures</a></td><td class="num">470</td><td>Python flakiness-via-repetition</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>Supply-chain, evidence &amp; attestation</h3>
+    <div class="table-scroll"><table>
+      <thead><tr><th>Project</th><th class="num">★</th><th>Pattern BridgeLab lacks</th></tr></thead>
+      <tbody>
+        <tr><td class="repo"><a href="https://github.com/in-toto/attestation">in-toto/attestation</a></td><td class="num">~0.4k</td><td><b>ITE-6 DSSE Statement + .intoto.jsonl bundle</b> — JSON-Lines of independently-signed envelopes; the portable evidence-bundle format. (Classic in-toto layout/links' <span class="ic">inspections</span> run arbitrary commands — conflicts with no-shell, so use the Statement predicate.)</td></tr>
+        <tr><td class="repo"><a href="https://github.com/slsa-framework/slsa">slsa-framework/slsa</a></td><td class="num">1.9k</td><td>Provenance predicate <span class="ic">provenance/v1</span> carried inside an in-toto Statement — the bundle's spine</td></tr>
+        <tr><td class="repo"><a href="https://github.com/sigstore/sigstore-python">sigstore/sigstore-python</a></td><td class="num">~0.3k</td><td><span class="ic">sign_dsse(Statement)→Bundle</span> / <span class="ic">verify_dsse(bundle, offline=True)</span> — Python signing + offline verify for ITE-6 envelopes</td></tr>
+        <tr><td class="repo"><a href="https://github.com/sigstore/cosign">sigstore/cosign</a></td><td class="num">6.2k</td><td>Signing + attestation bundles; keyless Sigstore w/ Rekor (inclusion proof embedded → offline verify)</td></tr>
+        <tr><td class="repo"><a href="https://github.com/anchore/syft">anchore/syft</a></td><td class="num">9.4k</td><td><b>SBOM gen, fully offline</b> (CycloneDX/SPDX) — the evidence artifact <i>and</i> grype's input</td></tr>
+        <tr><td class="repo"><a href="https://github.com/anchore/grype">anchore/grype</a></td><td class="num">12.7k</td><td><span class="ic">grype sbom:... --fail-on=high --only-fixed</span> → exit 2 on HIGH/CRITICAL — cleanest severity-gated exit, no Python-side threshold logic</td></tr>
+        <tr><td class="repo"><a href="https://github.com/pypa/pip-audit">pypa/pip-audit</a></td><td class="num">~1.3k</td><td><b>Pure-Python</b> dep auditor; library API + CycloneDX output — Python-native cross-check in the same gate</td></tr>
+        <tr><td class="repo"><a href="https://github.com/google/osv-scanner">google/osv-scanner</a></td><td class="num">10.8k</td><td>Dep vuln scan, offline via <span class="ic">--download-offline-databases</span> (exit-1-on-any-vuln needs a severity filter → grype is cleaner)</td></tr>
+        <tr><td class="repo"><a href="https://github.com/CycloneDX/cyclonedx-python-lib">CycloneDX/cyclonedx-python-lib</a></td><td class="num">~0.1k</td><td>Native in-document JSF signatures + BOM-Link; properties/annotations = M-EV-05 sensitivity labels</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>Spec-driven dev, PR automation, security, observability</h3>
+    <div class="table-scroll"><table>
+      <thead><tr><th>Project</th><th class="num">★</th><th>Pattern BridgeLab lacks</th></tr></thead>
+      <tbody>
+        <tr><td class="repo"><a href="https://github.com/github/spec-kit">github/spec-kit</a></td><td class="num">GitHub</td><td><b>Spec-driven process harness</b> — intent→spec→implementation→tasks, drives any coding agent across the SDLC; model for M-EV-01 requirement traceability</td></tr>
+        <tr><td class="repo"><a href="https://github.com/QodoAI/pr-agent">QodoAI/pr-agent</a></td><td class="num">major</td><td>Multi-agent code review (review/improve/describe) with PR-history indexing + governance</td></tr>
+        <tr><td class="repo"><a href="https://github.com/PyGithub/PyGithub">PyGithub/PyGithub</a></td><td class="num">7.8k</td><td>PR upsert for M-CC-01 — <span class="ic">draft=True</span>, head filter must be <span class="ic">"owner:branch"</span>; <b>no atomic create-if-not-exists</b> → needs client-side mutex + re-check; never <span class="ic">.merge()</span></td></tr>
+        <tr><td class="repo"><a href="https://github.com/cli/cli">cli/cli (gh)</a></td><td class="num">~45.8k</td><td>Fixed-argv fallback (<span class="ic">shell=False</span> + <span class="ic">--body-file</span>); use <span class="ic">pr list --head</span> not <span class="ic">pr view</span>; no <span class="ic">--create-if-not-exists</span> exists</td></tr>
+        <tr><td class="repo"><a href="https://github.com/NVIDIA/NeMo-Guardrails">NVIDIA/NeMo-Guardrails</a></td><td class="num">OSS</td><td>Programmable rails for prompt-injection defense / input-output fencing</td></tr>
+        <tr><td class="repo"><a href="https://github.com/protectai/llm-guard">protectai/llm-guard</a></td><td class="num">3.2k</td><td>Prompt-injection + output guards (⚠️ archived — needs a maintained fork)</td></tr>
+        <tr><td class="repo"><a href="https://github.com/langfuse/langfuse">langfuse/langfuse</a></td><td class="num">33k</td><td>LLM tracing/evals via OpenTelemetry — append-only trace store = model for authority-behind-instructions</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <p class="sec-label">The elevation map</p>
+    <h2>Open-source pattern → BridgeLab milestone</h2>
+    <p>For each milestone cluster, the one pattern worth borrowing, how it fits BridgeLab's additive + lazy-import + zero-surface discipline, what it unblocks, and the security note. Ordered by unblock value, not by roadmap release number.</p>
+
+    <div class="phase-grid">
+
+      <div class="phase">
+        <div class="ph-head"><span class="ph-id">M-EV-01</span><span class="ph-title">Requirement traceability — the highest-value single unblock</span><span class="ph-source">← github/spec-kit</span></div>
+        <p>Status: <span class="tag t-miss">MISSING</span>. No <span class="ic">requirements.py</span>, no <span class="ic">requirements</span> table; all nine traceability bullets open. This is the named CKS-002B blocker.</p>
+        <div class="adopt">
+          <p class="head">Adopt</p>
+          <p>spec-kit's model is <b>intent → spec (normative requirement IDs) → implementation → tasks</b>, driving any coding agent. Borrow the <b>normative-ID convention</b> and the spec-as-source-of-truth discipline: a <span class="ic">RequirementManager(settings, store, reader)</span> extracts IDs (default pattern <span class="ic">^[A-Z]+-\d+[A-Z]?-R\d+</span> plus fenced normative blocks), classifies normative vs example/commentary, and joins <span class="ic">requirements → requirement_links → changed paths / test names</span> into a coverage matrix. Additive <span class="ic">requirements</span> + <span class="ic">requirement_links</span> tables; <span class="ic">SCHEMA_VERSION</span> stays 1. Internal-first — surface <span class="ic">requirements_covered</span> in existing snapshots, no new tool. A coverage-report tool is <span class="tag t-surf">NEW SURFACE</span>.</p>
+        </div>
+      </div>
+
+      <div class="phase">
+        <div class="ph-head"><span class="ph-id">M-CT · MCPB-010 tail</span><span class="ph-title">Resumable state done better — checkpointers, stores, time-travel</span><span class="ph-source">← langchain-ai/langgraph</span></div>
+        <p>Status: <span class="tag t-done">DONE core</span> + <span class="tag t-warn">PARTIAL tail</span> (M-CT-01/03/04/05). Checkpoints, paused states, compaction, resume all shipped in MCPB-010. The <i>shape</i> can still mature.</p>
+        <div class="adopt">
+          <p class="head">Adopt</p>
+          <p>LangGraph splits durable state into <b>Checkpointers</b> (short-term thread snapshots — what BridgeLab already has) and <b>Stores</b> (long-term cross-thread memory) and exposes <b>time-travel</b> + <b>interrupts</b> + <b>subgraphs</b> as first-class. Borrow the Checkpointer/Store separation: BridgeLab's <span class="ic">job_checkpoints</span> is a checkpointer; add a long-term <b>Store</b> for cross-job lessons (the P3 capsule/passport layer, M-IN-01, without building it yet — just the store). Time-travel maps to M-CT-04 atomic-milestone acceptance (a milestone closes when its acceptance paths + command pass; revisiting an earlier checkpoint is the time-travel primitive). All internal, no new tool.</p>
+        </div>
+      </div>
+
+      <div class="phase">
+        <div class="ph-head"><span class="ph-id">M-CC-09</span><span class="ph-title">Verification-lab determinism — the hermetic build</span><span class="ph-source">← Nix · devbox · nextest · Bazel · libfaketime</span></div>
+        <p>Status: <span class="tag t-warn">PARTIAL</span>. <span class="ic">_run_command</span> pins LANG/LC_ALL/PYTHONIOENCODING + wall timeout. Missing: pinned toolchain, cached deps, network policy, deterministic clock/TZ/random, flaky detection, baseline comparison, signed results.</p>
+        <div class="adopt">
+          <p class="head">Adopt</p>
+          <p><b>PIN_TOOLCHAIN</b> via Nix flakes or devbox (Nix without learning Nix) — a per-project lockfile the bridge resolves before running verification, giving bit-for-bit reproducible envs. <b>Flaky detection</b> via deterministic repetitions (nextest's retry-classification model; for Python, pytest-rerunfailures semantics) — run a command's declared-deterministic subset N times, label divergence as <span class="ic">infrastructure_status=DEGRADED</span> (feeds M-EV-07). <b>Deterministic env</b>: <span class="ic">TZ=UTC, SOURCE_DATE_EPOCH, PYTHONHASHSEED=0</span>, sorted fs iteration, optional libfaketime for a frozen clock. <b>Baseline comparison</b> against the last green verification's fingerprint (CycloneDX SBOM diff). Each is project opt-in, internal, fixed-argv. A <span class="ic">replay_verification</span> tool is <span class="tag t-surf">NEW SURFACE</span> — defer.</p>
+        </div>
+      </div>
+
+      <div class="phase">
+        <div class="ph-head"><span class="ph-id">M-CC-11 · M-EV-06</span><span class="ph-title">Evidence bundle + supply-chain attestation</span><span class="ph-source">← in-toto · SLSA · cosign · osv-scanner · syft</span></div>
+        <p>Status: <span class="tag t-miss">MISSING</span> portable bundle, source classifications, signed manifests, supply-chain scan. Fingerprints + verification/review records + append-only ledger already exist (good foundation).</p>
+        <div class="adopt">
+          <p class="head">Adopt</p>
+          <p><b>Bundle format:</b> the in-toto <b>ITE-6 Bundle</b> (<span class="ic">.intoto.jsonl</span>) — a JSON-Lines file where each line is a DSSE-wrapped in-toto Statement, <i>each independently signed</i>, with no whole-bundle authentication needed. Verifier reads lines, checks each envelope offline, ignores unknown predicates (monotonic). Each record type becomes a distinct predicate under one Statement shell: <span class="ic">https://bridgelab.dev/verification/v1</span> (verification record), <span class="ic">.../review/v1</span>, <span class="ic">.../ledger/v1</span> (job_events snapshot), <span class="ic">.../sbom/v1</span>. Subject = the content-addressed candidate fingerprint (already exists). <b>Provenance:</b> add a SLSA <span class="ic">provenance/v1</span> predicate (<span class="ic">buildType=https://bridgelab.dev/mcp-bridge@v1</span>, <span class="ic">externalParameters</span> = fixed argv + base_head + fingerprint, <span class="ic">builder.id</span> = bridge version) so jobs are legible to any SLSA-aware consumer.</p>
+          <p><b>Signing:</b> <span class="ic">sigstore-python</span>'s <span class="ic">sign_dsse(Statement) → Bundle</span> / <span class="ic">verify_dsse(bundle, offline=True)</span> — a project key for offline-first; keyless+Rekor when public transparency is wanted (the inclusion proof is embedded, so verify stays offline). <b>SBOM:</b> CycloneDX with <b>native in-document signatures (JSF)</b> + BOM-Link, embedded as one bundle line — its properties/annotations are the natural home for M-EV-05 sensitivity-classification labels. <b>Drop:</b> classic in-toto <i>layout+links</i> (its <span class="ic">inspections</span> run arbitrary commands at verify time — conflicts with no-shell); SPDX (no native signing); W3C VC (no canonical software-dev evidence schema, overkill); OCI/ORAS (a publication channel, not an audit format — optional distribution add-on only).</p>
+          <p>The <span class="ic">export_evidence_bundle</span> tool is <span class="tag t-surf">NEW SURFACE</span> (capability <span class="ic">EXPORT_EVIDENCE_BUNDLE</span>, dormant by default). Sensitivity classification (M-CC-11) gates inclusion; <span class="ic">.env</span>/tokens/certs/<span class="ic">.venv</span> excluded — already a BridgeLab invariant.</p>
+        </div>
+      </div>
+
+      <div class="phase">
+        <div class="ph-head"><span class="ph-id">M-GV-06</span><span class="ph-title">Sub-agent delegation + parent/child task trees</span><span class="ph-source">← LangGraph subgraphs · crewAI roles · openai-agents handoffs</span></div>
+        <p>Status: <span class="tag t-miss">MISSING</span>. No <span class="ic">parent_job_id</span>, no delegation mandate, no delegation records.</p>
+        <div class="adopt">
+          <p class="head">Adopt</p>
+          <p>LangGraph's <b>subgraph</b> primitive is the cleanest fit: a parent job spawns bounded children, each a subgraph with its own state but scoped to the parent's authorized path set ⊆ and capability ⊆. crewAI's role crews model the Planner/Implementer/Reviewer/Evidence-officer split BridgeLab already half-has. openai-agents' <b>handoffs</b> model the replace-worker control (M-CC-08). Add <span class="ic">parent_job_id</span> + <span class="ic">delegation_mandate_json</span> (mandate/inputs/outputs/authority) to <span class="ic">DevelopmentJob</span>; bound children via <span class="ic">config.MAX_DELEGATIONS_PER_JOB</span>; record delegation in the <span class="ic">authorizations</span> table (<span class="ic">delegated_from</span>). Internal-first; a <span class="ic">delegate</span> tool is <span class="tag t-surf">NEW SURFACE</span> — defer.</p>
+        </div>
+      </div>
+
+      <div class="phase">
+        <div class="ph-head"><span class="ph-id">M-GV-01/02/03/04</span><span class="ph-title">Durable authorization + named roles + external grounding + spec-gating</span><span class="ph-source">← OPA/Cedar · crewAI · spec-kit · MCP ToolAnnotations</span></div>
+        <p>Status: <span class="tag t-warn">PARTIAL</span>. Per-call inline evidence re-statement; <span class="ic">ProjectCapability</span> is a static flag, not a per-action authorization record. Roles half-built. No external grounding, no spec-gating.</p>
+        <div class="adopt">
+          <p class="head">Adopt</p>
+          <p>Replace inline-evidence re-statement with a durable <span class="ic">authorizations</span> table (actor / authority_source / capability / target / issued_at / expires_at / single_use / delegated_from) — the structure OPA and Cedar encode as policy, but BridgeLab can hold it as a plain SQLite table consumed in the same ACID txn as the action it authorizes. crewAI's role pattern formalizes Planner / Evidence-officer / Supervisor as capability-gated <b>invocations</b> on existing infra (not new runtimes) — each read-only (<span class="ic">Read,Glob,Grep</span> only). spec-kit's spec-as-source-of-truth + a pinned <span class="ic">ratified_spec_commit</span> gives external grounding (M-GV-03) and spec-gating (M-GV-04): genesis jobs require the apex spec ref present and unchanged. MCP <span class="ic">ToolAnnotations</span> (destructive/readOnly) is already BridgeLab's gating grammar. Internal-first; no new tool.</p>
+        </div>
+      </div>
+
+      <div class="phase">
+        <div class="ph-head"><span class="ph-id">M-GV-07</span><span class="ph-title">Parallel verify + review + conflict reconciliation</span><span class="ph-source">← LangGraph fan-out/fan-in · Qodo multi-agent review</span></div>
+        <p>Status: <span class="tag t-warn">PARTIAL</span>. Verify and review are independent managers but run sequentially; <span class="ic">validate_for_commit</span> accepts one review, no reconciliation.</p>
+        <div class="adopt">
+          <p class="head">Adopt</p>
+          <p>LangGraph's <b>fan-out / fan-in</b> is the pattern: once the candidate is stable, <span class="ic">asyncio.gather</span> verify + independent review concurrently. Qodo's multi-agent review (separate review/improve/describe agents with PR-history indexing) is the model for <b>reviewer conflict reconciliation</b>: divergent verdicts trigger a tie-breaker third reviewer with a distinct <span class="ic">reviewer_id</span>; the commit gate requires a reconciled pass. Additive <span class="ic">reconcile_reviews(review_ids)</span>; no new tool.</p>
+        </div>
+      </div>
+
+      <div class="phase">
+        <div class="ph-head"><span class="ph-id">M-CC-01/02/05</span><span class="ph-title">PR creation, state confirmation, race-safe idempotency</span><span class="ph-source">← PyGithub · gh</span></div>
+        <p>Status: <span class="tag t-miss">MISSING</span>. Lifecycle step 13 (open/update draft PR) is explicitly excluded today; no existing-PR discovery, no PR-state confirmation.</p>
+        <div class="adopt">
+          <p class="head">Adopt</p>
+          <p><b>Primary path: PyGithub</b> (native Python, <span class="ic">draft=True</span> on create, no shell — github3.py lacks the draft param, so it's out). Discovery: <span class="ic">repo.get_pulls(state="open", head="owner:branch", base=base)</span> — the <span class="ic">owner:branch</span> prefix is <b>mandatory</b>; a bare branch name silently returns all PRs. If found, <span class="ic">pr.edit(title=..., body=...)</span>; else <span class="ic">repo.create_pull(..., draft=True)</span>. State confirmation via <span class="ic">repo.get_pull(n)</span> → <span class="ic">.state/.draft/.merged/.head.sha</span>.</p>
+          <p><b>No atomic create-if-not-exists exists anywhere</b> — not in the REST/GraphQL API, not in <span class="ic">gh pr create</span> (declined in cli/cli #5792), not in the GitHub MCP server. So race-safety (M-CC-05) <b>requires client-side per-branch mutual exclusion</b> (filelock / Redis <span class="ic">SET NX</span>) + a <b>re-check after acquiring the lock</b> to close the window where a peer created the PR while you waited. <b>gh CLI fallback</b> (token-less envs): fixed-argv list with <span class="ic">shell=False</span> + <span class="ic">--body-file</span> to dodge quoting; use <span class="ic">gh pr list --head</span> (not <span class="ic">pr view</span>, which has documented false-negatives). <b>Never call merge</b> — omit <span class="ic">pr.merge()</span> / <span class="ic">gh pr merge</span>. Don't add the GitHub MCP server solely for this — it forces an MCP client + transport and still leaves the upsert to you.</p>
+          <p>Re-stated evidence required; PR base = the job's base branch; surface <span class="ic">remote_branch_state</span> + <span class="ic">pr_state</span> (M-CC-02). <span class="tag t-surf">NEW SURFACE</span>, dormant by default.</p>
+        </div>
+      </div>
+
+      <div class="phase">
+        <div class="ph-head"><span class="ph-id">M-CC-11</span><span class="ph-title">Prompt-injection defense for repo-ingested content</span><span class="ph-source">← NeMo-Guardrails · llm-guard (fork)</span></div>
+        <p>Status: <span class="tag t-warn">PARTIAL</span>. Blast-radius reduction in <span class="ic">claude.py build_*</span> exists; no systematic injection defense on content the reader ingests.</p>
+        <div class="adopt">
+          <p class="head">Adopt</p>
+          <p>Borrow the <b>spotlighting / data-trust-boundary</b> technique from the prompt-injection literature (fence + delimit untrusted repo content the reader ingests, so model instructions can't ride in file contents). NeMo-Guardrails' programmable rails or a maintained llm-guard fork as the implementation; run it as fixed-argv on reader output, not as a networked service. Keep it internal and opt-in; no new tool surface — it hardens <span class="ic">reader.py</span>.</p>
+        </div>
+      </div>
+
+      <div class="phase">
+        <div class="ph-head"><span class="ph-id">M-EV-05</span><span class="ph-title">Authority-behind-every-governance-instruction</span><span class="ph-source">← langfuse · OpenTelemetry</span></div>
+        <p>Status: <span class="tag t-miss">MISSING</span>. <span class="ic">job_events</span> is append-only but governance-changing instructions carry no authority ref.</p>
+        <div class="adopt">
+          <p class="head">Adopt</p>
+          <p>Langfuse / OpenTelemetry's <b>span-attribution model</b> — every event carries actor, authority source, scope, timestamp — is exactly the authority-record shape BridgeLab wants. Stamp governance-changing events (status / extension / pause / terminal) with an <span class="ic">authority_ref</span> in <span class="ic">jobs._record_event</span>; sidecar <span class="ic">authority_records</span> + <span class="ic">source_classifications</span> (canonical/historical/asserted/observed/tested/inferred/superseded). Internal, no new tool. Composes with M-GV-01 once the <span class="ic">authorizations</span> table exists.</p>
+        </div>
+      </div>
+
+      <div class="phase">
+        <div class="ph-head"><span class="ph-id">M-CC-11</span><span class="ph-title">Supply-chain gate — severity-gated pre-commit reject</span><span class="ph-source">← syft · grype · pip-audit</span></div>
+        <p>Status: <span class="tag t-miss">MISSING</span>. No dependency/supply-chain scanning.</p>
+        <div class="adopt">
+          <p class="head">Adopt</p>
+          <p><b>Recommended 2-tool combo:</b> <b>syft</b> (SBOM gen, fully offline, emits CycloneDX/SPDX — the same SBOM that goes in the evidence bundle) + <b>grype</b> (<span class="ic">grype sbom:./sbom.cdx.json --fail-on=high --only-fixed -o json</span> — exit code 2 on any HIGH/CRITICAL finding, the cleanest severity-gated exit of any scanner, no Python-side threshold logic). Both Apache-2.0 single Go binaries, fixed-argv via <span class="ic">subprocess.run([...], shell=False)</span>, offline DBs downloadable and refreshed on a schedule (not per-commit). Add <b>pip-audit</b> (<span class="ic">pip-audit -r requirements.lock --format=json --vulnerability-service=osv --require-hashes</span>) as a Python-native cross-check inside the same gate; reject commit if <i>either</i> reports HIGH/CRITICAL.</p>
+          <p><b>Drop:</b> Dependabot (Ruby + Docker, remediation-not-gate) and Snyk (account-gated, cloud-required, closed-contribution — violates the offline + OSS-clean constraints). osv-scanner is viable (<span class="ic">--offline-vulnerabilities</span> + <span class="ic">--download-offline-databases</span>) but its exit-1-on-any-vuln needs a Python-side severity filter, so grype's native <span class="ic">--fail-on</span> is cleaner. Internal, fixed-argv; feeds M-CC-11 and the evidence bundle (the syft SBOM <i>is</i> the M-EV-06 artifact).</p>
+        </div>
+      </div>
+
+      <div class="phase">
+        <div class="ph-head"><span class="ph-id">M-CC-11</span><span class="ph-title">Sandboxed execution of repo-controlled scripts</span><span class="ph-source">← gVisor · nsjail · bubblewrap · Firecracker</span></div>
+        <p>Status: <span class="tag t-warn">PARTIAL</span>. <span class="ic">verification_commands</span> run in the candidate worktree (not a true sandbox); repo-controlled scripts run with the bridge's privilege.</p>
+        <div class="adopt">
+          <p class="head">Adopt</p>
+          <p>For repo-controlled verification scripts, run under a <b>lightweight syscall sandbox</b> rather than the bridge's cwd. Lightest-to-embed in a Python subprocess path: <b>bubblewrap (bwrap)</b> or <b>nsjail</b> with <span class="ic">--network=none --read-only</span> + a frozen clock; gVisor (<span class="ic">runsc</span>) for stronger isolation without a full VM; Firecracker/E2B/Daytona only if a true per-task VM is warranted (heaviest). Project opt-in; fixed argv (the bridge invokes the sandbox runner, not the sandbox script directly). Network policy (none | allowlist) flows from M-CC-09. Internal; no new tool.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <section>
+    <p class="sec-label">The target</p>
+    <h2>BridgeLab now vs. super-developer-level target</h2>
+    <div class="table-scroll"><table class="target">
+      <thead><tr><th>Dimension</th><th>BridgeLab today</th><th>Super-dev target</th><th>Pattern source</th></tr></thead>
+      <tbody>
+        <tr><td class="dim">State model</td><td>Checkpoints + paused states + compaction (MCPB-010)</td><td>Checkpointer + long-term Store + time-travel + subgraphs</td><td>LangGraph</td></tr>
+        <tr><td class="dim">Requirements</td><td>Headings only; no normative IDs</td><td>Requirement→code→test matrix, deferrals, contradiction detection</td><td>spec-kit</td></tr>
+        <tr><td class="dim">Verification env</td><td>LANG pinned, wall timeout, no shell</td><td>Pinned toolchain (Nix/devbox), frozen clock, no-network, flaky detection, baseline diff</td><td>Nix · nextest · Bazel</td></tr>
+        <tr><td class="dim">Sandbox</td><td>Detached git worktree</td><td>Worktree + syscall sandbox (bwrap/nsjail/gVisor) for repo scripts</td><td>gVisor · nsjail</td></tr>
+        <tr><td class="dim">Evidence</td><td>Content-addressed fingerprints + records + ledger</td><td>in-toto ITE-6 <span class="ic">.intoto.jsonl</span> (DSSE-wrapped Statements, each signed) + SLSA provenance + CycloneDX SBOM, signed via sigstore-python (offline verify)</td><td>in-toto ITE-6 · SLSA · sigstore · CycloneDX</td></tr>
+        <tr><td class="dim">Supply chain</td><td>None</td><td>syft SBOM + grype <span class="ic">--fail-on=high</span> + pip-audit cross-check; reject commit on HIGH/CRITICAL; offline DBs</td><td>syft · grype · pip-audit</td></tr>
+        <tr><td class="dim">Delegation</td><td>Single drafter + reviewer</td><td>Bounded parent/child task trees with delegation mandates + records</td><td>LangGraph subgraphs · crewAI</td></tr>
+        <tr><td class="dim">Authorization</td><td>Inline per-call evidence re-statement</td><td>Durable per-action authorization objects (actor/authority/expiry/single-use/delegation)</td><td>OPA/Cedar shape, SQLite-held</td></tr>
+        <tr><td class="dim">Roles</td><td>Implementer, Test-op, Reviewer done; Planner/Evidence/Supervisor missing</td><td>All roles as capability-gated read-only invocations</td><td>crewAI</td></tr>
+        <tr><td class="dim">Review</td><td>Sequential verify then review; one review accepted</td><td>Parallel fan-out; tie-breaker reconciliation on conflict</td><td>LangGraph · Qodo</td></tr>
+        <tr><td class="dim">PR</td><td>Push-to-branch + remote-tip-verify only</td><td>PyGithub draft upsert (<span class="ic">owner:branch</span> filter) + client-side mutex + re-check; gh fallback; state confirmed, never merged</td><td>PyGithub · gh</td></tr>
+        <tr><td class="dim">Injection defense</td><td>Blast-radius reduction in claude.py</td><td>Spotlighting/fencing on all repo-ingested content; guardrails on reader output</td><td>NeMo-Guardrails · llm-guard</td></tr>
+        <tr><td class="dim">Audit</td><td>Append-only job_events</td><td>Every governance event authority-attributed; source classifications</td><td>Langfuse · OTel</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <p class="sec-label">How to sequence it</p>
+    <h2>Recommended adoption order</h2>
+    <p>The roadmap already names the unblock priority; this just attaches the open-source pattern to each step. Everything below respects BridgeLab's <b>additive-table + lazy-import + zero-surface</b> discipline and the verbatim security boundaries in <span class="ic">AGENTS.md</span>.</p>
+    <ul class="tight">
+      <li><b>1. Merge PR #5 (MCPB-010)</b> — continuity core is done, tested (167 tests), zero new surface. Nothing here depends on open-source adoption.</li>
+      <li><b>2. M-EV-01 requirement traceability</b> — borrow spec-kit's normative-ID + spec-as-truth discipline. Additive <span class="ic">requirements</span>/<span class="ic">requirement_links</span> tables, internal-first. <i>Highest unblock value; directly serves CKS-002B.</i></li>
+      <li><b>3. M-CT-01 / 04 / 05</b> — finish the continuity tail (fetch+pin base, atomic milestones, the two dormant states). Borrow LangGraph's time-travel primitive for milestone acceptance. Internal.</li>
+      <li><b>4. M-EV-02 / 03 / 04</b> — structured verification result schema, binding completeness, review content-addressing. Foundation for the evidence bundle; no external dep yet.</li>
+      <li><b>5. M-CC-09 verification-lab determinism</b> — first open-source adoption that adds a runtime dep: Nix/devbox for PIN_TOOLCHAIN, pytest-rerunfailures/nextest semantics for flaky detection. Project opt-in.</li>
+      <li><b>6. M-GV-01 authorization objects</b> — durable <span class="ic">authorizations</span> table; OPA/Cedar-shape, SQLite-held. Unblocks M-EV-05 authority records and M-GV-06 delegation records.</li>
+      <li><b>7. M-GV-06 delegation + M-GV-07 parallel review</b> — LangGraph subgraphs + fan-out/fan-in; internal, no new tool.</li>
+      <li><b>8. M-EV-06 evidence bundle export + M-CC-11 supply-chain</b> — in-toto ITE-6 <span class="ic">.intoto.jsonl</span> + SLSA provenance + CycloneDX SBOM, signed via sigstore-python; supply-chain gate syft + grype <span class="ic">--fail-on=high</span> + pip-audit. <span class="tag t-surf">NEW SURFACE</span> — needs your explicit authorization.</li>
+      <li><b>9. M-CC-01 PR automation</b> — PyGithub/gh-backed open/update draft PR. <span class="tag t-surf">NEW SURFACE</span> — needs your explicit authorization.</li>
+      <li><b>10. M-CC-11 sandboxing + injection defense</b> — bwrap/nsjail/gVisor for repo scripts; NeMo-Guardrails/llm-guard fork for reader fencing. Internal hardening.</li>
+      <li><b>11. P3 / institutional</b> — capsules, passports, dossiers, blind reconstruction. Build the long-term Store first (LangGraph pattern), fill it later. Explicitly a non-goal for the unblock.</li>
+    </ul>
+
+    <div class="note">
+      <b>Security constraints (unchanged, non-negotiable).</b> No <span class="ic">bypassPermissions</span> or unrestricted Bash; no <span class="ic">shell=True</span>; fixed argv. Reject hidden/protected/traversal/symlink paths; <span class="ic">.env</span>/tokens/certs/<span class="ic">.venv</span> never in archives or Git. The only push surface is opt-in <span class="ic">push_development_commit</span> (non-trunk, origin-only, no-force); ChatGPT confirmation is the outer authorization gate; the bridge never directly edits its production checkout. Every item above flagged <b>NEW SURFACE</b> needs a new <span class="ic">ProjectCapability</span> (with its dependency capability), a <span class="ic">ToolAnnotations</span>-registered tool, and must ship <b>off by default</b>. Merge/tag/release/deploy stay prohibited unless you explicitly authorize Option B (M-CC-04) — the bridge ratifies, a human merges.
+    </div>
+
+    <p class="footnote" style="margin-top:24px">Research method: hard repository data (star counts, last activity) via the GitHub MCP API on 2026-08-10; qualitative capability patterns via SearXNG reads of each project's docs. Star counts marked "major"/"OSS"/"GitHub" were not resolvable through the repo-qualifier query and are left approximate. Nothing here is committed; this is an elevation map for your decision, not a change to the repo.</p>
+  </section>
+
+</div>
