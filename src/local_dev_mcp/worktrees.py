@@ -143,7 +143,58 @@ class GitWorktreeManager:
         )
         return status, head
 
-    async def create(self, project: ProjectPolicy, job_id: str) -> JobWorktree:
+    async def _resolve_remote_default_tip(
+        self, project: ProjectPolicy
+    ) -> tuple[str, str] | None:
+        """Fetch ``origin`` and return ``(branch, tip_sha)`` of its default branch.
+
+        Returns ``None`` when the project has no ``origin`` remote or no
+        resolvable ``refs/remotes/origin/HEAD`` (offline / local-only repos).
+        ``branch`` is the default branch name, ``tip_sha`` the current remote
+        tip. Fetch is opt-in per job via ``requested_base``; the bridge never
+        fetches silently for projects that did not ask for a pinned base.
+        """
+        timeout = self.settings.git_command_timeout_seconds
+        try:
+            await run_git(
+                project.root,
+                "fetch",
+                "origin",
+                timeout_seconds=timeout,
+            )
+        except GitCommandError:
+            return None
+        try:
+            full = await run_git(
+                project.root,
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                timeout_seconds=timeout,
+            )
+        except GitCommandError:
+            return None
+        prefix = "refs/remotes/origin/"
+        if not full.startswith(prefix):
+            return None
+        branch = full[len(prefix):]
+        try:
+            tip = await run_git(
+                project.root,
+                "rev-parse",
+                "--verify",
+                f"refs/remotes/origin/{branch}",
+                timeout_seconds=timeout,
+            )
+        except GitCommandError:
+            return None
+        return branch, tip
+
+    async def create(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        requested_base: str | None = None,
+    ) -> JobWorktree:
         root = self._root_for(project)
         project_directory = _ensure_private_directory(root / project.id)
 
@@ -151,11 +202,32 @@ class GitWorktreeManager:
         if path.exists() or path.is_symlink():
             raise WorktreeError("job worktree path already exists")
 
-        before_status, base_head = await self._source_state(project)
+        before_status, local_head = await self._source_state(project)
         if before_status:
             raise WorktreeError(
                 "configured project checkout must be clean before starting a job"
             )
+        base_head = local_head
+
+        # M-CT-01: when a caller requests a pinned base, fetch ``origin`` and
+        # pin the worktree to the fetched remote default-branch tip rather than
+        # branching off the local canonical HEAD (which may be stale). The
+        # local checkout is left untouched; only the worktree uses the pin.
+        if requested_base is not None:
+            remote = await self._resolve_remote_default_tip(project)
+            if remote is None:
+                raise WorktreeError(
+                    "requested_base requires a resolvable origin default branch; "
+                    "this project has no origin remote or refs/remotes/origin/HEAD"
+                )
+            branch, remote_tip = remote
+            expected = requested_base.lower()
+            if remote_tip.lower() != expected:
+                raise WorktreeError(
+                    f"requested_base {expected[:12]} is not the current tip of "
+                    f"origin/{branch} (remote is at {remote_tip[:12]})"
+                )
+            base_head = expected
 
         created = False
         completed = False
@@ -173,7 +245,7 @@ class GitWorktreeManager:
             created = True
 
             after_status, after_head = await self._source_state(project)
-            if after_status or after_head != base_head:
+            if after_status or after_head != local_head:
                 raise WorktreeError(
                     "configured project checkout changed during worktree creation"
                 )

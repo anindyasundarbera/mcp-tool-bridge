@@ -385,9 +385,22 @@ def create_server(
                 )
             ),
         ] = "high",
+        requested_base: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional 40-hex commit to pin the job worktree to. When "
+                    "set, the bridge fetches origin and requires this to be the "
+                    "current tip of origin's default branch, branching the job "
+                    "off that fetched remote tip instead of the local HEAD. "
+                    "Omit for offline/local-only projects."
+                ),
+                pattern=r"^[0-9a-fA-F]{40}$",
+            ),
+        ] = None,
     ) -> dict[str, Any]:
         project = active_registry.resolve(project_id, ProjectCapability.CLAUDE_EDIT)
-        return await active_jobs.start(project, text, effort)
+        return await active_jobs.start(project, text, effort, requested_base)
 
     @mcp.tool(
         name="get_development_job",

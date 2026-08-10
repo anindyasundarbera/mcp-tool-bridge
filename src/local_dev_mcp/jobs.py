@@ -151,6 +151,9 @@ class DevelopmentJob:
     tool_failures: int = 0
     soft_warned: bool = False
     milestones: list[dict[str, Any]] | None = None
+    # M-CT-01: an optional fetched/pinned base commit the worktree was created
+    # from (``origin/<default>`` tip), rather than the local canonical HEAD.
+    requested_base: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -492,6 +495,86 @@ class DevelopmentJobManager:
         current = self._last_changed_paths.get(job.job_id)
         return bool(current)
 
+    def _blocked_input_signal(self, result: dict[str, Any]) -> str | None:
+        """M-CT-05: detect a structured 'input required' signal from the drafter.
+
+        Returns the human-readable blocker message when the executor result
+        carries a fenced ``<!-- bridge: blocked-input ... -->`` block in its
+        ``result`` text, or a ``blocked_input`` field. Returns ``None`` when no
+        such signal is present, so a normal candidate failure stays ``failed``.
+        """
+        marker = "<!-- bridge: blocked-input"
+        text = result.get("result")
+        if isinstance(text, str) and marker in text:
+            start = text.index(marker) + len(marker)
+            end = text.find("-->", start)
+            message = text[start:end].strip() if end != -1 else text[start:].strip()
+            return message or "the drafter requested additional input"
+        blocked = result.get("blocked_input")
+        if isinstance(blocked, str) and blocked.strip():
+            return blocked.strip()
+        return None
+
+    async def _close_milestones(
+        self,
+        job: DevelopmentJob,
+        project: ProjectPolicy,
+        changed_paths: tuple[str, ...],
+    ) -> None:
+        """M-CT-04: close any milestone whose acceptance criteria are now met.
+
+        A milestone is a dict with ``id``, ``title``, ``acceptance_paths``
+        (ordered list of paths that must all appear in the changed set) and an
+        optional ``acceptance_command_id`` (a verification command id that must
+        pass). A milestone closes only when its acceptance paths are present
+        AND (if a command is named) that command passes in the worktree. Closed
+        milestones are marked ``closed: True`` with a ``closed_at`` stamp and
+        recorded as a ``milestone`` checkpoint. Unclosed milestones stay open
+        and surface in the terminal report as remaining.
+        """
+        if not job.milestones or job.worktree is None:
+            return
+        changed = set(changed_paths)
+        for milestone in job.milestones:
+            if milestone.get("closed"):
+                continue
+            acceptance_paths = milestone.get("acceptance_paths") or []
+            if not isinstance(acceptance_paths, list) or not acceptance_paths:
+                continue
+            if not all(path in changed for path in acceptance_paths):
+                continue
+            command_id = milestone.get("acceptance_command_id")
+            if command_id is not None:
+                command = next(
+                    (
+                        command
+                        for command in project.verification_commands
+                        if command.id == command_id
+                    ),
+                    None,
+                )
+                if command is None:
+                    # Unknown command id: leave the milestone open; do not
+                    # fabricate acceptance.
+                    continue
+                from .verification import _run_command
+
+                try:
+                    outcome = await _run_command(self.settings, job.worktree, command)
+                except Exception:
+                    # A transient acceptance-command failure must not fail the
+                    # whole job; leave the milestone open and continue.
+                    continue
+                if outcome.get("status") != "passed":
+                    continue
+            milestone["closed"] = True
+            milestone["closed_at"] = _timestamp()
+            await self._record_checkpoint(
+                job, "milestone", milestone=milestone.get("id")
+            )
+            async with self._state_lock:
+                self._persist_progress(job)
+
     async def _sampler_loop(
         self,
         job: DevelopmentJob,
@@ -651,6 +734,7 @@ class DevelopmentJobManager:
         project: ProjectPolicy,
         text: str,
         effort: Effort,
+        requested_base: str | None = None,
     ) -> dict[str, Any]:
         specification = self._validate_input(project, text, effort)
         async with self._state_lock:
@@ -658,6 +742,7 @@ class DevelopmentJobManager:
                 job_id=self._new_job_id(),
                 project_id=project.id,
                 effort=effort,
+                requested_base=requested_base,
             )
             self._jobs[job.job_id] = job
             self._persist_progress(job)
@@ -947,7 +1032,9 @@ class DevelopmentJobManager:
                     assert job.worktree is not None
                     await self._worktrees.validate_resume(project, job.worktree)
                 else:
-                    worktree = await self._worktrees.create(project, job.job_id)
+                    worktree = await self._worktrees.create(
+                        project, job.job_id, requested_base=job.requested_base
+                    )
                     async with self._state_lock:
                         job.worktree = worktree
                         job.updated_at = _timestamp()
@@ -1013,9 +1100,12 @@ class DevelopmentJobManager:
                         raise asyncio.CancelledError
 
                     self._absorb_result_budget(job, result)
-                    await self._record_checkpoint(
+                    boundary_paths = await self._record_checkpoint(
                         job, "boundary", event={"slice": slice_index}
                     )
+                    # M-CT-04: close any milestone whose acceptance criteria are
+                    # now met (paths present + optional acceptance command passes).
+                    await self._close_milestones(job, project, boundary_paths)
                     # Persist a returned session id on every slice, not only on
                     # completion: a job that pauses (e.g. on a max_turns slice)
                     # still yields a resumable Claude session that ``resume``
@@ -1073,6 +1163,18 @@ class DevelopmentJobManager:
 
                     if claude_status == "timed_out":
                         terminal = JobStatus.TIMED_OUT
+                        break
+
+                    # M-CT-05: a structured 'input required' signal pauses the
+                    # job as BLOCKED_INPUT_REQUIRED (resumable) rather than
+                    # discarding it as a candidate failure. This takes
+                    # precedence over the tool-failure/no-progress budget
+                    # terminations below: a blocked job is waiting on the
+                    # operator, not exhausting its budget.
+                    blocked_message = self._blocked_input_signal(result)
+                    if blocked_message is not None:
+                        job.pause_reason = blocked_message
+                        terminal = JobStatus.BLOCKED_INPUT_REQUIRED
                         break
 
                     # Non-completed: classify against the budget/progress rules

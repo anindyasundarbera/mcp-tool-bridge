@@ -31,7 +31,7 @@ This document tracks progress on implementing the capability elevations outlined
 Based on the elevation map and recommended adoption order:
 
 ### 2. M-CT · MCPB-010 tail: Resumable state done better — checkpointers, stores, time-travel
-- **Status**: Pending
+- **Status**: Completed
 - **Description**: Finish the continuity tail (fetch+pin base, atomic milestones, dormant states)
 - **Pattern Source**: langchain-ai/langgraph
 - **Key Elements**:
@@ -40,6 +40,13 @@ Based on the elevation map and recommended adoption order:
   - BridgeLab's job_checkpoints as checkpointer; add long-term Store for cross-job lessons
   - Time-travel maps to atomic-milestone acceptance
   - Internal-first, no new tool
+- **Implementation**:
+  - **M-CT-01** (worktree base fetch + pin): `worktrees.py` gains `_resolve_remote_default_tip` (fixed-argv `git fetch origin` + `symbolic-ref` + `rev-parse`) and `create(..., requested_base=...)`; a requested base must equal the fetched `origin/<default>` tip or the job fails closed. Threaded through `DevelopmentJob.requested_base`, `start()`, and the `send_to_local_dev` tool's optional `requested_base` param (40-hex regex). The canonical checkout is left untouched.
+  - **M-CT-04** (atomic milestones): `jobs.py` gains `_close_milestones` — a milestone dict with `acceptance_paths` (all must appear in the changed set) and optional `acceptance_command_id` (a verification command that must pass) closes only when both hold; closed milestones are stamped `closed`/`closed_at` and recorded as a `milestone` checkpoint. Wired into the `_run` boundary checkpoint.
+  - **M-CT-05** (dormant states): `_blocked_input_signal` detects a fenced `<!-- bridge: blocked-input ... -->` block or `blocked_input` field and transitions the job to `BLOCKED_INPUT_REQUIRED` (resumable) instead of a candidate failure. `QUARANTINED_PROVENANCE` remains defined/non-resumable; its trigger is deferred to M-CC-10 per the roadmap.
+- **Files Modified**:
+  - Updated: `src/local_dev_mcp/worktrees.py`, `src/local_dev_mcp/jobs.py`, `src/local_dev_mcp/server.py`
+  - Created: `tests/test_mct.py` (6 tests)
 
 ### 3. M-CC-09: Verification-lab determinism — the hermetic build
 - **Status**: Pending
