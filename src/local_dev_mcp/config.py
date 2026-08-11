@@ -65,6 +65,7 @@ class Settings:
     verification_command_timeout_seconds: int
     max_verification_output_bytes: int
     max_commit_message_chars: int
+    verification_deterministic_repetitions: int
     claude_soft_turns: int
     claude_extension_turns: int
     claude_max_extensions: int
@@ -143,6 +144,9 @@ class Settings:
             ),
             max_commit_message_chars=_positive_int(
                 env, "MAX_COMMIT_MESSAGE_CHARS", 500
+            ),
+            verification_deterministic_repetitions=_positive_int(
+                env, "VERIFICATION_DETERMINISTIC_REPETITIONS", 1
             ),
             claude_soft_turns=_positive_int(env, "CLAUDE_SOFT_TURNS", 30),
             claude_extension_turns=_positive_int(

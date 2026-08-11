@@ -30,6 +30,15 @@ MAX_COMMIT_PATHS = 500
 _FINGERPRINT_MARKER = b"local-dev-mcp-candidate-state-v1\0"
 
 
+def _stderr_text(result: dict[str, Any]) -> str:
+    """Extract the bounded stderr text from a command result dict (or '')."""
+    stderr = result.get("stderr")
+    if isinstance(stderr, dict):
+        text = stderr.get("text")
+        return text if isinstance(text, str) else ""
+    return stderr if isinstance(stderr, str) else ""
+
+
 def _timestamp() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -832,6 +841,11 @@ async def _run_command(
         "NO_COLOR": "1",
         "PYTHONIOENCODING": "utf-8",
         "PYTHONDONTWRITEBYTECODE": "1",
+        # M-CC-09: deterministic env so the same candidate + command always
+        # yields the same result (the hermetic verification lab).
+        "TZ": "UTC",
+        "SOURCE_DATE_EPOCH": "0",
+        "PYTHONHASHSEED": "0",
     }
     python_path = _python_paths(worktree.path, command.python_path)
     if python_path is not None:
@@ -948,6 +962,20 @@ class VerificationCommitManager:
                 return candidate
         raise VerificationError("could not allocate a unique verification ID")
 
+    @staticmethod
+    def _commands_diverge(first: dict[str, Any], second: dict[str, Any]) -> bool:
+        """True when two runs of the same command produced different outcomes.
+
+        Only the determinism-relevant fields are compared: the status, exit
+        code, and stderr text. stdout may legitimately differ (e.g. timestamps
+        in output), but a divergent status, exit code, or stderr is a real flake.
+        """
+        return (
+            first.get("status") != second.get("status")
+            or first.get("exit_code") != second.get("exit_code")
+            or _stderr_text(first) != _stderr_text(second)
+        )
+
     async def verify(
         self,
         project: ProjectPolicy,
@@ -970,14 +998,25 @@ class VerificationCommitManager:
                     self.settings.projects_config_path,
                     *self._project_roots,
                 )
+                repetitions = max(1, self.settings.verification_deterministic_repetitions)
+                nondeterminism_labeled = False
                 for command in project.verification_commands:
-                    result = await _run_command(self.settings, worktree, command)
-                    command_results.append(
-                        _bound_redacted_output(
+                    # M-CC-09 flaky detection: run a command's deterministic
+                    # subset ``deterministic_repetitions`` times; if the results
+                    # diverge, label the verification as nondeterministic and
+                    # degrade the infrastructure status.
+                    first: dict[str, Any] | None = None
+                    for _ in range(repetitions):
+                        result = await _run_command(self.settings, worktree, command)
+                        bounded = _bound_redacted_output(
                             _redact(result, redacted_paths),
                             self.settings.max_verification_output_bytes,
                         )
-                    )
+                        if first is None:
+                            first = bounded
+                        elif self._commands_diverge(first, bounded):
+                            nondeterminism_labeled = True
+                    command_results.append(first)
                 results = tuple(command_results)
                 after = await _candidate_state(self.settings, project, worktree)
             except (DevelopmentJobError, WorktreeError, GitCommandError) as exc:
@@ -994,6 +1033,11 @@ class VerificationCommitManager:
                 "paths": list(before.paths),
                 "state_unchanged": unchanged,
                 "commands": list(results),
+                "deterministic_repetitions": repetitions,
+                "nondeterminism_labeled": nondeterminism_labeled,
+                "infrastructure_status": "DEGRADED"
+                if nondeterminism_labeled
+                else "HEALTHY",
             }
             if not passed:
                 if not unchanged:
@@ -1001,6 +1045,19 @@ class VerificationCommitManager:
                 else:
                     response["error"] = "one or more verification commands failed"
                 return response
+
+            # M-CC-09 baseline comparison: report whether the candidate's
+            # fingerprint matches the last green verification for this project
+            # (a deterministic repeat) or diverges from it (a changed baseline).
+            baseline = store.load_last_passed_record(self._db, project.id)
+            baseline_matches = (
+                baseline is not None
+                and baseline.get("diff_fingerprint") == before.fingerprint
+            )
+            response["baseline_fingerprint"] = (
+                baseline.get("diff_fingerprint") if baseline is not None else None
+            )
+            response["baseline_matches"] = baseline_matches
 
             record = VerificationRecord(
                 verification_id=self._new_verification_id(),

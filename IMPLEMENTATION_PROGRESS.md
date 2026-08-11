@@ -49,7 +49,7 @@ Based on the elevation map and recommended adoption order:
   - Created: `tests/test_mct.py` (6 tests)
 
 ### 3. M-CC-09: Verification-lab determinism — the hermetic build
-- **Status**: Pending
+- **Status**: Completed
 - **Description**: First open-source adoption adding runtime dependencies
 - **Pattern Source**: Nix · devbox · nextest · Bazel · libfaketime
 - **Key Elements**:
@@ -59,6 +59,23 @@ Based on the elevation map and recommended adoption order:
   - Baseline comparison against last green verification's fingerprint
   - Project opt-in; internal, fixed-argv
   - Future: replay_verification tool (NEW SURFACE)
+- **Implementation**:
+  - **Deterministic env**: `verification.py:_run_command` now sets `TZ=UTC`,
+    `SOURCE_DATE_EPOCH=0`, and `PYTHONHASHSEED=0` so the same candidate +
+    command always yields the same result (the hermetic lab). The reader already
+    does sorted fs iteration.
+  - **Flaky detection**: `verify()` runs each command `deterministic_repetitions`
+    times (`VERIFICATION_DETERMINISTIC_REPETITIONS`, default 1); a divergent
+    status/exit-code/stderr labels the verification `nondeterminism_labeled`
+    and sets `infrastructure_status=DEGRADED` (else HEALTHY).
+  - **Baseline comparison**: `store.load_last_passed_record` finds the last
+    green verification for a project; `verify()` surfaces `baseline_fingerprint`
+    and `baseline_regression` when the candidate differs from it.
+  - Internal-first; no new tool.
+- **Files Modified**:
+  - Updated: `src/local_dev_mcp/verification.py`, `src/local_dev_mcp/config.py`,
+    `src/local_dev_mcp/store.py`, `tests/test_config.py`
+  - Created: `tests/test_verification_lab.py` (4 tests)
 
 ### 4. M-CC-11 · M-EV-06: Evidence bundle + supply-chain attestation
 - **Status**: Pending

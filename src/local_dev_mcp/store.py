@@ -15,6 +15,7 @@ This module is the only place that knows the on-disk schema. It speaks in plain
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from pathlib import Path
@@ -380,6 +381,34 @@ def load_record_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
         dict(row)
         for row in connection.execute("SELECT * FROM verifications").fetchall()
     ]
+
+
+def load_last_passed_record(
+    connection: sqlite3.Connection, project_id: str
+) -> dict[str, Any] | None:
+    """Return the most recent passed verification row for a project, or None.
+
+    A record is 'passed' when every command in its ``commands_json`` reports
+    status ``passed``. Used by M-CC-09 baseline comparison: the caller compares
+    a candidate's fingerprint against this last green verification to report a
+    deterministic repeat or a changed baseline.
+    """
+    rows = connection.execute(
+        "SELECT * FROM verifications WHERE project_id = ? "
+        "ORDER BY verified_at DESC",
+        (project_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            commands = json.loads(row["commands_json"])
+        except (json.JSONDecodeError, TypeError, KeyError):
+            continue
+        if isinstance(commands, list) and commands and all(
+            isinstance(item, dict) and item.get("status") == "passed"
+            for item in commands
+        ):
+            return dict(row)
+    return None
 
 
 def upsert_job_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
