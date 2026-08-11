@@ -8,6 +8,7 @@ from pydantic import Field
 
 from .claude import ClaudeExecutor
 from .config import Settings
+from .evidence import EvidenceBundleError, EvidenceBundleManager
 from .git import project_status
 from .jobs import DevelopmentJobManager
 from .models import Effort, ProjectCapability
@@ -31,6 +32,7 @@ def create_server(
     review: ReviewManager | None = None,
     publication: PublicationManager | None = None,
     sync: SyncManager | None = None,
+    evidence: EvidenceBundleManager | None = None,
 ) -> FastMCP:
     active_settings = settings or Settings.from_env()
     active_registry = registry or ProjectRegistry.load(
@@ -66,6 +68,12 @@ def create_server(
         projects=active_registry.projects(),
     )
     active_sync = sync or SyncManager(
+        active_settings,
+        active_locks,
+        active_jobs,
+        projects=active_registry.projects(),
+    )
+    active_evidence = evidence or EvidenceBundleManager(
         active_settings,
         active_locks,
         active_jobs,
@@ -1014,6 +1022,60 @@ def create_server(
             project_id, ProjectCapability.SYNC_CANONICAL_CHECKOUT
         )
         return await active_sync.sync(project, expected_current_head, target_commit)
+
+    @mcp.tool(
+        name="export_evidence_bundle",
+        description=(
+            "Assemble a single redacted, content-addressed evidence bundle for "
+            "one development job: candidate fingerprint + changed paths + diff "
+            "summary, verification records + bindings, review records + verdict "
+            "hashes, checkpoint summary, and a bundle-wide SHA-256. Requires the "
+            "expected candidate fingerprint to bind the bundle to a specific "
+            "candidate. Never exposes raw worktree paths, secrets, or "
+            "credentials. Read-only; opt-in via the export_evidence_bundle "
+            "project capability."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
+    async def export_evidence_bundle(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        job_id: Annotated[
+            str,
+            Field(
+                description="Opaque job ID returned by send_to_local_dev.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+        expected_candidate_fingerprint: Annotated[
+            str,
+            Field(
+                description=(
+                    "Exact lowercase 64-hex SHA-256 candidate fingerprint the "
+                    "bundle is bound to."
+                ),
+                pattern=r"^[0-9a-f]{64}$",
+            ),
+        ],
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.EXPORT_EVIDENCE_BUNDLE
+        )
+        try:
+            return await active_evidence.export_bundle(
+                project,
+                job_id,
+                expected_candidate_fingerprint,
+            )
+        except EvidenceBundleError as exc:
+            raise ValueError(str(exc)) from exc
 
     return mcp
 

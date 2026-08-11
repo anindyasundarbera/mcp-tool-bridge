@@ -437,6 +437,30 @@ def load_review_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     ]
 
 
+def load_review_rows_for_job(
+    connection: sqlite3.Connection, job_id: str
+) -> list[dict[str, Any]]:
+    """Return one job's persisted review rows as dicts."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM reviews WHERE job_id = ?", (job_id,)
+        ).fetchall()
+    ]
+
+
+def load_record_rows_for_job(
+    connection: sqlite3.Connection, job_id: str
+) -> list[dict[str, Any]]:
+    """Return one job's persisted verification rows as dicts."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM verifications WHERE job_id = ?", (job_id,)
+        ).fetchall()
+    ]
+
+
 def upsert_review_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
     """Persist one review row as a single ACID transaction."""
     with connection:

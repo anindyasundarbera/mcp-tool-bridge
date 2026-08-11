@@ -18,6 +18,7 @@ class ProjectCapability(StrEnum):
     CANDIDATE_REVIEW = "candidate_review"
     PUSH_DEVELOPMENT_COMMIT = "push_development_commit"
     SYNC_CANONICAL_CHECKOUT = "sync_canonical_checkout"
+    EXPORT_EVIDENCE_BUNDLE = "export_evidence_bundle"
 
 
 def _policy_path(value: str) -> str:
@@ -186,6 +187,11 @@ class ProjectPolicy(BaseModel):
             and ProjectCapability.REPOSITORY_READ not in self.capabilities
         ):
             raise ValueError("sync_canonical_checkout requires repository_read")
+        if (
+            ProjectCapability.EXPORT_EVIDENCE_BUNDLE in self.capabilities
+            and ProjectCapability.REPOSITORY_READ not in self.capabilities
+        ):
+            raise ValueError("export_evidence_bundle requires repository_read")
         command_ids = [command.id for command in self.verification_commands]
         if len(command_ids) != len(set(command_ids)):
             raise ValueError("verification command IDs must be unique per project")

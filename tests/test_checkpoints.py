@@ -564,7 +564,7 @@ class ContinuityToolSurfaceTests(unittest.TestCase):
             tools = {tool.name for tool in _asyncio.run(server.list_tools())}
 
         # Continuity is internal to the job lifecycle: it must not add tools.
-        self.assertEqual(len(tools), 22)
+        self.assertEqual(len(tools), 23)
         for leaked in (
             "pause_development_job",
             "checkpoint_development_job",

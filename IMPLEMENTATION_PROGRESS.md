@@ -78,7 +78,7 @@ Based on the elevation map and recommended adoption order:
   - Created: `tests/test_verification_lab.py` (4 tests)
 
 ### 4. M-CC-11 · M-EV-06: Evidence bundle + supply-chain attestation
-- **Status**: Pending
+- **Status**: Completed (evidence bundle; supply-chain scan still pending)
 - **Description**: Portable evidence bundle, source classifications, signed manifests, supply-chain scan
 - **Pattern Source**: in-toto · SLSA · cosign · osv-scanner · syft
 - **Key Elements**:
@@ -89,6 +89,24 @@ Based on the elevation map and recommended adoption order:
   - Drop: classic in-toto layout+links, SPDX, W3C VC, OCI/ORAS
   - export_evidence_bundle tool (NEW SURFACE, capability EXPORT_EVIDENCE_BUNDLE)
   - Internal-first; sensitivity classification gates inclusion
+- **Implementation** (evidence bundle part):
+  - **NEW** `ProjectCapability.EXPORT_EVIDENCE_BUNDLE` (requires `repository_read`).
+  - **NEW** `evidence.py` `EvidenceBundleManager` + `export_evidence_bundle` MCP tool
+    (dormant by default; runtime capability-gated via `resolve`).
+  - Assembles a single redacted, content-addressed JSON bundle: candidate
+    fingerprint + changed paths + diff summary, verification records + bindings,
+    review records + verdict hashes, checkpoint summary, and a bundle-wide
+    SHA-256 computed over the returned (redacted) bytes so a recipient can
+    recompute it. Paths redacted; never exposes raw worktree paths/secrets.
+  - Additive store helpers `load_record_rows_for_job` / `load_review_rows_for_job`.
+  - Tool count 22 → 23 (guard tests in test_checkpoints/test_persistence updated).
+- **Files Modified**:
+  - Created: `src/local_dev_mcp/evidence.py`, `tests/test_evidence_bundle.py`
+  - Updated: `src/local_dev_mcp/server.py`, `src/local_dev_mcp/models.py`,
+    `src/local_dev_mcp/store.py`, `src/local_dev_mcp/__init__.py`,
+    `tests/test_server.py`, `tests/test_checkpoints.py`, `tests/test_persistence.py`
+- **Remaining** (supply-chain scan, M-CC-11): deferred — needs a runtime scanner
+  (syft/grype/pip-audit) and is a separate project opt-in.
 
 ### 5. M-GV-06: Sub-agent delegation + parent/child task trees
 - **Status**: Pending
