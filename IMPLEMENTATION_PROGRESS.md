@@ -144,7 +144,7 @@ Based on the elevation map and recommended adoption order:
   - Created: `tests/test_delegation.py` (6 tests)
 
 ### 6. M-GV-01/02/03/04: Durable authorization + named roles + external grounding + spec-gating
-- **Status**: Pending
+- **Status**: Completed (M-GV-01 durable authorization; M-GV-02/03/04 deferred)
 - **Description**: Replace inline-evidence re-statement with durable authorizations table
 - **Pattern Source**: OPA/Cedar · crewAI · spec-kit · MCP ToolAnnotations
 - **Key Elements**:
@@ -153,6 +153,23 @@ Based on the elevation map and recommended adoption order:
   - spec-kit's spec-as-source-of-truth + ratified_spec_commit for external grounding and spec-gating
   - Internal-first; no new tool
   - Composes with M-EV-05 once authorizations table exists
+- **Implementation** (M-GV-01):
+  - New additive `authorizations` table (SCHEMA_VERSION stays 1) + store helpers
+    `insert_authorization_row` / `load_authorization_row` /
+    `mark_authorization_used` (atomic `WHERE used = 0` guard, returns bool).
+  - New `authorization.py` `AuthorizationManager`: `issue` / `check` /
+    `consume` / `check_and_consume` / `get`. `check` validates project,
+    capability, target, unused, unexpired. `check_and_consume` is the
+    TOCTOU-safe single-use path (atomic UPDATE, only the first concurrent
+    consumer wins). Delegation chains record `delegated_from`.
+  - Internal-first: no new MCP tool; the manager is exported but not yet wired
+    into handlers (the inline-evidence path stays the default).
+- **Files Modified**:
+  - Created: `src/local_dev_mcp/authorization.py`, `tests/test_authorizations.py`
+  - Updated: `src/local_dev_mcp/store.py`, `src/local_dev_mcp/__init__.py`
+- **Remaining** (M-GV-02/03/04): named roles (Planner/Evidence-officer/
+  Supervisor), external apex grounding, and spec-gated runtime — deferred to a
+  later pass.
 
 ### 7. M-GV-07: Parallel verify + review + conflict reconciliation
 - **Status**: Pending

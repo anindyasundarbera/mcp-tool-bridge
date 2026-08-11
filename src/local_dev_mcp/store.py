@@ -149,6 +149,21 @@ CREATE TABLE IF NOT EXISTS requirement_links (
     FOREIGN KEY (requirement_id) REFERENCES requirements(requirement_id),
     FOREIGN KEY (job_id) REFERENCES jobs(job_id)
 );
+CREATE TABLE IF NOT EXISTS authorizations (
+    authorization_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    job_id TEXT,
+    actor TEXT NOT NULL,
+    authority_source TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    target TEXT NOT NULL,
+    issued_at TEXT NOT NULL,
+    expires_at TEXT,
+    single_use INTEGER NOT NULL DEFAULT 1,
+    used INTEGER NOT NULL DEFAULT 0,
+    delegated_from TEXT,
+    detail_json TEXT NOT NULL
+);
 """
 
 _UPSERT_JOB = """
@@ -785,3 +800,52 @@ def load_requirement_links_for_requirement(connection: sqlite3.Connection, requi
             "SELECT * FROM requirement_links WHERE requirement_id = ?", (requirement_id,)
         ).fetchall()
     ]
+
+
+_INSERT_AUTHORIZATION = """
+INSERT INTO authorizations (
+    authorization_id, project_id, job_id, actor, authority_source,
+    capability, target, issued_at, expires_at, single_use, used,
+    delegated_from, detail_json
+) VALUES (
+    :authorization_id, :project_id, :job_id, :actor, :authority_source,
+    :capability, :target, :issued_at, :expires_at, :single_use, :used,
+    :delegated_from, :detail_json
+)
+"""
+
+
+def insert_authorization_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
+    """Persist one authorization row as a single ACID transaction."""
+    with connection:
+        connection.execute(_INSERT_AUTHORIZATION, row)
+
+
+def load_authorization_row(
+    connection: sqlite3.Connection, authorization_id: str
+) -> dict[str, Any] | None:
+    """Return one authorization row, or None if it does not exist."""
+    row = connection.execute(
+        "SELECT * FROM authorizations WHERE authorization_id = ?",
+        (authorization_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def mark_authorization_used(
+    connection: sqlite3.Connection, authorization_id: str
+) -> bool:
+    """Atomically mark one authorization as used (single-use consumption).
+
+    The ``WHERE used = 0`` guard makes consumption atomic: only the first
+    concurrent consumer wins. Returns True if this call performed the
+    consumption, False if the authorization was already used (so the caller can
+    raise the appropriate error).
+    """
+    with connection:
+        cursor = connection.execute(
+            "UPDATE authorizations SET used = 1 "
+            "WHERE authorization_id = ? AND used = 0",
+            (authorization_id,),
+        )
+        return cursor.rowcount > 0
