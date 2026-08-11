@@ -44,7 +44,7 @@ class ServerSchemaTests(unittest.TestCase):
             )
             tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
 
-        self.assertEqual(len(tools), 23)
+        self.assertEqual(len(tools), 24)
         reader_tools = {
             "list_project_markdown",
             "search_project_markdown",

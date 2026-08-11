@@ -198,7 +198,7 @@ Based on the elevation map and recommended adoption order:
   commit gate — deferred to a later pass.
 
 ### 8. M-CC-01/02/05: PR creation, state confirmation, race-safe idempotency
-- **Status**: Pending
+- **Status**: Completed
 - **Description**: PyGithub/gh-backed open/update draft PR with client-side mutex + re-check
 - **Pattern Source**: PyGithub · gh
 - **Key Elements**:
@@ -211,6 +211,25 @@ Based on the elevation map and recommended adoption order:
   - Never call merge (omit pr.merge() / gh pr merge)
   - Surface remote_branch_state + pr_state (M-CC-02)
   - NEW SURFACE, dormant by default
+- **Implementation**:
+  - **NEW** `ProjectCapability.OPEN_PULL_REQUEST` (requires `push_development_commit`).
+  - **NEW** `pr.py` `PullRequestManager` + `open_pull_request` MCP tool (dormant by
+    default; runtime capability-gated via `resolve`).
+  - Uses the `gh` CLI with fixed argv (no shell): discovers an existing PR via
+    `gh pr list --head <branch>` (owner:branch form), updates it via `gh pr edit`,
+    or creates a draft via `gh pr create --draft`. Merge is never issued.
+  - Confirms `remote_branch_state` (present/vanished + head SHA) and `pr_state`
+    (number/url/state/action). Race-safe: discover-then-create/update; a gh
+    failure during discovery is re-raised (never mistaken for "no PR"), and the
+    matched PR's `headRefName` is cross-checked against the branch.
+  - Re-stated evidence: the caller's `fingerprint` must match a used verification
+    record for the exact (project, job, base_head).
+  - Tool count 23 → 24 (guard tests updated).
+- **Files Modified**:
+  - Created: `src/local_dev_mcp/pr.py`, `tests/test_pr.py`
+  - Updated: `src/local_dev_mcp/server.py`, `src/local_dev_mcp/models.py`,
+    `src/local_dev_mcp/__init__.py`, `tests/test_server.py`,
+    `tests/test_checkpoints.py`, `tests/test_persistence.py`
 
 ### 9. M-CC-11: Prompt-injection defense for repo-ingested content
 - **Status**: Pending

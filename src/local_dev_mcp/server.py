@@ -12,6 +12,7 @@ from .evidence import EvidenceBundleError, EvidenceBundleManager
 from .git import project_status
 from .jobs import DevelopmentJobManager
 from .models import Effort, ProjectCapability
+from .pr import PullRequestError, PullRequestManager
 from .reader import RepositoryReader
 from .registry import ProjectLockManager, ProjectRegistry
 from .review import ReviewError, ReviewManager
@@ -33,6 +34,7 @@ def create_server(
     publication: PublicationManager | None = None,
     sync: SyncManager | None = None,
     evidence: EvidenceBundleManager | None = None,
+    pr: PullRequestManager | None = None,
 ) -> FastMCP:
     active_settings = settings or Settings.from_env()
     active_registry = registry or ProjectRegistry.load(
@@ -74,6 +76,12 @@ def create_server(
         projects=active_registry.projects(),
     )
     active_evidence = evidence or EvidenceBundleManager(
+        active_settings,
+        active_locks,
+        active_jobs,
+        projects=active_registry.projects(),
+    )
+    active_pr = pr or PullRequestManager(
         active_settings,
         active_locks,
         active_jobs,
@@ -1075,6 +1083,73 @@ def create_server(
                 expected_candidate_fingerprint,
             )
         except EvidenceBundleError as exc:
+            raise ValueError(str(exc)) from exc
+
+    @mcp.tool(
+        name="open_pull_request",
+        description=(
+            "Open or update a draft pull request for a development job's "
+            "published remote branch. Discovers an existing PR for the branch "
+            "and updates it, or opens a new draft PR. Confirms the remote "
+            "branch and PR state. Never merges. Requires the job to have been "
+            "published (push_development_commit). Opt-in via the "
+            "open_pull_request project capability."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def open_pull_request(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        job_id: Annotated[
+            str,
+            Field(
+                description="Opaque job ID returned by send_to_local_dev.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+        base_head: Annotated[
+            str,
+            Field(
+                description="Exact lowercase 40-hex SHA the job branched from.",
+                pattern=r"^[0-9a-f]{40}$",
+            ),
+        ],
+        fingerprint: Annotated[
+            str,
+            Field(
+                description="Exact lowercase 64-hex SHA-256 candidate fingerprint.",
+                pattern=r"^[0-9a-f]{64}$",
+            ),
+        ],
+        title: Annotated[
+            str,
+            Field(description="Pull request title.", min_length=1, max_length=200),
+        ],
+        draft: Annotated[
+            bool,
+            Field(description="Open as a draft PR (default true)."),
+        ] = True,
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.OPEN_PULL_REQUEST
+        )
+        try:
+            return await active_pr.open_pull_request(
+                project,
+                job_id,
+                base_head,
+                fingerprint,
+                title,
+                draft=draft,
+            )
+        except PullRequestError as exc:
             raise ValueError(str(exc)) from exc
 
     return mcp
