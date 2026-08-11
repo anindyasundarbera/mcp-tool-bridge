@@ -26,6 +26,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.max_verification_output_bytes, 1048576)
         self.assertEqual(settings.max_commit_message_chars, 500)
         self.assertEqual(settings.verification_deterministic_repetitions, 1)
+        self.assertEqual(settings.max_delegations_per_job, 3)
         self.assertTrue(settings.projects_config_path.is_absolute())
         self.assertEqual(settings.projects_config_path.name, "projects.json")
 

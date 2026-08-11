@@ -109,7 +109,7 @@ Based on the elevation map and recommended adoption order:
   (syft/grype/pip-audit) and is a separate project opt-in.
 
 ### 5. M-GV-06: Sub-agent delegation + parent/child task trees
-- **Status**: Pending
+- **Status**: Completed
 - **Description**: Bounded parent/child task trees with delegation mandates + records
 - **Pattern Source**: LangGraph subgraphs · crewAI roles · openai-agents handoffs
 - **Key Elements**:
@@ -117,6 +117,31 @@ Based on the elevation map and recommended adoption order:
   - Bound children via config.MAX_DELEGATIONS_PER_JOB
   - Record delegation in authorizations table (delegated_from)
   - Internal-first; delegate tool is NEW SURFACE (defer)
+- **Implementation**:
+  - `DevelopmentJob` gains `parent_job_id` and `delegation_mandate` (persisted
+    on the additive `job_progress` sidecar, so the `jobs` schema is untouched).
+  - New additive `delegations` ledger table (parent_job_id, child_job_id,
+    project_id, mandate_json, created_at) + store helpers
+    `insert_delegation_row` / `load_delegation_rows_for_parent` /
+    `load_delegation_rows_for_child`.
+  - `DevelopmentJobManager.delegate(project, parent_job_id, text, effort,
+    mandate)` spawns a bounded child: same project, real parent, and the parent
+    must not exceed `MAX_DELEGATIONS_PER_JOB` (default 3). The delegation is
+    recorded in the ledger and the child's parent/mandate are persisted.
+  - Scope enforcement (fail-closed): a mandate must declare a non-empty
+    `outputs` list; at completion a child whose changed paths fall outside its
+    declared outputs (or that produces no verifiable changed paths) is rejected
+    as `failed` rather than promoted. A child may not delegate further (one-level
+    depth bound). Mandate structure is validated (`inputs`/`outputs`/`authority`
+    only, bounded size).
+  - The terminal report (`_snapshot`) surfaces `parent_job_id`,
+    `delegation_mandate`, and the `children` tree from the ledger.
+  - Internal-first: no new MCP tool (a `delegate` tool is deferred as NEW
+    SURFACE).
+- **Files Modified**:
+  - Updated: `src/local_dev_mcp/jobs.py`, `src/local_dev_mcp/store.py`,
+    `src/local_dev_mcp/config.py`, `tests/test_config.py`
+  - Created: `tests/test_delegation.py` (6 tests)
 
 ### 6. M-GV-01/02/03/04: Durable authorization + named roles + external grounding + spec-gating
 - **Status**: Pending

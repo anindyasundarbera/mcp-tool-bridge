@@ -154,6 +154,12 @@ class DevelopmentJob:
     # M-CT-01: an optional fetched/pinned base commit the worktree was created
     # from (``origin/<default>`` tip), rather than the local canonical HEAD.
     requested_base: str | None = None
+    # M-GV-06: parent/child delegation. ``parent_job_id`` links a child job to
+    # the job that delegated to it; ``delegation_mandate`` bounds the child's
+    # scope (inputs/outputs/authority). Persisted in the ``job_progress``
+    # sidecar (additive) so the ``jobs`` schema is untouched.
+    parent_job_id: str | None = None
+    delegation_mandate: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,6 +364,8 @@ class DevelopmentJobManager:
             "tool_failures": job.tool_failures,
             "soft_warned": 1 if job.soft_warned else 0,
             "milestones_json": _json_dumps(job.milestones),
+            "parent_job_id": job.parent_job_id,
+            "delegation_mandate_json": _json_dumps(job.delegation_mandate),
             "updated_at": _timestamp(),
         }
 
@@ -383,6 +391,10 @@ class DevelopmentJobManager:
         milestones = _json_loads(row.get("milestones_json"))
         if isinstance(milestones, list):
             job.milestones = milestones
+        job.parent_job_id = row.get("parent_job_id")
+        mandate = _json_loads(row.get("delegation_mandate_json"))
+        if isinstance(mandate, dict):
+            job.delegation_mandate = mandate
 
     def _record_event(
         self,
@@ -631,6 +643,53 @@ class DevelopmentJobManager:
         validate_effort(project, effort)
         return specification
 
+    def _validate_mandate(self, mandate: dict[str, Any] | None) -> dict[str, Any]:
+        """Validate a delegation mandate's structure.
+
+        A mandate is a dict with at most ``inputs`` / ``outputs`` / ``authority``
+        keys, each a list of non-empty strings (paths or capability names), and
+        must declare a non-empty ``outputs`` list (the only paths the child may
+        change). Anything else — including a missing mandate — is rejected so a
+        malformed, oversized, or fail-open mandate can never be persisted or
+        echoed into a snapshot.
+        """
+        if mandate is None:
+            raise DevelopmentJobError("delegation mandate is required")
+        if not isinstance(mandate, dict):
+            raise DevelopmentJobError("delegation mandate must be a dict")
+        allowed = {"inputs", "outputs", "authority"}
+        unknown = set(mandate) - allowed
+        if unknown:
+            raise DevelopmentJobError(
+                f"delegation mandate has unsupported keys: {sorted(unknown)}"
+            )
+        # A delegation mandate must declare its outputs: the child's changed
+        # paths are bounded to them, so an output-less mandate would silently
+        # disable the scope bound (fail-open). Requiring outputs keeps the
+        # enforcement fail-closed.
+        if "outputs" not in mandate:
+            raise DevelopmentJobError(
+                "delegation mandate must declare a non-empty 'outputs' list"
+            )
+        for key in allowed:
+            value = mandate.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, list) or not value:
+                raise DevelopmentJobError(
+                    f"delegation mandate {key!r} must be a non-empty list"
+                )
+            if len(value) > 100:
+                raise DevelopmentJobError(
+                    f"delegation mandate {key!r} exceeds 100 entries"
+                )
+            for item in value:
+                if not isinstance(item, str) or not item.strip():
+                    raise DevelopmentJobError(
+                        f"delegation mandate {key!r} entries must be non-empty strings"
+                    )
+        return mandate
+
     def _new_job_id(self) -> str:
         for _ in range(10):
             candidate = secrets.token_hex(16)
@@ -688,6 +747,22 @@ class DevelopmentJobManager:
             "checkpoint_count": store.checkpoint_count(self._db, job.job_id),
             "milestones": list(job.milestones) if job.milestones else [],
         }
+        if job.parent_job_id is not None:
+            snapshot["parent_job_id"] = job.parent_job_id
+        if job.delegation_mandate is not None:
+            snapshot["delegation_mandate"] = job.delegation_mandate
+        # M-GV-06: surface the parent/child delegation tree (children of this
+        # job, from the delegations ledger) so an orchestrator can query it.
+        children = store.load_delegation_rows_for_parent(self._db, job.job_id)
+        if children:
+            snapshot["children"] = [
+                {
+                    "child_job_id": row.get("child_job_id"),
+                    "mandate": _json_loads(row.get("mandate_json")),
+                    "created_at": row.get("created_at"),
+                }
+                for row in children
+            ]
         if job.worktree is not None:
             snapshot["base_head"] = job.worktree.base_head
         if job.result is not None:
@@ -753,6 +828,74 @@ class DevelopmentJobManager:
             )
             self._persist_job(job)
             return self._snapshot(job)
+
+    async def delegate(
+        self,
+        project: ProjectPolicy,
+        parent_job_id: str,
+        text: str,
+        effort: Effort,
+        mandate: dict[str, Any],
+    ) -> dict[str, Any]:
+        """M-GV-06: spawn a bounded child job delegated from a parent job.
+
+        The child is bounded to the parent's authorized scope: it must belong
+        to the same project, the parent must be a real job, the parent must
+        not have exceeded ``MAX_DELEGATIONS_PER_JOB``, and the mandate must
+        declare the child's ``outputs`` (the only paths it may change). The
+        delegation is recorded in the ``delegations`` ledger (parent -> child)
+        with the mandate, and the child's ``parent_job_id`` /
+        ``delegation_mandate`` are persisted on its ``job_progress`` sidecar.
+        Internal-first: no new MCP tool; a parent job spawns children via this
+        manager method.
+        """
+        specification = self._validate_input(project, text, effort)
+        mandate = self._validate_mandate(mandate)
+        async with self._state_lock:
+            parent = self._require_job(project, parent_job_id)
+            # M-GV-06 depth bound: a child may not itself delegate, so the
+            # delegation tree is at most two levels deep (parent -> child).
+            if parent.parent_job_id is not None:
+                raise DevelopmentJobError(
+                    "a delegated child job cannot delegate further; "
+                    "delegation is bounded to one level"
+                )
+            existing = store.load_delegation_rows_for_parent(self._db, parent_job_id)
+            if len(existing) >= self.settings.max_delegations_per_job:
+                raise DevelopmentJobError(
+                    f"parent job {parent_job_id!r} has reached the delegation "
+                    f"limit ({self.settings.max_delegations_per_job})"
+                )
+            child = DevelopmentJob(
+                job_id=self._new_job_id(),
+                project_id=project.id,
+                effort=effort,
+                parent_job_id=parent_job_id,
+                delegation_mandate=mandate,
+            )
+            self._jobs[child.job_id] = child
+            self._persist_progress(child)
+            self._record_event(
+                child,
+                "created",
+                {"effort": effort, "parent_job_id": parent_job_id},
+            )
+            store.insert_delegation_row(
+                self._db,
+                {
+                    "parent_job_id": parent_job_id,
+                    "child_job_id": child.job_id,
+                    "project_id": project.id,
+                    "mandate_json": _json_dumps(mandate),
+                    "created_at": _timestamp(),
+                },
+            )
+            child.task = asyncio.create_task(
+                self._run(child, project, specification, effort, resume=False),
+                name=f"development-job-{child.job_id}",
+            )
+            self._persist_job(child)
+            return self._snapshot(child)
 
     async def get(
         self,
@@ -1123,6 +1266,53 @@ class DevelopmentJobManager:
                     terminal_reason = result.get("terminal_reason")
 
                     if claude_status == "completed":
+                        # M-GV-06 scope enforcement: a delegated child's changed
+                        # paths must stay within the mandate's declared outputs.
+                        # If the child touched anything outside its mandate, the
+                        # candidate is rejected rather than silently promoted.
+                        # Fail-closed: an empty changed-path read (transient git
+                        # error) rejects the child rather than promoting it.
+                        # Gate on parent_job_id (not delegation_mandate) so a
+                        # legacy child row with a NULL mandate still enforces.
+                        if job.parent_job_id is not None:
+                            if job.delegation_mandate is None:
+                                # A legacy child row with a NULL mandate cannot
+                                # be scope-checked; fail closed rather than
+                                # promote it unbounded.
+                                async with self._state_lock:
+                                    job.status = JobStatus.FAILED
+                                    job.error = (
+                                        "delegated child has no mandate; "
+                                        "refusing to promote an unbounded child"
+                                    )
+                                    job.updated_at = _timestamp()
+                                    self._persist_job(job)
+                                    self._persist_progress(job)
+                                terminal = job.status
+                                applied = True
+                                break
+                            allowed = set(job.delegation_mandate.get("outputs"))
+                            changed = await self._current_changed_paths(job)
+                            out_of_scope = [
+                                path for path in changed if path not in allowed
+                            ]
+                            if not changed or out_of_scope:
+                                reason = (
+                                    "delegated child changed paths outside its "
+                                    "mandate: " + ", ".join(sorted(out_of_scope))[:2000]
+                                    if out_of_scope
+                                    else "delegated child produced no verifiable "
+                                    "changed paths at completion"
+                                )
+                                async with self._state_lock:
+                                    job.status = JobStatus.FAILED
+                                    job.error = reason
+                                    job.updated_at = _timestamp()
+                                    self._persist_job(job)
+                                    self._persist_progress(job)
+                                terminal = job.status
+                                applied = True
+                                break
                         public_result = dict(result)
                         public_result.pop("session_id", None)
                         public_result = _redact(

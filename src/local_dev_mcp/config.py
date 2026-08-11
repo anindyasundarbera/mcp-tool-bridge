@@ -75,6 +75,7 @@ class Settings:
     claude_checkpoint_interval_seconds: float
     claude_checkpoint_max: int
     claude_stream_json: bool
+    max_delegations_per_job: int
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str] | None = None) -> "Settings":
@@ -170,4 +171,7 @@ class Settings:
             ),
             claude_stream_json=env.get("CLAUDE_STREAM_JSON", "").strip()
             in ("1", "true", "yes", "on"),
+            max_delegations_per_job=_positive_int(
+                env, "MAX_DELEGATIONS_PER_JOB", 3
+            ),
         )

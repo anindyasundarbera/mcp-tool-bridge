@@ -120,7 +120,17 @@ CREATE TABLE IF NOT EXISTS job_progress (
     tool_failures INTEGER NOT NULL,
     soft_warned INTEGER NOT NULL,
     milestones_json TEXT,
+    parent_job_id TEXT,
+    delegation_mandate_json TEXT,
     updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS delegations (
+    delegation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent_job_id TEXT NOT NULL,
+    child_job_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    mandate_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS requirements (
     requirement_id TEXT PRIMARY KEY,
@@ -250,10 +260,12 @@ INSERT INTO job_events (
 _UPSERT_PROGRESS = """
 INSERT INTO job_progress (
     job_id, pause_reason, turns_used, tokens_used, extensions_granted,
-    no_progress_turns, tool_failures, soft_warned, milestones_json, updated_at
+    no_progress_turns, tool_failures, soft_warned, milestones_json,
+    parent_job_id, delegation_mandate_json, updated_at
 ) VALUES (
     :job_id, :pause_reason, :turns_used, :tokens_used, :extensions_granted,
-    :no_progress_turns, :tool_failures, :soft_warned, :milestones_json, :updated_at
+    :no_progress_turns, :tool_failures, :soft_warned, :milestones_json,
+    :parent_job_id, :delegation_mandate_json, :updated_at
 )
 ON CONFLICT(job_id) DO UPDATE SET
     pause_reason = excluded.pause_reason,
@@ -264,6 +276,8 @@ ON CONFLICT(job_id) DO UPDATE SET
     tool_failures = excluded.tool_failures,
     soft_warned = excluded.soft_warned,
     milestones_json = excluded.milestones_json,
+    parent_job_id = excluded.parent_job_id,
+    delegation_mandate_json = excluded.delegation_mandate_json,
     updated_at = excluded.updated_at
 """
 
@@ -301,6 +315,32 @@ def ensure_state_dir(state_root: Path) -> Path:
     return _ensure_private_directory(state_root)
 
 
+# Additive columns added to existing tables across releases. ``CREATE TABLE IF
+# NOT EXISTS`` is a no-op on an existing table, so these must be added via
+# idempotent ``ALTER TABLE ... ADD COLUMN`` guarded by ``PRAGMA table_info``.
+# SCHEMA_VERSION stays 1: the columns are additive and never break old rows.
+_ADDITIVE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "job_progress": (
+        ("parent_job_id", "TEXT"),
+        ("delegation_mandate_json", "TEXT"),
+    ),
+}
+
+
+def _migrate_additive_columns(connection: sqlite3.Connection) -> None:
+    """Add any missing additive columns to existing tables (idempotent)."""
+    for table, columns in _ADDITIVE_COLUMNS.items():
+        existing = {
+            row["name"]
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        for name, definition in columns:
+            if name not in existing:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+                )
+
+
 def open_state_db(db_path: Path) -> sqlite3.Connection:
     """Open (creating if needed) the durable state database.
 
@@ -318,6 +358,7 @@ def open_state_db(db_path: Path) -> sqlite3.Connection:
         connection.execute("PRAGMA temp_store=MEMORY")
         connection.execute("PRAGMA busy_timeout=2000")
         connection.executescript(_CREATE_SCHEMA)
+        _migrate_additive_columns(connection)
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES ('version', ?) "
             "ON CONFLICT(key) DO NOTHING",
@@ -677,6 +718,41 @@ def load_progress_row(
         "SELECT * FROM job_progress WHERE job_id = ?", (job_id,)
     ).fetchone()
     return dict(row) if row is not None else None
+
+
+_INSERT_DELEGATION = """
+INSERT INTO delegations (
+    parent_job_id, child_job_id, project_id, mandate_json, created_at
+) VALUES (
+    :parent_job_id, :child_job_id, :project_id, :mandate_json, :created_at
+)
+"""
+
+
+def insert_delegation_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
+    """Append one parent->child delegation record as a single ACID transaction.
+
+    Delegations are an append-only audit ledger: each bounded sub-agent
+    delegation adds a row linking the parent job to its child job, with the
+    mandate (inputs/outputs/authority) that bounds the child's scope. No
+    single-use bound; the table exists for restart-safe tree reconstruction.
+    """
+    with connection:
+        connection.execute(_INSERT_DELEGATION, row)
+
+
+def load_delegation_rows_for_parent(
+    connection: sqlite3.Connection, parent_job_id: str
+) -> list[dict[str, Any]]:
+    """Return one parent job's delegation rows as dicts, oldest first."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM delegations WHERE parent_job_id = ? "
+            "ORDER BY delegation_id ASC",
+            (parent_job_id,),
+        ).fetchall()
+    ]
 
 
 def upsert_requirement_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
