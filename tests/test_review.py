@@ -881,5 +881,170 @@ class ReviewManagerTests(unittest.TestCase):
             registry.resolve("other", ProjectCapability.CANDIDATE_REVIEW)
 
 
+class ReviewReconciliationTests(unittest.TestCase):
+    """M-GV-07: reconcile_reviews for divergent verdicts + reconciled commit gate."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        initialize_git_repository(self.root)
+        self.settings = Settings.from_env(
+            {
+                "PROJECTS_CONFIG_PATH": str(self.base / "projects.json"),
+                "JOB_WORKTREE_ROOT": str(self.base / "jobs"),
+                "VERIFICATION_COMMAND_TIMEOUT_SECONDS": "2",
+                "MAX_VERIFICATION_OUTPUT_BYTES": "64",
+            }
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _managers(
+        self, project: ProjectPolicy, edit: Any
+    ) -> tuple[ProjectLockManager, DevelopmentJobManager, VerificationCommitManager, ReviewManager]:
+        locks = ProjectLockManager()
+        jobs = DevelopmentJobManager(
+            self.settings, locks, EditingExecutor(edit), projects=(project,)
+        )
+        verification = VerificationCommitManager(
+            self.settings, locks, jobs, projects=(project,)
+        )
+        review = ReviewManager(
+            self.settings, locks, jobs, ReviewExecutor(), projects=(project,)
+        )
+        return locks, jobs, verification, review
+
+    async def _completed_job(
+        self, jobs: DevelopmentJobManager, project: ProjectPolicy, edit: Any
+    ) -> dict[str, Any]:
+        started = await jobs.start(project, "make candidate", "high")
+        completed = await wait_completed(jobs, project, str(started["job_id"]))
+        assert completed["status"] == "completed"
+        return completed
+
+    def test_agreeing_reviews_reconcile_to_pass(self) -> None:
+        async def exercise() -> None:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            _, jobs, _, review = self._managers(project, edit)
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+            r1 = await review.record_candidate_review(
+                project, job_id,
+                {"summary": "ok", "issues": [], "recommendation": "approve"},
+                reviewer_id="reviewer-a",
+            )
+            r2 = await review.record_candidate_review(
+                project, job_id,
+                {"summary": "ok", "issues": [], "recommendation": "approve"},
+                reviewer_id="reviewer-b",
+            )
+            result = await review.reconcile_reviews(
+                project, job_id, [r1["review_id"], r2["review_id"]]
+            )
+            self.assertEqual(result["resolved"], "pass")
+            self.assertTrue(result["reconciled"])
+
+        asyncio.run(exercise())
+
+    def test_divergent_reviews_require_tie_breaker(self) -> None:
+        async def exercise() -> None:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            _, jobs, _, review = self._managers(project, edit)
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+            r1 = await review.record_candidate_review(
+                project, job_id,
+                {"summary": "ok", "issues": [], "recommendation": "approve"},
+                reviewer_id="reviewer-a",
+            )
+            r2 = await review.record_candidate_review(
+                project, job_id,
+                {"summary": "bad", "issues": ["x"], "recommendation": "reject"},
+                reviewer_id="reviewer-b",
+            )
+            # Two divergent reviews with only two distinct reviewers: no tie-breaker.
+            with self.assertRaisesRegex(ReviewError, "tie-breaker"):
+                await review.reconcile_reviews(
+                    project, job_id, [r1["review_id"], r2["review_id"]]
+                )
+            # A third caller-supplied review with a distinct label is NOT enough:
+            # the tie-breaker must be bridge-attested (run_independent_review).
+            r3 = await review.record_candidate_review(
+                project, job_id,
+                {"summary": "ok", "issues": [], "recommendation": "approve"},
+                reviewer_id="reviewer-c",
+            )
+            with self.assertRaisesRegex(ReviewError, "bridge-attested"):
+                await review.reconcile_reviews(
+                    project, job_id, [r1["review_id"], r2["review_id"], r3["review_id"]]
+                )
+            # A bridge-attested review (run_independent_review) breaks the tie.
+            attested = await review.run_independent_review(project, job_id, "high")
+            result = await review.reconcile_reviews(
+                project, job_id,
+                [r1["review_id"], r2["review_id"], attested["review_id"]],
+            )
+            self.assertEqual(result["resolved"], "pass")
+
+        asyncio.run(exercise())
+
+    def test_all_reject_reconciles_to_fail(self) -> None:
+        async def exercise() -> None:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            _, jobs, _, review = self._managers(project, edit)
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+            r1 = await review.record_candidate_review(
+                project, job_id,
+                {"summary": "bad", "issues": ["x"], "recommendation": "reject"},
+                reviewer_id="reviewer-a",
+            )
+            r2 = await review.record_candidate_review(
+                project, job_id,
+                {"summary": "bad", "issues": ["y"], "recommendation": "reject"},
+                reviewer_id="reviewer-b",
+            )
+            result = await review.reconcile_reviews(
+                project, job_id, [r1["review_id"], r2["review_id"]]
+            )
+            self.assertEqual(result["resolved"], "fail")
+
+        asyncio.run(exercise())
+
+    def test_reconcile_requires_at_least_two_reviews(self) -> None:
+        async def exercise() -> None:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            _, jobs, _, review = self._managers(project, edit)
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+            r1 = await review.record_candidate_review(
+                project, job_id,
+                {"summary": "ok", "issues": [], "recommendation": "approve"},
+                reviewer_id="reviewer-a",
+            )
+            with self.assertRaisesRegex(ReviewError, "at least two reviews"):
+                await review.reconcile_reviews(project, job_id, [r1["review_id"]])
+
+        asyncio.run(exercise())
+
+
 if __name__ == "__main__":
     unittest.main()

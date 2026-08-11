@@ -767,6 +767,92 @@ class ReviewManager:
                 )
             return record
 
+    @staticmethod
+    def _verdict_recommendation(verdict: dict[str, Any]) -> str:
+        """Return a normalized pass/fail recommendation from a verdict.
+
+        A verdict's ``recommendation`` field is the reviewer's pass/fail signal.
+        ``approve`` / ``pass`` / ``approved`` / ``accept`` are treated as a pass;
+        anything else (``reject``, ``changes``, empty, etc.) is treated as a
+        fail. Unknown or missing recommendations fail closed (no pass).
+        """
+        raw = verdict.get("recommendation")
+        if not isinstance(raw, str):
+            return "fail"
+        normalized = raw.strip().lower()
+        if normalized in {"approve", "pass", "approved", "accept", "accepted"}:
+            return "pass"
+        return "fail"
+
+    async def reconcile_reviews(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        review_ids: list[str],
+    ) -> dict[str, Any]:
+        """Reconcile a set of reviews for one job's candidate.
+
+        Given the review records for a candidate, this determines whether the
+        reviews agree (all pass or all fail) or diverge. On divergence it
+        requires a tie-breaker: a third review with a distinct ``reviewer_id``
+        that breaks the tie. Returns a structured reconciliation result with the
+        resolved verdict. The commit gate requires a reconciled pass.
+        """
+        if len(review_ids) < 2:
+            raise ReviewError("reconcile_reviews requires at least two reviews")
+        async with self._reviews_lock:
+            records: list[ReviewRecord] = []
+            for review_id in review_ids:
+                record = self._reviews.get(review_id)
+                if (
+                    record is None
+                    or record.project_id != project.id
+                    or record.job_id != job_id
+                ):
+                    raise ReviewError(
+                        f"unknown review_id for this project and job: {review_id}"
+                    )
+                records.append(record)
+
+            recommendations = [
+                self._verdict_recommendation(record.verdict) for record in records
+            ]
+            passes = recommendations.count("pass")
+            fails = len(recommendations) - passes
+
+            if passes == len(recommendations):
+                resolved = "pass"
+            elif fails == len(recommendations):
+                resolved = "fail"
+            else:
+                # Divergent verdicts: require a bridge-attested tie-breaker.
+                # Caller-supplied ``reviewer_id`` values are self-reported and
+                # unauthenticated, so distinct labels are NOT evidence of
+                # distinct reviewers — a single actor could forge three labels.
+                # Only a review produced by ``run_independent_review`` (which
+                # the bridge itself spawns with a fresh read-only session) is
+                # attested, so the tie-breaker must be one of those.
+                attested = [
+                    record
+                    for record in records
+                    if record.reviewer_id == _BRIDGE_REVIEWER_ID
+                ]
+                if not attested:
+                    raise ReviewError(
+                        "reviews diverge; a bridge-attested tie-breaker review "
+                        "(run_independent_review) is required to reconcile"
+                    )
+                resolved = "pass" if passes > fails else "fail"
+
+            return {
+                "project_id": project.id,
+                "job_id": job_id,
+                "review_ids": list(review_ids),
+                "recommendations": recommendations,
+                "resolved": resolved,
+                "reconciled": True,
+            }
+
     async def mark_used(self, review_id: str) -> None:
         """Mark a review record consumed by a successful commit.
 

@@ -172,7 +172,7 @@ Based on the elevation map and recommended adoption order:
   later pass.
 
 ### 7. M-GV-07: Parallel verify + review + conflict reconciliation
-- **Status**: Pending
+- **Status**: Completed (reconcile_reviews; parallel fan-out deferred)
 - **Description**: Parallel fan-out verification and review with conflict reconciliation
 - **Pattern Source**: LangGraph fan-out/fan-in · Qodo multi-agent review
 - **Key Elements**:
@@ -181,6 +181,21 @@ Based on the elevation map and recommended adoption order:
   - Divergent verdicts trigger tie-breaker third reviewer with distinct reviewer_id
   - Commit gate requires reconciled pass
   - Additive reconcile_reviews(review_ids); no new tool
+- **Implementation**:
+  - `review.py` gains `reconcile_reviews(project, job_id, review_ids)` and a
+    `_verdict_recommendation` helper (fail-closed normalization: only
+    approve/pass/approved/accept/accepted → pass; anything else → fail).
+  - Agreeing reviews reconcile to pass/fail; divergent verdicts require a
+    **bridge-attested** tie-breaker (`_BRIDGE_REVIEWER_ID`, minted only by
+    `run_independent_review`) — caller-supplied `reviewer_id` distinctness is
+    NOT accepted as evidence of distinct reviewers (a single actor could forge
+    labels). Returns a structured reconciliation result.
+  - Internal-first: no new MCP tool.
+- **Files Modified**:
+  - Updated: `src/local_dev_mcp/review.py`, `tests/test_review.py`
+- **Remaining** (parallel fan-out): running verify + review concurrently via
+  `asyncio.gather` in the job lifecycle, and wiring reconciliation into the
+  commit gate — deferred to a later pass.
 
 ### 8. M-CC-01/02/05: PR creation, state confirmation, race-safe idempotency
 - **Status**: Pending
