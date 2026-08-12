@@ -363,6 +363,12 @@ def ensure_state_dir(state_root: Path) -> Path:
 # SCHEMA_VERSION stays 1: the columns are additive and never break old rows.
 _ADDITIVE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     "job_progress": (
+        # ``tool_failures`` was part of the MCPB-010 schema from the start but
+        # was never registered here, so a ``job_progress`` table created by an
+        # earlier build (e.g. the pre-delegation schema) was never upgraded and
+        # the progress upsert failed with "no column named tool_failures".
+        # ``INTEGER NOT NULL`` needs a default for ``ALTER TABLE ... ADD COLUMN``.
+        ("tool_failures", "INTEGER NOT NULL DEFAULT 0"),
         ("parent_job_id", "TEXT"),
         ("delegation_mandate_json", "TEXT"),
     ),

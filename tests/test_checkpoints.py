@@ -519,6 +519,108 @@ class CheckpointStoreTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_job_progress_gains_tool_failures_column_in_place(self) -> None:
+        """A job_progress table created without tool_failures is upgraded on open.
+
+        Regression for the live-server failure ``OperationalError: table
+        job_progress has no column named tool_failures``: the MCPB-010 schema
+        always declared ``tool_failures`` but it was never registered in
+        ``_ADDITIVE_COLUMNS``, so a table created by an earlier build was never
+        upgraded and the progress upsert crashed. The column must be added
+        idempotently (with a default for the NOT NULL constraint) and the
+        progress upsert must then succeed.
+        """
+        import sqlite3
+
+        from local_dev_mcp.store import upsert_progress_row
+
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "bridge.db"
+            # Simulate a pre-MCPB-010 job_progress table (no tool_failures).
+            connection = sqlite3.connect(db_path)
+            connection.executescript(
+                """
+                CREATE TABLE job_progress (
+                    job_id TEXT PRIMARY KEY,
+                    pause_reason TEXT,
+                    turns_used INTEGER NOT NULL,
+                    tokens_used INTEGER NOT NULL,
+                    extensions_granted INTEGER NOT NULL,
+                    no_progress_turns INTEGER NOT NULL,
+                    soft_warned INTEGER NOT NULL,
+                    milestones_json TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            # Re-opening with the current code adds tool_failures additively.
+            connection = open_state_db(db_path)
+            try:
+                columns = {
+                    row["name"]
+                    for row in connection.execute(
+                        "PRAGMA table_info(job_progress)"
+                    ).fetchall()
+                }
+                self.assertIn("tool_failures", columns)
+                self.assertIn("parent_job_id", columns)
+                self.assertIn("delegation_mandate_json", columns)
+                # The progress upsert that crashed on the live server now works.
+                upsert_progress_row(
+                    connection,
+                    {
+                        "job_id": "job-tf",
+                        "pause_reason": None,
+                        "turns_used": 0,
+                        "tokens_used": 0,
+                        "extensions_granted": 0,
+                        "no_progress_turns": 0,
+                        "tool_failures": 0,
+                        "soft_warned": 0,
+                        "milestones_json": None,
+                        "parent_job_id": None,
+                        "delegation_mandate_json": None,
+                        "updated_at": "2026-08-12T00:00:00Z",
+                    },
+                )
+                row = connection.execute(
+                    "SELECT tool_failures FROM job_progress WHERE job_id='job-tf'"
+                ).fetchone()
+                self.assertEqual(row["tool_failures"], 0)
+            finally:
+                connection.close()
+
+            # Re-opening again is a no-op: the migration is idempotent and the
+            # upsert still succeeds (no duplicate-column error).
+            connection = open_state_db(db_path)
+            try:
+                upsert_progress_row(
+                    connection,
+                    {
+                        "job_id": "job-tf",
+                        "pause_reason": None,
+                        "turns_used": 1,
+                        "tokens_used": 0,
+                        "extensions_granted": 0,
+                        "no_progress_turns": 0,
+                        "tool_failures": 1,
+                        "soft_warned": 0,
+                        "milestones_json": None,
+                        "parent_job_id": None,
+                        "delegation_mandate_json": None,
+                        "updated_at": "2026-08-12T00:00:01Z",
+                    },
+                )
+                row = connection.execute(
+                    "SELECT tool_failures FROM job_progress WHERE job_id='job-tf'"
+                ).fetchone()
+                self.assertEqual(row["tool_failures"], 1)
+            finally:
+                connection.close()
+
 
 class ContinuityToolSurfaceTests(unittest.TestCase):
     def test_continuity_adds_no_new_mcp_tools(self) -> None:
