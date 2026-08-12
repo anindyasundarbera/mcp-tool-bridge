@@ -931,6 +931,62 @@ async def _run_exec(
     }
 
 
+def _sandbox_argv(worktree: JobWorktree, argv: list[str]) -> list[str]:
+    """Wrap a fixed-argv command in a bubblewrap (bwrap) syscall sandbox.
+
+    M-CC-11: repo-controlled verification scripts run under a lightweight
+    sandbox rather than with the bridge's privilege. The bridge invokes the
+    sandbox runner (bwrap) with a fixed argument vector — never the sandbox
+    script directly — with ``--unshare-net`` (network none), a read-only root
+    bind, and a frozen clock (``SOURCE_DATE_EPOCH``). The candidate worktree is
+    bound read-only so a repo-controlled script cannot modify the candidate
+    state it is supposed to verify. ``--die-with-parent`` ties the sandbox's
+    lifetime to the bridge so a killed bridge cannot orphan a sandboxed process.
+
+    Only the candidate worktree and the minimal interpreter runtime (``/usr``,
+    ``/lib``, ``/lib64``, ``/bin``, ``/etc/alternatives``) are bound read-only —
+    never the whole host root — so a malicious repo-controlled script cannot
+    read host secrets (``/etc/shadow``, ``.env``, project config, ``/home``).
+    ``/dev/null`` is the only device exposed.
+    """
+    return [
+        "bwrap",
+        "--unshare-net",
+        "--unshare-ipc",
+        "--unshare-pid",
+        "--ro-bind",
+        str(worktree.path),
+        str(worktree.path),
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--ro-bind",
+        "/lib",
+        "/lib",
+        "--ro-bind",
+        "/lib64",
+        "/lib64",
+        "--ro-bind",
+        "/bin",
+        "/bin",
+        "--ro-bind",
+        "/etc/alternatives",
+        "/etc/alternatives",
+        "--proc",
+        "/proc",
+        "--dev-bind",
+        "/dev/null",
+        "/dev/null",
+        "--tmpfs",
+        "/tmp",
+        "--setenv",
+        "SOURCE_DATE_EPOCH",
+        "0",
+        "--die-with-parent",
+        *argv,
+    ]
+
+
 async def _run_command(
     settings: Settings,
     worktree: JobWorktree,
@@ -938,11 +994,14 @@ async def _run_command(
 ) -> dict[str, Any]:
     python_path = _python_paths(worktree.path, command.python_path)
     extra_env = {"PYTHONPATH": python_path} if python_path is not None else None
+    argv = list(command.argv)
+    if command.sandbox:
+        argv = _sandbox_argv(worktree, argv)
     return await _run_exec(
         settings,
         worktree,
         command_id=command.id,
-        argv=list(command.argv),
+        argv=argv,
         extra_env=extra_env,
         start_error_prefix="verification executable could not start",
     )

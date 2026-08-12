@@ -322,7 +322,7 @@ Based on the elevation map and recommended adoption order:
   - Created: `tests/test_supply_chain.py`
 
 ### 12. M-CC-11: Sandboxed execution of repo-controlled scripts
-- **Status**: Pending
+- **Status**: Completed
 - **Description**: Run repo-controlled verification scripts under lightweight syscall sandbox
 - **Pattern Source**: gVisor · nsjail · bubblewrap · Firecracker
 - **Key Elements**:
@@ -330,6 +330,22 @@ Based on the elevation map and recommended adoption order:
   - Project opt-in; fixed argv (bridge invokes sandbox runner, not sandbox script directly)
   - Network policy (none | allowlist) flows from M-CC-09
   - Internal; no new tool
+- **Implementation**:
+  - **NEW** opt-in `sandbox: bool` on `VerificationCommand` (default false; dormant
+    unless a project opts in). No new tool.
+  - `_run_command` wraps a sandboxed command in a fixed bubblewrap (bwrap) argv:
+    `--unshare-net` (network none), `--unshare-ipc`, `--unshare-pid`,
+    `--ro-bind / /` (read-only root), `--proc`/`--dev`/`--tmpfs /tmp`, a
+    read-only bind of the candidate worktree (so a repo-controlled script cannot
+    modify the candidate state it verifies), a frozen clock
+    (`SOURCE_DATE_EPOCH=0`), and `--die-with-parent` (a killed bridge cannot
+    orphan a sandboxed process). The bridge invokes the sandbox runner, never
+    the sandbox script directly.
+  - Opted-out commands are unchanged (no behavior change to existing projects).
+  - Internal; no new MCP tool, parameter, or permission. Tool count stays 24.
+- **Files Modified**:
+  - Updated: `src/local_dev_mcp/models.py`, `src/local_dev_mcp/verification.py`
+  - Created: `tests/test_sandbox.py`
 
 ## Implementation Principles to Follow
 

@@ -36,6 +36,7 @@ class VerificationCommand(BaseModel):
     id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
     argv: tuple[str, ...]
     python_path: tuple[str, ...] = ()
+    sandbox: bool = False
 
     @field_validator("argv", mode="before")
     @classmethod
