@@ -100,6 +100,11 @@ def _timestamp() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _new_authority_id() -> str:
+    """Return a random authority-record identifier (M-EV-05)."""
+    return f"auth-{secrets.token_hex(16)}"
+
+
 def _valid_session_id(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -401,8 +406,36 @@ class DevelopmentJobManager:
         job: DevelopmentJob,
         event_type: str,
         detail: dict[str, Any] | None = None,
+        *,
+        authority: dict[str, Any] | None = None,
     ) -> None:
-        """Append one row to the append-only audit ledger."""
+        """Append one row to the append-only audit ledger.
+
+        M-EV-05: governance-changing events (status / extension / pause /
+        terminal) are stamped with an ``authority`` block carrying the actor,
+        authority source, scope, and source classification. The ``authority_id``
+        is embedded in the event's ``detail_json`` and the full record is
+        persisted to the sidecar ``authority_records`` table so the authority
+        behind every governance instruction is durable and queryable.
+        """
+        detail = dict(detail or {})
+        if authority is not None:
+            authority_id = authority.get("authority_id") or _new_authority_id()
+            detail["authority_id"] = authority_id
+            store.insert_authority_record(
+                self._db,
+                {
+                    "authority_id": authority_id,
+                    "job_id": job.job_id,
+                    "event_id": None,
+                    "actor": authority.get("actor", "bridge"),
+                    "authority_source": authority.get("authority_source", "bridge_internal"),
+                    "scope": authority.get("scope", event_type),
+                    "classification": authority.get("classification", "observed"),
+                    "recorded_at": _timestamp(),
+                    "detail_json": _json_dumps(authority.get("detail") or {}),
+                },
+            )
         store.insert_event_row(
             self._db,
             {
@@ -410,7 +443,7 @@ class DevelopmentJobManager:
                 "project_id": job.project_id,
                 "occurred_at": _timestamp(),
                 "event_type": event_type,
-                "detail_json": _json_dumps(detail or {}),
+                "detail_json": _json_dumps(detail),
             },
         )
 
@@ -790,6 +823,22 @@ class DevelopmentJobManager:
             if isinstance(changed, list):
                 snapshot["changed_path_count"] = len(changed)
                 snapshot["changed_paths"] = changed
+        # M-EV-05: surface the authority records behind this job's governance
+        # events (actor, authority source, scope, classification) so an
+        # orchestrator can audit who/what authorized each instruction.
+        authority_records = store.load_authority_records(self._db, job.job_id)
+        if authority_records:
+            snapshot["authority_records"] = [
+                {
+                    "authority_id": row.get("authority_id"),
+                    "actor": row.get("actor"),
+                    "authority_source": row.get("authority_source"),
+                    "scope": row.get("scope"),
+                    "classification": row.get("classification"),
+                    "recorded_at": row.get("recorded_at"),
+                }
+                for row in authority_records
+            ]
         return snapshot
 
     def _require_job(
@@ -821,7 +870,17 @@ class DevelopmentJobManager:
             )
             self._jobs[job.job_id] = job
             self._persist_progress(job)
-            self._record_event(job, "created", {"effort": effort})
+            self._record_event(
+                job,
+                "created",
+                {"effort": effort},
+                authority={
+                    "actor": "ChatGPT",
+                    "authority_source": "chatgpt_confirmation",
+                    "scope": "job_creation",
+                    "classification": "canonical",
+                },
+            )
             job.task = asyncio.create_task(
                 self._run(job, project, specification, effort, resume=False),
                 name=f"development-job-{job.job_id}",
@@ -879,6 +938,13 @@ class DevelopmentJobManager:
                 child,
                 "created",
                 {"effort": effort, "parent_job_id": parent_job_id},
+                authority={
+                    "actor": "bridge",
+                    "authority_source": "parent_delegation",
+                    "scope": "job_creation",
+                    "classification": "inferred",
+                    "detail": {"parent_job_id": parent_job_id},
+                },
             )
             store.insert_delegation_row(
                 self._db,
@@ -963,6 +1029,12 @@ class DevelopmentJobManager:
                 job,
                 "status",
                 {"status": "queued", "attempt": job.attempt, "paused": is_paused},
+                authority={
+                    "actor": "ChatGPT",
+                    "authority_source": "chatgpt_confirmation",
+                    "scope": "resume",
+                    "classification": "canonical",
+                },
             )
             job.task = asyncio.create_task(
                 self._run(
@@ -1186,13 +1258,29 @@ class DevelopmentJobManager:
                             job,
                             "worktree_prepared",
                             {"base_head": worktree.base_head},
+                            authority={
+                                "actor": "bridge",
+                                "authority_source": "bridge_internal",
+                                "scope": "worktree_preparation",
+                                "classification": "observed",
+                            },
                         )
 
                 if job.cancel_requested:
                     raise asyncio.CancelledError
                 assert job.worktree is not None
                 await self._set_status(job, JobStatus.RUNNING)
-                self._record_event(job, "status", {"status": "running"})
+                self._record_event(
+                    job,
+                    "status",
+                    {"status": "running"},
+                    authority={
+                        "actor": "bridge",
+                        "authority_source": "bridge_internal",
+                        "scope": "status_transition",
+                        "classification": "observed",
+                    },
+                )
 
                 # When resuming a paused job, seed the progress baseline from
                 # the last checkpoint so progress detection compares against the
@@ -1409,6 +1497,12 @@ class DevelopmentJobManager:
                                 "turns_used": job.turns_used,
                                 "no_progress_turns": job.no_progress_turns,
                             },
+                            authority={
+                                "actor": "bridge",
+                                "authority_source": "budget_policy",
+                                "scope": "extension",
+                                "classification": "inferred",
+                            },
                         )
                         await self._record_checkpoint(job, "extension")
                         self._persist_progress(job)
@@ -1440,6 +1534,12 @@ class DevelopmentJobManager:
                             "turns_used": job.turns_used,
                             "extensions_granted": job.extensions_granted,
                         },
+                        authority={
+                            "actor": "bridge",
+                            "authority_source": "bridge_internal",
+                            "scope": "terminal_transition",
+                            "classification": "observed",
+                        },
                     )
                     async with self._state_lock:
                         self._persist_progress(job)
@@ -1450,7 +1550,17 @@ class DevelopmentJobManager:
                 job.updated_at = _timestamp()
                 self._persist_job(job)
                 self._persist_progress(job)
-            self._record_event(job, "terminal", {"status": "cancelled"})
+            self._record_event(
+                job,
+                "terminal",
+                {"status": "cancelled"},
+                authority={
+                    "actor": "ChatGPT",
+                    "authority_source": "chatgpt_confirmation",
+                    "scope": "cancellation",
+                    "classification": "canonical",
+                },
+            )
             raise
         except Exception as exc:
             safe_error = _redact(str(exc), self._paths_for(project, job))
@@ -1462,7 +1572,15 @@ class DevelopmentJobManager:
                 self._persist_job(job)
                 self._persist_progress(job)
             self._record_event(
-                job, "terminal", {"status": "failed", "error": str(safe_error)[-1000:]}
+                job,
+                "terminal",
+                {"status": "failed", "error": str(safe_error)[-1000:]},
+                authority={
+                    "actor": "bridge",
+                    "authority_source": "bridge_internal",
+                    "scope": "terminal_transition",
+                    "classification": "observed",
+                },
             )
         finally:
             async with self._state_lock:

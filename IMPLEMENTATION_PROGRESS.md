@@ -259,7 +259,7 @@ Based on the elevation map and recommended adoption order:
   - Updated: `.env.example`, `README.md`
 
 ### 10. M-EV-05: Authority-behind-every-governance-instruction
-- **Status**: Pending
+- **Status**: Completed
 - **Description**: Every governance-changing instruction carries authority reference
 - **Pattern Source**: langfuse · OpenTelemetry
 - **Key Elements**:
@@ -268,6 +268,26 @@ Based on the elevation map and recommended adoption order:
   - Sidecar authority_records + source_classifications (canonical/historical/asserted/observed/tested/inferred/superseded)
   - Internal, no new tool
   - Composes with M-GV-01 once authorizations table exists
+- **Implementation**:
+  - **NEW** additive `authority_records` + `source_classifications` tables in
+    `bridge.db` (`SCHEMA_VERSION` stays 1; existing databases upgrade in place).
+    `source_classifications` is seeded idempotently with the fixed vocabulary
+    (canonical/historical/asserted/observed/tested/inferred/superseded).
+  - `jobs._record_event` now accepts an optional `authority` block; every
+    governance-changing event (created / status / extension / terminal /
+    worktree_prepared) is stamped with an `authority_id` embedded in the event's
+    `detail_json`, and the full authority record (actor, authority_source, scope,
+    classification, recorded_at) is persisted to `authority_records`.
+  - Authority sources: `chatgpt_confirmation` (canonical) for user-authorized
+    creation/resume/cancel; `parent_delegation` (inferred) for delegated child
+    jobs; `budget_policy` (inferred) for extensions; `bridge_internal`
+    (observed) for status/terminal/worktree transitions.
+  - `get_development_job` snapshot surfaces `authority_records` (additive, no
+    new tool) so an orchestrator can audit who/what authorized each instruction.
+  - Internal; no new MCP tool, parameter, or permission. Tool count stays 24.
+- **Files Modified**:
+  - Updated: `src/local_dev_mcp/store.py`, `src/local_dev_mcp/jobs.py`
+  - Created: `tests/test_authority.py`
 
 ### 11. M-CC-11: Supply-chain gate — severity-gated pre-commit reject
 - **Status**: Pending

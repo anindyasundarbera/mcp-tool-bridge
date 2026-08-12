@@ -164,6 +164,21 @@ CREATE TABLE IF NOT EXISTS authorizations (
     delegated_from TEXT,
     detail_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS source_classifications (
+    classification TEXT PRIMARY KEY,
+    description TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS authority_records (
+    authority_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    event_id INTEGER,
+    actor TEXT NOT NULL,
+    authority_source TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    classification TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    detail_json TEXT NOT NULL
+);
 """
 
 _UPSERT_JOB = """
@@ -374,6 +389,7 @@ def open_state_db(db_path: Path) -> sqlite3.Connection:
         connection.execute("PRAGMA busy_timeout=2000")
         connection.executescript(_CREATE_SCHEMA)
         _migrate_additive_columns(connection)
+        _seed_source_classifications(connection)
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES ('version', ?) "
             "ON CONFLICT(key) DO NOTHING",
@@ -686,6 +702,30 @@ def compact_checkpoints(
         return int(cursor.rowcount or 0)
 
 
+def _seed_source_classifications(connection: sqlite3.Connection) -> None:
+    """Seed the fixed source-classification vocabulary (idempotent).
+
+    M-EV-05: every authority record carries one of these classifications so an
+    orchestrator can reason about how authoritative a governance instruction
+    is. The seed is additive and never overwrites an existing row.
+    """
+    classifications = (
+        ("canonical", "the authoritative, current source of truth"),
+        ("historical", "a past state, no longer current"),
+        ("asserted", "claimed by an actor without independent verification"),
+        ("observed", "directly observed from the system or repository"),
+        ("tested", "confirmed by a deterministic verification run"),
+        ("inferred", "derived by reasoning from other evidence"),
+        ("superseded", "replaced by a later, higher-authority instruction"),
+    )
+    with connection:
+        connection.executemany(
+            "INSERT OR IGNORE INTO source_classifications "
+            "(classification, description) VALUES (?, ?)",
+            classifications,
+        )
+
+
 def insert_event_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
     """Append one audit-event row as a single ACID transaction.
 
@@ -707,6 +747,58 @@ def load_event_rows(
         for row in connection.execute(
             "SELECT * FROM job_events WHERE job_id = ? ORDER BY event_id ASC",
             (job_id,),
+        ).fetchall()
+    ]
+
+
+_INSERT_AUTHORITY = """
+INSERT INTO authority_records (
+    authority_id, job_id, event_id, actor, authority_source, scope,
+    classification, recorded_at, detail_json
+) VALUES (
+    :authority_id, :job_id, :event_id, :actor, :authority_source, :scope,
+    :classification, :recorded_at, :detail_json
+)
+"""
+
+
+def insert_authority_record(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
+    """Append one authority record as a single ACID transaction.
+
+    M-EV-05: a sidecar to the append-only ``job_events`` ledger. Each
+    governance-changing event (status / extension / pause / terminal) is
+    stamped with an ``authority_id`` in its ``detail_json``, and the full
+    authority record (actor, authority source, scope, classification,
+    timestamp) is persisted here so the authority behind every instruction is
+    durable and queryable.
+    """
+    with connection:
+        connection.execute(_INSERT_AUTHORITY, row)
+
+
+def load_authority_records(
+    connection: sqlite3.Connection, job_id: str
+) -> list[dict[str, Any]]:
+    """Return one job's authority records as dicts, oldest first."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM authority_records WHERE job_id = ? "
+            "ORDER BY recorded_at ASC, authority_id ASC",
+            (job_id,),
+        ).fetchall()
+    ]
+
+
+def load_source_classifications(
+    connection: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Return the seeded source-classification vocabulary."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT classification, description FROM source_classifications "
+            "ORDER BY classification ASC"
         ).fetchall()
     ]
 
