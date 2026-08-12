@@ -179,6 +179,18 @@ CREATE TABLE IF NOT EXISTS authority_records (
     recorded_at TEXT NOT NULL,
     detail_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS supply_chain_scans (
+    scan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    verification_id TEXT NOT NULL,
+    scan_command TEXT NOT NULL,
+    scan_argv TEXT NOT NULL,
+    exit_code INTEGER,
+    passed INTEGER NOT NULL,
+    scanned_at TEXT NOT NULL,
+    detail_json TEXT NOT NULL
+);
 """
 
 _UPSERT_JOB = """
@@ -799,6 +811,45 @@ def load_source_classifications(
         for row in connection.execute(
             "SELECT classification, description FROM source_classifications "
             "ORDER BY classification ASC"
+        ).fetchall()
+    ]
+
+
+_INSERT_SUPPLY_CHAIN_SCAN = """
+INSERT INTO supply_chain_scans (
+    project_id, job_id, verification_id, scan_command, scan_argv,
+    exit_code, passed, scanned_at, detail_json
+) VALUES (
+    :project_id, :job_id, :verification_id, :scan_command, :scan_argv,
+    :exit_code, :passed, :scanned_at, :detail_json
+)
+"""
+
+
+def insert_supply_chain_scan(
+    connection: sqlite3.Connection, row: dict[str, Any]
+) -> None:
+    """Append one supply-chain scan result as a single ACID transaction.
+
+    M-CC-11: an additive audit row for each severity-gated supply-chain scan
+    run at commit time. Records the scanner, its fixed argv, the exit code, and
+    whether the gate passed, so a rejected commit leaves a durable audit trail
+    for an orchestrator or operator.
+    """
+    with connection:
+        connection.execute(_INSERT_SUPPLY_CHAIN_SCAN, row)
+
+
+def load_supply_chain_scans(
+    connection: sqlite3.Connection, job_id: str
+) -> list[dict[str, Any]]:
+    """Return one job's supply-chain scan rows as dicts, oldest first."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM supply_chain_scans WHERE job_id = ? "
+            "ORDER BY scan_id ASC",
+            (job_id,),
         ).fetchall()
     ]
 

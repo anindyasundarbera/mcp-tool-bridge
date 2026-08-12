@@ -290,7 +290,7 @@ Based on the elevation map and recommended adoption order:
   - Created: `tests/test_authority.py`
 
 ### 11. M-CC-11: Supply-chain gate — severity-gated pre-commit reject
-- **Status**: Pending
+- **Status**: Completed
 - **Description**: Dependency/supply-chain scanning to reject HIGH/CRITICAL vulnerabilities
 - **Pattern Source**: syft · grype · pip-audit
 - **Key Elements**:
@@ -299,6 +299,27 @@ Based on the elevation map and recommended adoption order:
   - Drop: Dependabot, Snyk (violates offline+OSS-clean constraints)
   - osv-scanner viable but needs Python-side severity filter (grype's --fail-on cleaner)
   - Internal, fixed-argv; feeds M-CC-11 and evidence bundle (syft SBOM is M-EV-06 artifact)
+- **Implementation**:
+  - **NEW** opt-in `supply_chain_scans` on `ProjectPolicy` (a list of
+    `SupplyChainCommand` fixed-argv scanners, e.g. `grype ... --fail-on=high`,
+    `pip-audit ...`). Dormant unless a project opts in; no new tool.
+  - `VerificationCommitManager.commit` runs every configured scanner inside the
+    candidate worktree (isolated) with fixed argv (no shell) and a deterministic
+    environment, **before** any staging. A non-zero exit (exactly how grype's
+    `--fail-on` surfaces a HIGH/CRITICAL finding) rejects the commit; a scanner
+    that cannot start also fails closed. The source checkout and candidate
+    worktree are left unchanged on rejection.
+  - **NEW** additive `supply_chain_scans` audit table in `bridge.db`
+    (`SCHEMA_VERSION` stays 1; existing databases upgrade in place). One
+    append-only ACID row per scan (scanner, argv, exit code, passed, timestamp)
+    so a rejected commit leaves a durable audit trail.
+  - Refactored the verification command runner onto a shared `_run_exec` helper
+    (no behavior change to verification commands).
+  - Internal; no new MCP tool, parameter, or permission. Tool count stays 24.
+- **Files Modified**:
+  - Updated: `src/local_dev_mcp/models.py`, `src/local_dev_mcp/verification.py`,
+    `src/local_dev_mcp/store.py`
+  - Created: `tests/test_supply_chain.py`
 
 ### 12. M-CC-11: Sandboxed execution of repo-controlled scripts
 - **Status**: Pending

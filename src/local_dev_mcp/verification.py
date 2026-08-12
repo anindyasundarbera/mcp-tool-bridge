@@ -17,7 +17,7 @@ from . import store
 from .config import Settings
 from .git import GitCommandError, run_git
 from .jobs import DevelopmentJobError, DevelopmentJobManager
-from .models import ProjectPolicy, VerificationCommand
+from .models import ProjectPolicy, SupplyChainCommand, VerificationCommand
 from .registry import ProjectLockManager
 from .worktrees import GitWorktreeManager, JobWorktree, WorktreeError
 
@@ -41,6 +41,12 @@ def _stderr_text(result: dict[str, Any]) -> str:
 
 def _timestamp() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _json_dumps(value: Any) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
 def _redact(value: Any, paths: tuple[Path, ...]) -> Any:
@@ -826,15 +832,26 @@ def _python_paths(root: Path, entries: Iterable[str]) -> str | None:
     return os.pathsep.join(resolved) if resolved else None
 
 
-async def _run_command(
+async def _run_exec(
     settings: Settings,
     worktree: JobWorktree,
-    command: VerificationCommand,
+    *,
+    command_id: str,
+    argv: list[str],
+    extra_env: dict[str, str] | None = None,
+    start_error_prefix: str = "executable could not start",
 ) -> dict[str, Any]:
-    expanded = list(command.argv)
+    """Run a fixed-argv subprocess in the candidate worktree and bound its output.
+
+    Shared by the verification commands and the M-CC-11 supply-chain scans.
+    The environment is deterministic (M-CC-09) and stripped of tokens/certs; no
+    shell is involved. A non-zero exit code is reported to the caller, which
+    decides whether it is a gate rejection.
+    """
+    expanded = list(argv)
     if expanded[0] == "{python}":
         expanded[0] = sys.executable
-    environment = {
+    environment: dict[str, str] = {
         "PATH": os.defpath,
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
@@ -847,9 +864,8 @@ async def _run_command(
         "SOURCE_DATE_EPOCH": "0",
         "PYTHONHASHSEED": "0",
     }
-    python_path = _python_paths(worktree.path, command.python_path)
-    if python_path is not None:
-        environment["PYTHONPATH"] = python_path
+    if extra_env:
+        environment.update(extra_env)
 
     try:
         process = await asyncio.create_subprocess_exec(
@@ -863,10 +879,10 @@ async def _run_command(
         )
     except OSError as exc:
         return {
-            "command_id": command.id,
+            "command_id": command_id,
             "status": "failed",
             "exit_code": None,
-            "error": f"verification executable could not start: {exc}",
+            "error": f"{start_error_prefix}: {exc}",
         }
 
     assert process.stdout is not None and process.stderr is not None
@@ -905,7 +921,7 @@ async def _run_command(
             await process.wait()
     stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
     return {
-        "command_id": command.id,
+        "command_id": command_id,
         "status": "timed_out"
         if timed_out
         else ("passed" if process.returncode == 0 else "failed"),
@@ -913,6 +929,46 @@ async def _run_command(
         "stdout": stdout,
         "stderr": stderr,
     }
+
+
+async def _run_command(
+    settings: Settings,
+    worktree: JobWorktree,
+    command: VerificationCommand,
+) -> dict[str, Any]:
+    python_path = _python_paths(worktree.path, command.python_path)
+    extra_env = {"PYTHONPATH": python_path} if python_path is not None else None
+    return await _run_exec(
+        settings,
+        worktree,
+        command_id=command.id,
+        argv=list(command.argv),
+        extra_env=extra_env,
+        start_error_prefix="verification executable could not start",
+    )
+
+
+async def _run_supply_chain_scan(
+    settings: Settings,
+    worktree: JobWorktree,
+    scan: SupplyChainCommand,
+) -> dict[str, Any]:
+    """Run one severity-gated supply-chain scan with a fixed argument vector.
+
+    M-CC-11: a deterministic scanner (e.g. ``grype ... --fail-on=high``,
+    ``pip-audit ...``) is invoked with fixed argv (no shell) inside the
+    candidate worktree. A non-zero exit code means the gate rejects the commit
+    (exactly how grype's ``--fail-on`` surfaces a HIGH/CRITICAL finding). The
+    command must be present on PATH or start with ``{python}``; a scanner that
+    cannot start is treated as a failed gate (fail-closed), not skipped.
+    """
+    return await _run_exec(
+        settings,
+        worktree,
+        command_id=scan.id,
+        argv=list(scan.argv),
+        start_error_prefix="supply-chain scanner could not start",
+    )
 
 
 class VerificationCommitManager:
@@ -1136,6 +1192,62 @@ class VerificationCommitManager:
                 record.base_head, record.diff_fingerprint, record.paths
             ):
                 raise VerificationError("candidate state changed after verification")
+
+            # M-CC-11: severity-gated supply-chain gate. If the project opts in
+            # with supply_chain_scans, every scanner must exit 0 (e.g. grype
+            # --fail-on=high, pip-audit) or the commit is rejected before any
+            # staging. Each result is appended to the supply_chain_scans audit
+            # table. Runs inside the candidate worktree (isolated), fixed-argv,
+            # fail-closed on missing scanners.
+            supply_chain_results: list[dict[str, Any]] = []
+            if project.supply_chain_scans:
+                redacted_scan_paths = (
+                    worktree.path,
+                    project.root,
+                    self.settings.job_worktree_root,
+                    self.settings.projects_config_path,
+                    *self._project_roots,
+                )
+                for scan in project.supply_chain_scans:
+                    scan_result = await _run_supply_chain_scan(
+                        self.settings, worktree, scan
+                    )
+                    bounded_scan = _bound_redacted_output(
+                        _redact(scan_result, redacted_scan_paths),
+                        self.settings.max_verification_output_bytes,
+                    )
+                    supply_chain_results.append(bounded_scan)
+                    store.insert_supply_chain_scan(
+                        self._db,
+                        {
+                            "project_id": project.id,
+                            "job_id": job_id,
+                            "verification_id": verification_id,
+                            "scan_command": scan.id,
+                            "scan_argv": _json_dumps(list(scan.argv)),
+                            "exit_code": bounded_scan.get("exit_code"),
+                            "passed": 1
+                            if bounded_scan.get("status") == "passed"
+                            else 0,
+                            "scanned_at": _timestamp(),
+                            "detail_json": _json_dumps(
+                                {
+                                    "status": bounded_scan.get("status"),
+                                    "stderr": _stderr_text(bounded_scan)[-1000:],
+                                }
+                            ),
+                        },
+                    )
+                failed_scans = [
+                    result.get("command_id")
+                    for result in supply_chain_results
+                    if result.get("status") != "passed"
+                ]
+                if failed_scans:
+                    raise VerificationError(
+                        "supply-chain gate rejected the commit: scanners failed "
+                        f"({', '.join(str(failed_scans))})"
+                    )
 
             timeout = self.settings.git_command_timeout_seconds
             staged = False

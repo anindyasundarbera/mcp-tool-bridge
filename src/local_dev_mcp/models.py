@@ -81,6 +81,53 @@ class VerificationCommand(BaseModel):
         return paths
 
 
+class SupplyChainCommand(BaseModel):
+    """One severity-gated supply-chain scan run at commit time (M-CC-11).
+
+    A fixed argument vector for a deterministic scanner (e.g. ``grype ... --fail
+    -on=high``, ``pip-audit ...``). The bridge runs it with fixed argv (no
+    shell) inside the candidate worktree at commit time and rejects the commit
+    if it exits non-zero (which is exactly how grype's ``--fail-on`` surfaces a
+    HIGH/CRITICAL finding). Internal and opt-in per project; no new tool.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    argv: tuple[str, ...]
+
+    @field_validator("argv", mode="before")
+    @classmethod
+    def validate_argv(cls, value: object) -> tuple[str, ...]:
+        if isinstance(value, (str, bytes)) or value is None:
+            raise ValueError("supply-chain argv must be a list of arguments")
+        arguments = tuple(str(item) for item in value)  # type: ignore[arg-type]
+        if not 1 <= len(arguments) <= 64:
+            raise ValueError("supply-chain argv must contain 1 through 64 arguments")
+        for argument in arguments:
+            if not argument or len(argument) > 2000 or "\x00" in argument:
+                raise ValueError(
+                    "supply-chain arguments must be non-empty, NUL-free, and at "
+                    "most 2000 characters"
+                )
+        if "{python}" in arguments[1:]:
+            raise ValueError("{python} is allowed only as the supply-chain executable")
+        executable = PurePosixPath(arguments[0].replace("\\", "/")).name.lower()
+        if executable.removesuffix(".exe") in {
+            "sh",
+            "bash",
+            "dash",
+            "zsh",
+            "ksh",
+            "fish",
+            "powershell",
+            "pwsh",
+            "cmd",
+        }:
+            raise ValueError("supply-chain commands must not invoke a shell")
+        return arguments
+
+
 class ProjectPolicy(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -94,6 +141,7 @@ class ProjectPolicy(BaseModel):
     markdown_write_roots: tuple[str, ...] = ()
     commit_roots: tuple[str, ...] = ()
     verification_commands: tuple[VerificationCommand, ...] = ()
+    supply_chain_scans: tuple[SupplyChainCommand, ...] = ()
     protected_paths: tuple[str, ...] = (".git", ".env")
     default_effort: Effort = "high"
     allow_ultracode: bool = True
@@ -201,6 +249,9 @@ class ProjectPolicy(BaseModel):
         command_ids = [command.id for command in self.verification_commands]
         if len(command_ids) != len(set(command_ids)):
             raise ValueError("verification command IDs must be unique per project")
+        scan_ids = [scan.id for scan in self.supply_chain_scans]
+        if len(scan_ids) != len(set(scan_ids)):
+            raise ValueError("supply-chain scan IDs must be unique per project")
         return self
 
     def public_metadata(self) -> dict[str, object]:
