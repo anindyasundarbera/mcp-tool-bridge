@@ -232,7 +232,7 @@ Based on the elevation map and recommended adoption order:
     `tests/test_checkpoints.py`, `tests/test_persistence.py`
 
 ### 9. M-CC-11: Prompt-injection defense for repo-ingested content
-- **Status**: Pending
+- **Status**: Completed
 - **Description**: Systematic injection defense on content the reader ingests
 - **Pattern Source**: NeMo-Guardrails · llm-guard (fork)
 - **Key Elements**:
@@ -241,6 +241,22 @@ Based on the elevation map and recommended adoption order:
   - Run as fixed-argv on reader output (not networked service)
   - Internal hardening; no new tool surface
   - Hardens reader.py
+- **Implementation**:
+  - **NEW** opt-in `READER_INJECTION_DEFENSE` setting (default off; no new tool).
+  - `reader.py` `_fence_untrusted` wraps content returned by `read_markdown` and
+    `read_range` in a delimited data-trust boundary
+    (`<!-- BEGIN UNTRUSTED REPOSITORY CONTENT ... -->` ... `<!-- END ... -->`)
+    and neutralizes directive-like lines (e.g. "Ignore all previous
+    instructions", "You are ...", "system:") by prefixing `> [untrusted data]`
+    so they read as data, not instructions. The same per-line neutralizer is
+    applied to `outline` heading text and `search` excerpts when enabled.
+  - Deterministic and lossless for ordinary prose; the raw SHA-256 metadata is
+    unchanged (fencing applies only to the returned `content`).
+  - Internal hardening; no new MCP tool, parameter, or permission.
+- **Files Modified**:
+  - Updated: `src/local_dev_mcp/reader.py`, `src/local_dev_mcp/config.py`
+  - Updated: `tests/test_reader.py`, `tests/test_config.py`
+  - Updated: `.env.example`, `README.md`
 
 ### 10. M-EV-05: Authority-behind-every-governance-instruction
 - **Status**: Pending

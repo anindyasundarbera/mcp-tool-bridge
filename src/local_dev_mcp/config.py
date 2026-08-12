@@ -35,6 +35,10 @@ def _port(environment: Mapping[str, str], name: str, default: int) -> int:
     return value
 
 
+def _truthy(environment: Mapping[str, str], name: str) -> bool:
+    return environment.get(name, "").strip() in ("1", "true", "yes", "on")
+
+
 def _absolute_path(environment: Mapping[str, str], name: str, default: str) -> Path:
     path = Path(environment.get(name, default)).expanduser()
     if not path.is_absolute():
@@ -76,6 +80,7 @@ class Settings:
     claude_checkpoint_max: int
     claude_stream_json: bool
     max_delegations_per_job: int
+    reader_injection_defense: bool
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str] | None = None) -> "Settings":
@@ -169,9 +174,9 @@ class Settings:
             claude_checkpoint_max=_positive_int(
                 env, "CLAUDE_CHECKPOINT_MAX", 500
             ),
-            claude_stream_json=env.get("CLAUDE_STREAM_JSON", "").strip()
-            in ("1", "true", "yes", "on"),
+            claude_stream_json=_truthy(env, "CLAUDE_STREAM_JSON"),
             max_delegations_per_job=_positive_int(
                 env, "MAX_DELEGATIONS_PER_JOB", 3
             ),
+            reader_injection_defense=_truthy(env, "READER_INJECTION_DEFENSE"),
         )

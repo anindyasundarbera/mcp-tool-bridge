@@ -27,8 +27,21 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.max_commit_message_chars, 500)
         self.assertEqual(settings.verification_deterministic_repetitions, 1)
         self.assertEqual(settings.max_delegations_per_job, 3)
+        self.assertFalse(settings.reader_injection_defense)
         self.assertTrue(settings.projects_config_path.is_absolute())
         self.assertEqual(settings.projects_config_path.name, "projects.json")
+
+    def test_reader_injection_defense_flag(self) -> None:
+        self.assertFalse(Settings.from_env({}).reader_injection_defense)
+        self.assertTrue(
+            Settings.from_env({"READER_INJECTION_DEFENSE": "1"}).reader_injection_defense
+        )
+        self.assertTrue(
+            Settings.from_env({"READER_INJECTION_DEFENSE": "true"}).reader_injection_defense
+        )
+        self.assertFalse(
+            Settings.from_env({"READER_INJECTION_DEFENSE": "0"}).reader_injection_defense
+        )
 
     def test_rejects_non_positive_limits(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "greater than zero"):

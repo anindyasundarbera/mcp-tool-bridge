@@ -227,6 +227,7 @@ production.
 | `MAX_MARKDOWN_RANGE_LINES` | 1,000 | Maximum lines per range read |
 | `MAX_MARKDOWN_WRITE_BYTES` | 1,048,576 | Maximum Markdown write/current size |
 | `MAX_MARKDOWN_DIFF_BYTES` | 262,144 | Maximum returned writer diff |
+| `READER_INJECTION_DEFENSE` | off | Fence + delimit untrusted repo content the reader ingests (prompt-injection defense) |
 | `GIT_COMMAND_TIMEOUT_SECONDS` | 30 | Maximum fixed Git command time |
 | `CANDIDATE_HEALTH_TIMEOUT_SECONDS` | 30 | Candidate startup/probe deadline |
 | `VERIFICATION_COMMAND_TIMEOUT_SECONDS` | 600 | Per-command verification deadline |
