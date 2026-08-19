@@ -31,12 +31,15 @@
       "display_name": "Local Development MCP",
       "description": "The ChatGPT-to-Claude development bridge",
       "root": "/home/anindyasundar-bera/local-dev-mcp",
-      "enabled": false,
+      "enabled": true,
       "require_git": true,
       "capabilities": [
         "repository_read",
         "claude_edit",
-        "verification_commit"
+        "verification_commit",
+        "job_introspection",
+        "policy_introspection",
+        "canonical_history_read"
       ],
       "markdown_write_roots": [
         "docs"

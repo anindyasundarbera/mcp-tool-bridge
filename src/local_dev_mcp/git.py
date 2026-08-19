@@ -62,3 +62,48 @@ async def project_status(
         "working_tree": status,
         "diff_stat": diff_stat,
     }
+
+
+async def is_ancestor(
+    root: Path,
+    a: str,
+    b: str,
+    *,
+    timeout_seconds: int = 30,
+) -> bool:
+    """Return True iff commit ``a`` is an ancestor of commit ``b``.
+
+    Uses only local refs (no fetch). ``git merge-base --is-ancestor`` exits 0
+    when ``a`` is an ancestor of ``b`` and non-zero otherwise; any non-zero
+    status (including a real git failure) resolves to False so callers fail open
+    rather than raising from a read-side classification.
+    """
+    try:
+        await run_git(
+            root,
+            "merge-base",
+            "--is-ancestor",
+            a,
+            b,
+            timeout_seconds=timeout_seconds,
+        )
+        return True
+    except GitCommandError:
+        return False
+
+
+async def count_range(
+    root: Path,
+    a: str,
+    b: str,
+    *,
+    timeout_seconds: int = 30,
+) -> int:
+    """Count commits in the ``a..b`` range (commits in ``b`` not in ``a``)."""
+    out = await run_git(
+        root, "rev-list", "--count", f"{a}..{b}", timeout_seconds=timeout_seconds
+    )
+    try:
+        return int(out.strip())
+    except ValueError:
+        return 0

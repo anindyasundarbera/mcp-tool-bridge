@@ -20,6 +20,12 @@ class ProjectCapability(StrEnum):
     SYNC_CANONICAL_CHECKOUT = "sync_canonical_checkout"
     EXPORT_EVIDENCE_BUNDLE = "export_evidence_bundle"
     OPEN_PULL_REQUEST = "open_pull_request"
+    # M-AL-01 read-only introspection capabilities (dormant by default). A project
+    # opts in by listing one; each requires its prerequisite capability so the
+    # authorization boundary never widens beyond what the project already grants.
+    JOB_INTROSPECTION = "job_introspection"
+    POLICY_INTROSPECTION = "policy_introspection"
+    CANONICAL_HISTORY_READ = "canonical_history_read"
 
 
 def _policy_path(value: str) -> str:
@@ -247,6 +253,24 @@ class ProjectPolicy(BaseModel):
             and ProjectCapability.PUSH_DEVELOPMENT_COMMIT not in self.capabilities
         ):
             raise ValueError("open_pull_request requires push_development_commit")
+        # M-AL-01 introspection capabilities: read-only observation gated on the
+        # prerequisite mutation/read capability they introspect, so a project
+        # cannot introspect a surface it is not already authorized to use.
+        if (
+            ProjectCapability.JOB_INTROSPECTION in self.capabilities
+            and ProjectCapability.CLAUDE_EDIT not in self.capabilities
+        ):
+            raise ValueError("job_introspection requires claude_edit")
+        if (
+            ProjectCapability.POLICY_INTROSPECTION in self.capabilities
+            and ProjectCapability.REPOSITORY_READ not in self.capabilities
+        ):
+            raise ValueError("policy_introspection requires repository_read")
+        if (
+            ProjectCapability.CANONICAL_HISTORY_READ in self.capabilities
+            and ProjectCapability.REPOSITORY_READ not in self.capabilities
+        ):
+            raise ValueError("canonical_history_read requires repository_read")
         command_ids = [command.id for command in self.verification_commands]
         if len(command_ids) != len(set(command_ids)):
             raise ValueError("verification command IDs must be unique per project")

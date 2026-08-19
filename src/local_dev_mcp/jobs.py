@@ -95,6 +95,11 @@ PROHIBITED_ACTIONS = (
     "deploy",
 )
 
+# M-AL-01: hard ceiling on ``list_development_jobs`` so a project with very many
+# durable jobs still returns a bounded response. The caller's ``limit`` is
+# clamped to this value before slicing.
+MAX_LIST_JOBS = 200
+
 
 def _timestamp() -> str:
     return datetime.now(UTC).isoformat()
@@ -1138,6 +1143,38 @@ class DevelopmentJobManager:
                 worktree=job.worktree,
             )
 
+    async def committed_job_summary(
+        self,
+        project_id: str,
+        commit_sha: str,
+    ) -> dict[str, Any] | None:
+        """Return safe fields of the job whose ``committed_sha`` matches (M-AL-01).
+
+        A read-only introspection accessor for canonicalization reconciliation: it
+        finds the project's job that produced ``commit_sha`` and returns only safe
+        fields (``job_id``, ``status``, ``base_head``, ``committed_sha``). The raw
+        worktree path, session id, result, candidate, and error are never exposed.
+        Returns ``None`` when no job for this project committed that SHA. Reads
+        under the state lock for consistency with the other job accessors.
+        """
+        target = commit_sha.lower()
+        async with self._state_lock:
+            for job in self._jobs.values():
+                if (
+                    job.project_id == project_id
+                    and job.committed_sha is not None
+                    and job.committed_sha.lower() == target
+                ):
+                    return {
+                        "job_id": job.job_id,
+                        "status": job.status.value,
+                        "base_head": (
+                            job.worktree.base_head if job.worktree is not None else None
+                        ),
+                        "committed_sha": job.committed_sha,
+                    }
+        return None
+
     async def has_active_jobs(self, project_id: str) -> bool:
         """True if the project has any non-terminal job (queued/preparing/
         running/validating).
@@ -1186,6 +1223,131 @@ class DevelopmentJobManager:
                     }
                 )
             return summaries
+
+    async def list_jobs(
+        self,
+        project: ProjectPolicy,
+        scope: str = "all",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Enumerate this project's durable jobs as sanitized summaries (M-AL-01).
+
+        Returns a bounded list without requiring a job_id: each entry carries
+        only safe fields (job_id, project_id, status, execution phase, effort,
+        attempt, timestamps, committed_sha, base_head) plus durable governance
+        flags (verification/review/publication presence). The raw worktree path,
+        Claude session id, candidate/result/error payloads, and
+        cancel_requested are never exposed — mirroring the sanitization proven
+        by ``stale_resumable_job_summaries``. ``scope`` selects ``all`` (default),
+        ``active`` (non-terminal/in-flight), or ``terminal``; ``limit`` is clamped
+        to ``MAX_LIST_JOBS`` and the response reports whether it was truncated.
+        """
+        if scope not in ("all", "active", "terminal"):
+            raise DevelopmentJobError(
+                f"invalid scope: {scope!r}; expected all/active/terminal"
+            )
+        if limit < 0:
+            raise DevelopmentJobError("limit must be non-negative")
+
+        async with self._state_lock:
+            matching = [
+                job
+                for job in self._jobs.values()
+                if job.project_id == project.id
+            ]
+        if scope == "active":
+            matching = [j for j in matching if j.status not in TERMINAL_STATUSES]
+        elif scope == "terminal":
+            matching = [j for j in matching if j.status in TERMINAL_STATUSES]
+
+        # Deterministic ordering: newest first by created_at, job_id ascending
+        # as a stable tiebreaker (Python sort is stable, so sort secondary first).
+        matching.sort(key=lambda job: job.job_id)
+        matching.sort(key=lambda job: job.created_at, reverse=True)
+
+        effective_limit = min(limit, MAX_LIST_JOBS)
+        truncated = len(matching) > effective_limit
+        page = matching[:effective_limit] if effective_limit else []
+
+        # One pass over each durable table for this project (3 queries total),
+        # indexed by job_id, so each summary's governance flags are O(1).
+        verification_by_job: dict[str, list[dict[str, Any]]] = {}
+        for row in store.load_record_rows(self._db):
+            if row.get("project_id") == project.id:
+                verification_by_job.setdefault(row["job_id"], []).append(row)
+        review_by_job: dict[str, list[dict[str, Any]]] = {}
+        for row in store.load_review_rows(self._db):
+            if row.get("project_id") == project.id:
+                review_by_job.setdefault(row["job_id"], []).append(row)
+        publication_by_job: dict[str, dict[str, Any]] = {}
+        for row in store.load_publication_rows(self._db):
+            if row.get("project_id") == project.id:
+                publication_by_job[row["job_id"]] = row
+
+        entries = [
+            self._list_job_entry(
+                job,
+                verification_by_job.get(job.job_id, []),
+                review_by_job.get(job.job_id, []),
+                publication_by_job.get(job.job_id),
+            )
+            for job in page
+        ]
+        redaction_paths = (
+            project.root,
+            self.settings.job_worktree_root,
+            self.settings.projects_config_path,
+            *self._project_roots,
+        )
+        return _redact(
+            {
+                "project_id": project.id,
+                "scope": scope,
+                "count": len(entries),
+                "truncated": truncated,
+                "limit_applied": effective_limit,
+                "jobs": entries,
+            },
+            redaction_paths,
+        )
+
+    def _list_job_entry(
+        self,
+        job: DevelopmentJob,
+        verification_rows: list[dict[str, Any]],
+        review_rows: list[dict[str, Any]],
+        publication_row: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Build one sanitized job summary for ``list_jobs``.
+
+        Exposes only safe fields: never the worktree path, session id, result,
+        candidate, error, or cancel_requested. ``base_head`` is the worktree's
+        base HEAD (a public SHA), safe to surface. Governance flags come from the
+        durable tables only (PR state is in-memory and intentionally omitted).
+        """
+        entry: dict[str, Any] = {
+            "job_id": job.job_id,
+            "project_id": job.project_id,
+            "status": job.status.value,
+            "execution_phase": (
+                "terminal" if job.status in TERMINAL_STATUSES else "in_flight"
+            ),
+            "effort": job.effort,
+            "attempt": job.attempt,
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+            "committed": job.committed_sha is not None,
+            "verification_present": bool(verification_rows),
+            "review_present": bool(review_rows),
+            "publication_present": publication_row is not None,
+        }
+        if job.committed_sha is not None:
+            entry["committed_sha"] = job.committed_sha
+        if job.worktree is not None:
+            entry["base_head"] = job.worktree.base_head
+        if publication_row is not None:
+            entry["publication_branch"] = publication_row.get("branch_name")
+        return entry
 
     async def _set_status(
         self,

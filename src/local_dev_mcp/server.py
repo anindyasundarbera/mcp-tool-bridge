@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -10,6 +10,7 @@ from .claude import ClaudeExecutor
 from .config import Settings
 from .evidence import EvidenceBundleError, EvidenceBundleManager
 from .git import project_status
+from .introspection import CanonicalizationResolver, effective_policy_view
 from .jobs import DevelopmentJobManager
 from .models import Effort, ProjectCapability
 from .pr import PullRequestError, PullRequestManager
@@ -35,6 +36,7 @@ def create_server(
     sync: SyncManager | None = None,
     evidence: EvidenceBundleManager | None = None,
     pr: PullRequestManager | None = None,
+    canonicalization: CanonicalizationResolver | None = None,
 ) -> FastMCP:
     active_settings = settings or Settings.from_env()
     active_registry = registry or ProjectRegistry.load(
@@ -85,6 +87,14 @@ def create_server(
         active_settings,
         active_locks,
         active_jobs,
+        projects=active_registry.projects(),
+    )
+    active_canonicalization = canonicalization or CanonicalizationResolver(
+        active_settings,
+        active_locks,
+        active_jobs,
+        active_pr,
+        active_sync,
         projects=active_registry.projects(),
     )
 
@@ -1029,7 +1039,64 @@ def create_server(
         project = active_registry.resolve(
             project_id, ProjectCapability.SYNC_CANONICAL_CHECKOUT
         )
-        return await active_sync.sync(project, expected_current_head, target_commit)
+        try:
+            return await active_sync.sync(project, expected_current_head, target_commit)
+        except SyncError as exc:
+            raise ValueError(str(exc)) from exc
+
+    @mcp.tool(
+        name="prepare_canonical_for_work",
+        description=(
+            "Pre-work canonical-checkout update check. Fetches origin and reports "
+            "whether the canonical checkout is up to date with, behind, ahead of, "
+            "or diverged from origin's default branch, plus dirty/no-origin/"
+            "fetch-failed states — without merging. Call with pull=false (default) "
+            "to see whether updates are available; when the verdict is "
+            "updates_available, call again with pull=true to fast-forward the "
+            "canonical checkout to the verified remote tip (auto-discovered; no "
+            "SHA arguments required). The pull reuses sync_canonical_checkout's "
+            "safety: clean checkout, on the default branch, fast-forward only; "
+            "never pushes, forces, merges, tags, deletes, or moves a remote ref. "
+            "Refuses while a non-terminal development job exists. A diverged state "
+            "cannot be fast-forwarded and still requires a human steward. Opt-in "
+            "via the sync_canonical_checkout project capability."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def prepare_canonical_for_work(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        pull: Annotated[
+            bool,
+            Field(
+                description=(
+                    "false (default): fetch and report the update state without "
+                    "merging. true: fast-forward the canonical checkout to the "
+                    "verified remote tip when updates are available."
+                ),
+            ),
+        ] = False,
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.SYNC_CANONICAL_CHECKOUT
+        )
+        if not pull:
+            return await active_sync.check_for_updates(project)
+        try:
+            return await active_sync.sync(
+                project,
+                expected_current_head=None,
+                target_commit=None,
+            )
+        except SyncError as exc:
+            raise ValueError(str(exc)) from exc
 
     @mcp.tool(
         name="export_evidence_bundle",
@@ -1151,6 +1218,115 @@ def create_server(
             )
         except PullRequestError as exc:
             raise ValueError(str(exc)) from exc
+
+    # M-AL-01 read-only introspection tools (dormant by default; opt-in via the
+    # job_introspection / policy_introspection / canonical_history_read project
+    # capabilities). They only observe governed state and never mutate: they read
+    # the in-memory + durable job store, the already-validated effective policy,
+    # and origin history via read-only git/gh (no fetch, no push, no merge).
+
+    @mcp.tool(
+        name="list_development_jobs",
+        description=(
+            "Enumerate this project's durable development jobs without a job ID. "
+            "Returns a bounded, sanitized list (no worktree path or Claude session "
+            "ID) with per-job governance state (verification/review/publication "
+            "presence). Use scope=active for in-flight jobs, terminal for finished "
+            "jobs, or all (default). Opt-in via the job_introspection capability."
+        ),
+        annotations=read_only_annotations,
+    )
+    async def list_development_jobs(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        scope: Annotated[
+            Literal["all", "active", "terminal"],
+            Field(
+                description=(
+                    "Job lifecycle filter: all (default), active (in-flight), or "
+                    "terminal (completed/failed/cancelled)."
+                ),
+            ),
+        ] = "all",
+        limit: Annotated[
+            int,
+            Field(
+                description="Maximum number of jobs to return (default 50, hard cap 200).",
+                ge=0,
+            ),
+        ] = 50,
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.JOB_INTROSPECTION
+        )
+        return await active_jobs.list_jobs(project, scope, limit)
+
+    @mcp.tool(
+        name="get_effective_project_policy",
+        description=(
+            "Expose the validated effective policy for one allowed project as a "
+            "deterministic, redacted view with a policy_fingerprint. The absolute "
+            "root is never returned. Use this to reason about a project's "
+            "authorization surface without re-parsing its JSON. Opt-in via the "
+            "policy_introspection capability."
+        ),
+        annotations=read_only_annotations,
+    )
+    async def get_effective_project_policy(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.POLICY_INTROSPECTION
+        )
+        redaction_paths = (
+            project.root,
+            active_settings.job_worktree_root,
+            active_settings.projects_config_path,
+            *(policy.root for policy in active_registry.projects()),
+        )
+        return effective_policy_view(project, redaction_paths)
+
+    @mcp.tool(
+        name="resolve_candidate_canonicalization",
+        description=(
+            "Reconcile a detached development commit against the project's "
+            "canonical history. Given a 40-hex commit SHA, returns a three-state "
+            "verdict: CANONICAL (absorbed into origin's default branch by direct "
+            "ancestry or squash/rebase content-equivalence), NOT_CANONICAL "
+            "(provenance-linked and published but not yet absorbed), or "
+            "INDETERMINATE (provenance missing, content mismatch, or canonical tip "
+            "unreadable). Read-only and origin-only: never fetches, pushes, merges, "
+            "tags, or moves a ref. Opt-in via the canonical_history_read capability."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def resolve_candidate_canonicalization(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        commit_sha: Annotated[
+            str,
+            Field(
+                description="Exact 40-hex SHA of the candidate detached commit.",
+                pattern=r"^[0-9a-fA-F]{40}$",
+            ),
+        ],
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.CANONICAL_HISTORY_READ
+        )
+        return await active_canonicalization.resolve(project, commit_sha)
 
     return mcp
 

@@ -9,6 +9,7 @@ from local_dev_mcp.registry import ProjectRegistry
 from local_dev_mcp.server import create_server
 
 from tests.support import initialize_git_repository
+from tests.test_sync import add_origin, advance_origin, init_repo, rev
 
 
 class ServerSchemaTests(unittest.TestCase):
@@ -44,7 +45,7 @@ class ServerSchemaTests(unittest.TestCase):
             )
             tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
 
-        self.assertEqual(len(tools), 24)
+        self.assertEqual(len(tools), 28)
         reader_tools = {
             "list_project_markdown",
             "search_project_markdown",
@@ -194,6 +195,43 @@ class ServerSchemaTests(unittest.TestCase):
         self.assertEqual(push_schema["properties"]["branch_name"]["minLength"], 1)
         self.assertEqual(push_schema["properties"]["branch_name"]["maxLength"], 200)
 
+        # M-AL-01 read-only introspection tools (dormant by default; opt-in via
+        # the job_introspection / policy_introspection / canonical_history_read
+        # capabilities). They are registered regardless of the project's
+        # capabilities (authorization is enforced at call time via resolve).
+        introspection_tools = {
+            "list_development_jobs",
+            "get_effective_project_policy",
+            "resolve_candidate_canonicalization",
+        }
+        self.assertTrue(introspection_tools.issubset(tools))
+        for name in introspection_tools:
+            self.assertTrue(tools[name].annotations.readOnlyHint)
+            self.assertFalse(tools[name].annotations.destructiveHint)
+            self.assertTrue(tools[name].annotations.idempotentHint)
+        # list_development_jobs / get_effective_project_policy are local-only;
+        # canonical history reconciliation reads origin, so it is openWorld.
+        self.assertFalse(tools["list_development_jobs"].annotations.openWorldHint)
+        self.assertFalse(
+            tools["get_effective_project_policy"].annotations.openWorldHint
+        )
+        self.assertTrue(
+            tools["resolve_candidate_canonicalization"].annotations.openWorldHint
+        )
+        list_schema = tools["list_development_jobs"].parameters
+        self.assertEqual(
+            set(list_schema["properties"]["scope"]["enum"]),
+            {"all", "active", "terminal"},
+        )
+        self.assertEqual(list_schema["properties"]["scope"]["default"], "all")
+        self.assertEqual(list_schema["properties"]["limit"]["default"], 50)
+        self.assertEqual(list_schema["properties"]["limit"]["minimum"], 0)
+        resolve_schema = tools["resolve_candidate_canonicalization"].parameters
+        self.assertEqual(
+            resolve_schema["properties"]["commit_sha"]["pattern"],
+            r"^[0-9a-fA-F]{40}$",
+        )
+
     def test_writer_and_development_jobs_share_the_project_modifying_lock(self) -> None:
         class BlockingWriter:
             def __init__(self) -> None:
@@ -287,6 +325,79 @@ class ServerSchemaTests(unittest.TestCase):
                 blocking_writer.release.set()
                 await writer_call
                 await asyncio.wait_for(observing_executor.entered.wait(), timeout=2)
+
+        asyncio.run(exercise())
+
+
+class PrepareCanonicalForWorkTests(unittest.TestCase):
+    """Server-level check-then-pull flow for the pre-work update tool."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        self.base_head = init_repo(self.root)
+        self.bare = self.base / "remote.git"
+        add_origin(self.root, self.bare)
+        self.project = ProjectPolicy.model_validate(
+            {
+                "id": "test-project",
+                "display_name": "Test",
+                "description": "Test",
+                "root": str(self.root),
+                "capabilities": ["repository_read", "sync_canonical_checkout"],
+                "protected_paths": [".git", ".env"],
+            }
+        )
+        self.server = create_server(
+            Settings.from_env(
+                {
+                    "PROJECTS_CONFIG_PATH": str(self.base / "projects.json"),
+                    "JOB_WORKTREE_ROOT": str(self.base / "jobs"),
+                }
+            ),
+            ProjectRegistry({"test-project": self.project}),
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_check_reports_updates_then_pull_fast_forwards(self) -> None:
+        async def exercise() -> None:
+            target = advance_origin(self.bare, self.base, "server-merge")
+            self.assertEqual(rev(self.root, "HEAD"), self.base_head)
+
+            check = await self.server.call_tool(
+                "prepare_canonical_for_work",
+                {"project_id": "test-project", "pull": False},
+            )
+            check_data = check.structured_content
+            self.assertEqual(check_data["state"], "updates_available")
+            self.assertTrue(check_data["updates_available"])
+            self.assertEqual(check_data["remote_tip"], target)
+            self.assertEqual(check_data["behind_by"], 1)
+
+            pulled = await self.server.call_tool(
+                "prepare_canonical_for_work",
+                {"project_id": "test-project", "pull": True},
+            )
+            pulled_data = pulled.structured_content
+            self.assertEqual(pulled_data["status"], "synchronized")
+            self.assertEqual(pulled_data["to_head"], target)
+            self.assertEqual(rev(self.root, "HEAD"), target)
+
+        asyncio.run(exercise())
+
+    def test_pull_when_up_to_date_is_idempotent(self) -> None:
+        async def exercise() -> None:
+            pulled = await self.server.call_tool(
+                "prepare_canonical_for_work",
+                {"project_id": "test-project", "pull": True},
+            )
+            pulled_data = pulled.structured_content
+            self.assertEqual(pulled_data["status"], "already_synchronized")
+            self.assertTrue(pulled_data["idempotent"])
+            self.assertEqual(rev(self.root, "HEAD"), self.base_head)
 
         asyncio.run(exercise())
 

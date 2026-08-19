@@ -182,6 +182,39 @@ class PullRequestManager:
             return None
         return candidate
 
+    async def view_pr(
+        self, worktree: Path, pr_number: int, *, timeout: int
+    ) -> dict[str, Any] | None:
+        """Read one PR's merge/landing state via ``gh pr view`` (M-AL-01).
+
+        A read-only counterpart to ``_discover_pr``: given a PR number, returns
+        its ``state`` (open/closed/merged), ``merged`` flag, ``mergeCommit.oid``
+        (the landing SHA, when merged), base/head refs, and url. Returns ``None``
+        if gh reports no such PR. A ``gh`` failure (timeout/auth/network/rate-limit)
+        is re-raised as ``PullRequestError`` so a read-only reconciliation tool can
+        distinguish "no PR" from "transient gh failure". Never issues a mutation;
+        ``pr view`` is read-only and uses the fixed-argv ``_gh`` runner with no
+        shell and stdin DEVNULL.
+        """
+        output = await _gh(
+            worktree,
+            "pr",
+            "view",
+            str(pr_number),
+            "--json",
+            "number,state,merged,mergeCommit,baseRefName,headRefName,url",
+            timeout_seconds=timeout,
+        )
+        if not output:
+            return None
+        try:
+            parsed = json.loads(output)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(parsed, dict) or "number" not in parsed:
+            return None
+        return parsed
+
     async def open_pull_request(
         self,
         project: ProjectPolicy,
@@ -279,6 +312,25 @@ class PullRequestManager:
                     raise PullRequestError(
                         f"could not determine the PR base branch: {exc}"
                     ) from exc
+                # BridgeLab publishes a detached, independently verified commit
+                # directly to the remote feature branch; the canonical checkout
+                # stays on ``main`` and no local feature branch exists. ``--fill``
+                # is therefore incompatible: ``gh`` inspects the local Git commit
+                # range (``origin/main...<head>``) to generate the body, which
+                # fails with an ambiguous-argument error because that range is not
+                # in the working tree. Supply an explicit ``--body`` built only
+                # from metadata already in scope (no extra shell commands, no
+                # worktree paths, no secrets), so PR creation does not depend on a
+                # local feature branch and never prompts (stdin is DEVNULL).
+                commit_sha = str(publication["commit_sha"])
+                body = (
+                    "Created by BridgeLab from an independently reviewed and "
+                    "verified development candidate.\n\n"
+                    f"- source branch: {branch_name}\n"
+                    f"- base branch: {base}\n"
+                    f"- commit SHA: {commit_sha}\n"
+                    f"- candidate fingerprint: {fingerprint}\n"
+                )
                 args = [
                     "pr",
                     "create",
@@ -288,6 +340,8 @@ class PullRequestManager:
                     base,
                     "--title",
                     title,
+                    "--body",
+                    body,
                 ]
                 if draft:
                     args.append("--draft")

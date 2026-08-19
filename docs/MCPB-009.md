@@ -64,6 +64,21 @@ audit log synchronously in `__init__` and appends one ACID row per
 synchronization. No existing tool, parameter, or safety annotation changes
 for projects that do not opt in.
 
+A pre-work update companion extends MCPB-009 without adding a capability:
+`prepare_canonical_for_work(pull=false)` fetches `origin` and classifies the
+canonical checkout against the remote default tip (`up_to_date`,
+`updates_available`, `ahead`, `diverged`, `dirty`, `no_origin`, `fetch_failed`)
+without merging; `prepare_canonical_for_work(pull=true)` fast-forwards to the
+auto-discovered verified remote tip, reusing the `sync` ff-only guards with no
+SHA arguments required. `SyncManager.sync` accepts optional
+`expected_current_head`/`target_commit` (omitted on the auto-discovery path); the
+precise `sync_canonical_checkout` tool is unchanged. A stale-base guard in
+`worktrees.create` refuses to branch a non-pinned job off a canonical HEAD that
+is behind `origin/<default>`, naming `prepare_canonical_for_work(pull=true)` so
+the orchestrator self-serves the pull instead of hitting an opaque downstream
+error; the guard is skipped when there is no `origin` or `requested_base` is
+pinned, and a `diverged` checkout still requires a human steward.
+
 The per-project lock is held for an entire job run (`DevelopmentJobManager._run`),
 so sync naturally waits for any running job to finish before it acquires the
 lock; the active-job check then refuses queued jobs that would otherwise

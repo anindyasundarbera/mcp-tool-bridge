@@ -147,10 +147,142 @@ class PullRequestTests(unittest.TestCase):
             self.assertEqual(result["pr_state"]["state"], "open")
             self.assertTrue(result["draft"])
             self.assertTrue(result["remote_branch_state"]["present"])
-            # The create call must include --draft and never merge.
+            # The create call must supply an explicit ``--body`` (BridgeLab's
+            # detached-publication model has no local feature branch, so
+            # ``--fill`` cannot infer a commit range and must be absent) while
+            # keeping the explicit ``--title``, ``--head``, ``--base``, and
+            # ``--draft``. It must never merge.
             calls = [c.args for c in gh_mock.call_args_list]
-            self.assertTrue(any("--draft" in c for c in calls))
+            create_call = next(c for c in calls if "create" in c)
+            self.assertIn("--body", create_call)
+            self.assertNotIn("--fill", create_call)
+            self.assertIn("--title", create_call)
+            self.assertIn("My draft PR", create_call)
+            self.assertIn("--head", create_call)
+            self.assertIn(branch, create_call)
+            self.assertIn("--base", create_call)
+            self.assertIn("--draft", create_call)
+            # Body is the BridgeLab-owned deterministic description (no Git
+            # history inference, no worktree paths).
+            body = create_call[create_call.index("--body") + 1]
+            self.assertIn("Created by BridgeLab", body)
+            self.assertIn("source branch: agent/pr-test-1", body)
             self.assertFalse(any("merge" in c for c in calls))
+
+        asyncio.run(exercise())
+
+    def test_non_draft_create_has_body_no_draft_flag(self) -> None:
+        """Non-draft PR creation supplies --body/--title, omits --draft/--fill."""
+        async def exercise() -> None:
+            policy_obj = policy(self.root)
+            branch = "agent/pr-test-nondraft"
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            _, verification, publication, pr, completed = await self._prepare(
+                policy_obj, edit
+            )
+            info = await self._publish(
+                verification, publication, policy_obj, completed, branch
+            )
+
+            gh_mock = mock.AsyncMock(side_effect=[
+                # discover -> no existing PR (empty output)
+                "",
+                # create -> returns the PR url
+                "https://github.com/example/repo/pull/2",
+            ])
+            with mock.patch("local_dev_mcp.pr._gh", new=gh_mock):
+                result = await pr.open_pull_request(
+                    policy_obj,
+                    info["job_id"],
+                    info["base_head"],
+                    info["fingerprint"],
+                    "Ready for review",
+                    draft=False,
+                )
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["pr_state"]["action"], "created")
+            self.assertFalse(result["draft"])
+            calls = [c.args for c in gh_mock.call_args_list]
+            create_call = next(c for c in calls if "create" in c)
+            self.assertIn("--body", create_call)
+            self.assertNotIn("--fill", create_call)
+            self.assertIn("--title", create_call)
+            self.assertIn("Ready for review", create_call)
+            self.assertIn("--head", create_call)
+            self.assertIn(branch, create_call)
+            self.assertIn("--base", create_call)
+            self.assertNotIn("--draft", create_call)
+            self.assertFalse(any("merge" in c for c in calls))
+
+        asyncio.run(exercise())
+
+    def test_create_does_not_require_local_feature_branch(self) -> None:
+        """PR creation works with no local feature branch (detached publication).
+
+        BridgeLab publishes a detached commit to the remote branch while the
+        canonical checkout stays on ``main``; no local branch named
+        ``<branch>`` exists. The explicit ``--body`` keeps ``gh pr create`` from
+        inspecting a local commit range (``--fill`` would fail here with an
+        ambiguous-argument error). This test deletes any local branch ref and
+        confirms creation still succeeds.
+        """
+        async def exercise() -> None:
+            policy_obj = policy(self.root)
+            branch = "agent/pr-test-nolocalbranch"
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            _, verification, publication, pr, completed = await self._prepare(
+                policy_obj, edit
+            )
+            info = await self._publish(
+                verification, publication, policy_obj, completed, branch
+            )
+            # Ensure no local branch named <branch> exists in the canonical
+            # checkout (mirrors BridgeLab's detached-publication model).
+            subprocess.run(
+                ["git", "-C", str(self.root), "branch", "--list", branch],
+                check=True,
+                capture_output=True,
+            )
+            # The canonical checkout must remain on main, not the feature branch.
+            head_ref = subprocess.run(
+                ["git", "-C", str(self.root), "symbolic-ref", "--short", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            self.assertEqual(head_ref, "main")
+            self.assertNotIn(branch, subprocess.run(
+                ["git", "-C", str(self.root), "branch", "--list"],
+                check=True, capture_output=True, text=True,
+            ).stdout)
+
+            gh_mock = mock.AsyncMock(side_effect=[
+                # discover -> no existing PR (empty output)
+                "",
+                # create -> returns the PR url
+                "https://github.com/example/repo/pull/3",
+            ])
+            with mock.patch("local_dev_mcp.pr._gh", new=gh_mock):
+                result = await pr.open_pull_request(
+                    policy_obj,
+                    info["job_id"],
+                    info["base_head"],
+                    info["fingerprint"],
+                    "Detached candidate PR",
+                )
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["pr_state"]["action"], "created")
+            # The PR was created despite the feature branch not existing locally.
+            create_call = next(
+                c for c in [c.args for c in gh_mock.call_args_list]
+                if "create" in c
+            )
+            self.assertIn("--body", create_call)
+            self.assertNotIn("--fill", create_call)
 
         asyncio.run(exercise())
 

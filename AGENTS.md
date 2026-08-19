@@ -266,6 +266,34 @@ The prepared MCPB-009 source adds:
 - no push, merge-commit creation, tag, deletion, remote ref move, or
   configurable remote (`origin` only).
 
+MCPB-009 also adds a pre-work update companion so the orchestrator never starts
+new work on a stale base:
+
+- a `prepare_canonical_for_work` MCP tool (same capability as
+  `sync_canonical_checkout`) that fetches `origin` and reports whether the
+  canonical checkout is `up_to_date`, `updates_available`, `ahead`, `diverged`,
+  `dirty`, `no_origin`, or `fetch_failed` — **without merging**. With
+  `pull=true` it fast-forwards to the auto-discovered verified remote tip
+  (reusing the `sync` ff-only guards; no SHA arguments required);
+- a stale-base guard in worktree creation: when no `requested_base` is pinned
+  and the canonical checkout is behind `origin/<default>`, `send_to_local_dev`
+  refuses with an actionable message naming `prepare_canonical_for_work(pull=true)`
+  rather than silently branching new work off a stale `base_head`. The guard
+  reads **local remote-tracking refs only** (no `git fetch` on the worktree-creation
+  hot path), so it is armed by the `prepare_canonical_for_work` fetch above; if no
+  one has fetched it no-ops rather than blocking on the network. It is skipped
+  when there is no `origin` (offline / local-only repos) and when `requested_base`
+  is pinned. A `diverged` checkout still requires a human steward — fast-forward
+  cannot reconcile it.
+
+**Orchestrator pre-work convention:** after a pull request has been raised (and
+especially after one has merged on the remote) and before `send_to_local_dev` for
+the next piece of work, call `prepare_canonical_for_work(pull=false)`. If the
+verdict is `updates_available`, call `prepare_canonical_for_work(pull=true)` to
+fast-forward the canonical checkout to the verified remote tip, then proceed.
+This keeps the tree clean through a bridge tool instead of throwing an opaque
+stale-base error that a human steward must fix with a manual `git pull`.
+
 The prepared package version is `0.9.0`; 143 core tests pass. The capability
 is dormant unless a project opts in; `cairn-knowledge-store` is granted
 `sync_canonical_checkout` in `projects.json`. It has not been committed,
@@ -404,17 +432,23 @@ core tests and must be identified as such. Do not fabricate their results.
 
 ## Current resume pointer
 
-Resume by reviewing and accepting **MCPB-010** using:
+Resume by reviewing and accepting **M-AL-01** (read-only introspection) using:
 
 ```text
-docs/MCPB-010.md
-docs/MCPB-010-IMPLEMENTATION-BRIEF.md
+docs/M-AL-01.md
 ```
 
-MCPB-007 (independent candidate review) is accepted and committed; MCPB-008
-adds the bounded publication capability; MCPB-009 adds the canonical-checkout
-synchronization capability; MCPB-010 adds internal turn-level continuity state
-(durable checkpoints, paused states, soft/progress-gated budgets, structured
-terminal report) with zero new MCP tools. After acceptance, explicitly
-authorize any desired commit/push, live installation/restart, or
-real-repository smoke test as separate actions.
+M-AL-01 adds three dormant-by-default, capability-gated read-only introspection
+tools (MCP tool count 24 -> 27): `list_development_jobs`,
+`get_effective_project_policy`, and `resolve_candidate_canonicalization`, plus
+the `job_introspection`/`policy_introspection`/`canonical_history_read`
+capabilities (each gated on its prerequisite). It is the agent-lab Phase-0
+enabler, named M-AL-01 (not MCPB-011, which the roadmap reserves for the
+Evidence release M-EV-01). Implemented and verified locally (262 tests green,
+including an adversarial multi-agent review that found and fixed four
+INDETERMINATE-vs-NOT_CANONICAL correctness defects);
+**NOT COMMITTED, NOT PUSHED, NO PR OPENED, LIVE BRIDGELAB NOT RESTARTED.** The
+prior milestone, MCPB-010 (internal turn-level continuity state, zero new MCP
+tools), is implemented locally and pending acceptance. After acceptance of
+either, explicitly authorize any desired commit/push, live
+installation/restart, or real-repository smoke test as separate actions.

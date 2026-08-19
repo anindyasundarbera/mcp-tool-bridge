@@ -8,6 +8,7 @@ from local_dev_mcp.config import Settings
 from local_dev_mcp.models import ProjectPolicy
 from local_dev_mcp.worktrees import GitWorktreeManager, WorktreeError
 from tests.support import initialize_git_repository
+from tests.test_sync import add_origin, advance_origin, init_repo, rev
 
 
 def settings(base: Path) -> Settings:
@@ -192,6 +193,88 @@ class GitWorktreeManagerTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(WorktreeError, "worktree HEAD moved"):
             asyncio.run(self.manager.validate_resume(self.project, worktree))
+
+
+class StaleBaseGuardTests(unittest.TestCase):
+    """The pre-work staleness guard in ``worktrees.create``."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        self.base_head = init_repo(self.root)
+        self.bare = self.base / "remote.git"
+        add_origin(self.root, self.bare)
+        self.settings = settings(self.base)
+        self.manager = GitWorktreeManager(self.settings)
+        self.project = policy(self.root)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_create_refuses_stale_base_with_actionable_message(self) -> None:
+        # A PR merged on the remote; the canonical checkout is left stale. The
+        # guard reads local remote-tracking refs (no fetch), so simulate the
+        # orchestrator's prepare_canonical_for_work having fetched first.
+        advance_origin(self.bare, self.base, "merged-1")
+        subprocess.run(["git", "-C", str(self.root), "fetch", "-q", "origin"], check=True)
+        self.assertEqual(rev(self.root, "HEAD"), self.base_head)
+
+        with self.assertRaisesRegex(WorktreeError, "prepare_canonical_for_work"):
+            asyncio.run(self.manager.create(self.project, "a" * 32))
+
+        # No worktree was created; the canonical checkout is untouched.
+        self.assertEqual(rev(self.root, "HEAD"), self.base_head)
+        self.assertFalse(
+            (self.settings.job_worktree_root / "test-project" / ("a" * 32)).exists()
+        )
+
+    def test_create_does_not_fetch_on_hot_path(self) -> None:
+        # A merged PR exists on the remote, but the local tracking ref has NOT
+        # been refreshed (no fetch). The non-fetching guard must no-op rather
+        # than block on the network, so worktree creation proceeds at the stale
+        # base — the orchestrator is expected to have called
+        # prepare_canonical_for_work first to arm the guard.
+        advance_origin(self.bare, self.base, "merged-no-fetch")
+        self.assertEqual(rev(self.root, "HEAD"), self.base_head)
+        self.assertEqual(
+            rev(self.root, "refs/remotes/origin/main"), self.base_head
+        )
+
+        worktree = asyncio.run(self.manager.create(self.project, "e" * 32))
+        self.assertEqual(worktree.base_head, self.base_head)
+
+    def test_create_succeeds_after_sync_clears_staleness(self) -> None:
+        advance_origin(self.bare, self.base, "merged-2")
+        # Simulate the orchestrator pulling via ff-only: fetch, then move local
+        # main to the remote tip so the base is no longer stale.
+        subprocess.run(["git", "-C", str(self.root), "fetch", "-q", "origin"], check=True)
+        tip = rev(self.bare, "main")
+        subprocess.run(
+            ["git", "-C", str(self.root), "merge", "--ff-only", "-q", tip],
+            check=True,
+        )
+        worktree = asyncio.run(self.manager.create(self.project, "b" * 32))
+        self.assertEqual(worktree.base_head, tip)
+
+    def test_create_skips_guard_when_offline(self) -> None:
+        # No origin remote: the guard is skipped and a worktree is created at
+        # the local HEAD (existing contract preserved).
+        solo = self.base / "solo"
+        init_repo(solo)
+        solo_project = policy(solo)
+        worktree = asyncio.run(self.manager.create(solo_project, "c" * 32))
+        self.assertEqual(worktree.base_head, rev(solo, "HEAD"))
+
+    def test_create_skips_guard_for_pinned_requested_base(self) -> None:
+        # Stale canonical checkout, but the caller pins requested_base to the
+        # fetched remote tip: the guard is skipped and the pinned base is used.
+        tip = advance_origin(self.bare, self.base, "merged-3")
+        self.assertEqual(rev(self.root, "HEAD"), self.base_head)
+        worktree = asyncio.run(
+            self.manager.create(self.project, "d" * 32, requested_base=tip)
+        )
+        self.assertEqual(worktree.base_head, tip.lower())
 
 
 if __name__ == "__main__":

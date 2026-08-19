@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import Settings
-from .git import GitCommandError, run_git
+from .git import GitCommandError, count_range, is_ancestor, run_git
 from .models import ProjectPolicy
 
 
@@ -189,6 +189,81 @@ class GitWorktreeManager:
             return None
         return branch, tip
 
+    async def _remote_default_tip_local(
+        self, project: ProjectPolicy
+    ) -> tuple[str, str] | None:
+        """Origin default-branch ``(branch, tip)`` from local remote-tracking refs only.
+
+        No ``git fetch``: reads ``refs/remotes/origin/HEAD`` and
+        ``refs/remotes/origin/<branch>`` as they currently stand in the local
+        refs. Returns ``None`` when the symref/tip is unset (no origin, or origin
+        never fetched). The staleness guard uses this so a default worktree
+        creation never blocks on the network — freshness of the tracking ref is
+        established by ``prepare_canonical_for_work`` (which fetches) before work
+        starts, per the orchestrator pre-work convention.
+        """
+        timeout = self.settings.git_command_timeout_seconds
+        try:
+            full = await run_git(
+                project.root,
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                timeout_seconds=timeout,
+            )
+        except GitCommandError:
+            return None
+        prefix = "refs/remotes/origin/"
+        if not full.startswith(prefix):
+            return None
+        branch = full[len(prefix):]
+        try:
+            tip = await run_git(
+                project.root,
+                "rev-parse",
+                "--verify",
+                f"refs/remotes/origin/{branch}",
+                timeout_seconds=timeout,
+            )
+        except GitCommandError:
+            return None
+        return branch, tip
+
+    async def _refuse_if_stale_base(
+        self, project: ProjectPolicy, local_head: str
+    ) -> None:
+        """Raise ``WorktreeError`` if the canonical checkout is behind origin's default.
+
+        Uses **local remote-tracking refs only** (no fetch), so this is a cheap
+        backstop on the worktree-creation hot path: it refuses when the tracking
+        ref already shows the canonical HEAD is behind ``origin/<default>``. The
+        tracking ref is made fresh by ``prepare_canonical_for_work`` (which
+        fetches) before work starts; if no one has fetched, the ref is unset or
+        stale and the guard no-ops rather than blocking on the network. Only the
+        clean ``behind`` case is actionable — a diverged or ahead checkout is
+        left to the existing baseline checks.
+        """
+        remote = await self._remote_default_tip_local(project)
+        if remote is None:
+            return
+        branch, remote_tip = remote
+        if remote_tip.lower() == local_head.lower():
+            return
+        timeout = self.settings.git_command_timeout_seconds
+        behind = await is_ancestor(
+            project.root, local_head, remote_tip, timeout_seconds=timeout
+        )
+        if not behind:
+            return
+        behind_by = await count_range(
+            project.root, local_head, remote_tip, timeout_seconds=timeout
+        )
+        raise WorktreeError(
+            f"canonical checkout is {behind_by} commit(s) behind "
+            f"origin/{branch}; call prepare_canonical_for_work(pull=true) to "
+            "fast-forward to the verified remote tip, then retry "
+            "send_to_local_dev"
+        )
+
     async def create(
         self,
         project: ProjectPolicy,
@@ -228,6 +303,17 @@ class GitWorktreeManager:
                     f"origin/{branch} (remote is at {remote_tip[:12]})"
                 )
             base_head = expected
+
+        # Pre-work staleness guard (MCPB-009 companion): when the caller did not
+        # pin a base, the worktree branches off the local canonical HEAD. If a
+        # pull request has since merged on the remote, that HEAD is stale and the
+        # new work would be built on out-of-date code. Refuse with an actionable
+        # message so the orchestrator can self-serve a fast-forward via
+        # prepare_canonical_for_work(pull=true) instead of hitting an opaque
+        # downstream error. Skipped silently when there is no origin (offline /
+        # local-only repos) and when the caller pinned requested_base.
+        if requested_base is None:
+            await self._refuse_if_stale_base(project, local_head)
 
         created = False
         completed = False

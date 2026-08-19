@@ -455,6 +455,141 @@ class SyncTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    # --- check_for_updates (pre-work safe-mode check) -------------------
+
+    def test_check_for_updates_up_to_date(self) -> None:
+        async def exercise() -> None:
+            policy_obj = policy(self.root)
+            _, _, sync = self._managers(policy_obj)
+            result = await sync.check_for_updates(policy_obj)
+            self.assertEqual(result["state"], "up_to_date")
+            self.assertFalse(result["updates_available"])
+            self.assertEqual(result["local_head"], self.base_head)
+            self.assertEqual(result["remote_tip"], self.base_head)
+            self.assertEqual(result["default_branch"], "main")
+
+        asyncio.run(exercise())
+
+    def test_check_for_updates_reports_behind_with_summary(self) -> None:
+        async def exercise() -> None:
+            policy_obj = policy(self.root)
+            _, _, sync = self._managers(policy_obj)
+            target = advance_origin(self.bare, self.base, "update-1")
+            # Canonical checkout is still at the stale base.
+            self.assertEqual(rev(self.root, "HEAD"), self.base_head)
+
+            result = await sync.check_for_updates(policy_obj)
+
+            self.assertEqual(result["state"], "updates_available")
+            self.assertTrue(result["updates_available"])
+            self.assertEqual(result["local_head"], self.base_head)
+            self.assertEqual(result["remote_tip"], target)
+            self.assertEqual(result["default_branch"], "main")
+            self.assertEqual(result["behind_by"], 1)
+            self.assertEqual(len(result["incoming_commits"]), 1)
+            self.assertIn("update-1", result["incoming_commits"][0])
+            self.assertIn("update-1.md", result["diff_stat"])
+            self.assertIn("prepare_canonical_for_work(pull=true)", result["message"])
+            # No merge performed.
+            self.assertEqual(rev(self.root, "HEAD"), self.base_head)
+
+        asyncio.run(exercise())
+
+    def test_check_for_updates_reports_diverged(self) -> None:
+        async def exercise() -> None:
+            policy_obj = policy(self.root)
+            _, _, sync = self._managers(policy_obj)
+            advance_origin(self.bare, self.base, "remote-div")
+            # Local diverges: a commit on canonical main that is not on origin.
+            subprocess.run(
+                ["git", "-C", str(self.root), "commit", "-q", "--allow-empty",
+                 "-m", "local-div"],
+                check=True,
+            )
+            local_head = rev(self.root, "HEAD")
+            result = await sync.check_for_updates(policy_obj)
+            self.assertEqual(result["state"], "diverged")
+            self.assertFalse(result["updates_available"])
+            self.assertEqual(result["local_head"], local_head)
+            self.assertIn("human steward", result["message"])
+
+        asyncio.run(exercise())
+
+    def test_check_for_updates_reports_dirty_without_fetching(self) -> None:
+        async def exercise() -> None:
+            policy_obj = policy(self.root)
+            _, _, sync = self._managers(policy_obj)
+            advance_origin(self.bare, self.base, "update-2")
+            (self.root / "README.md").write_text("# dirty\n", encoding="utf-8")
+            result = await sync.check_for_updates(policy_obj)
+            self.assertEqual(result["state"], "dirty")
+            self.assertFalse(result["updates_available"])
+            self.assertEqual(result["local_head"], self.base_head)
+            # Nothing moved.
+            self.assertEqual(rev(self.root, "HEAD"), self.base_head)
+
+        asyncio.run(exercise())
+
+    def test_check_for_updates_no_origin(self) -> None:
+        async def exercise() -> None:
+            no_origin = self.base / "solo"
+            init_repo(no_origin)
+            policy_obj = policy(no_origin)
+            _, _, sync = self._managers(policy_obj)
+            result = await sync.check_for_updates(policy_obj)
+            self.assertEqual(result["state"], "no_origin")
+            self.assertFalse(result["updates_available"])
+
+        asyncio.run(exercise())
+
+    # --- sync auto-discovery (prepare_canonical_for_work pull path) -----
+
+    def test_sync_auto_discovers_remote_tip(self) -> None:
+        async def exercise() -> None:
+            policy_obj = policy(self.root)
+            _, _, sync = self._managers(policy_obj)
+            target = advance_origin(self.bare, self.base, "auto-1")
+            self.assertEqual(rev(self.root, "HEAD"), self.base_head)
+
+            result = await sync.sync(policy_obj, expected_current_head=None, target_commit=None)
+
+            self.assertEqual(result["status"], "synchronized")
+            self.assertFalse(result["idempotent"])
+            self.assertEqual(result["from_head"], self.base_head)
+            self.assertEqual(result["to_head"], target)
+            self.assertEqual(rev(self.root, "HEAD"), target)
+            self.assertTrue(is_clean(self.root))
+            # Audit row recorded.
+            self.assertEqual(len(sync.audit(policy_obj.id)), 1)
+            self.assertEqual(sync.audit(policy_obj.id)[0]["to_head"], target)
+
+        asyncio.run(exercise())
+
+    def test_sync_auto_discover_idempotent_when_already_at_tip(self) -> None:
+        async def exercise() -> None:
+            policy_obj = policy(self.root)
+            _, _, sync = self._managers(policy_obj)
+            # Remote and canonical both still at base.
+            result = await sync.sync(policy_obj, expected_current_head=None, target_commit=None)
+            self.assertEqual(result["status"], "already_synchronized")
+            self.assertTrue(result["idempotent"])
+            self.assertEqual(result["to_head"], self.base_head)
+            self.assertEqual(rev(self.root, "HEAD"), self.base_head)
+
+        asyncio.run(exercise())
+
+    def test_sync_auto_discover_rejects_dirty(self) -> None:
+        async def exercise() -> None:
+            policy_obj = policy(self.root)
+            _, _, sync = self._managers(policy_obj)
+            advance_origin(self.bare, self.base, "auto-2")
+            (self.root / "README.md").write_text("# dirty\n", encoding="utf-8")
+            with self.assertRaisesRegex(SyncError, "must be clean"):
+                await sync.sync(policy_obj, expected_current_head=None, target_commit=None)
+            self.assertEqual(rev(self.root, "HEAD"), self.base_head)
+
+        asyncio.run(exercise())
+
 
 class SyncCapabilityRegistryTests(unittest.TestCase):
     def test_sync_capability_requires_repository_read(self) -> None:
