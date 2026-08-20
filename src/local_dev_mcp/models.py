@@ -26,6 +26,21 @@ class ProjectCapability(StrEnum):
     JOB_INTROSPECTION = "job_introspection"
     POLICY_INTROSPECTION = "policy_introspection"
     CANONICAL_HISTORY_READ = "canonical_history_read"
+    # MCPB-011: governed execution of one named, policy-authorized runtime
+    # verification command against the canonical checkout. Host-runtime access
+    # (Docker, loopback networking, host services) derives only from trusted
+    # configuration; the MCP caller selects only a check id. Evidence-only: no
+    # commit, push, merge, tag, or ref authority. Requires repository_read.
+    RUNTIME_VERIFICATION = "runtime_verification"
+    # MCPB-012: governed capture of an approved set of uncommitted working-tree
+    # changes into a retained BridgeLab candidate, without modifying the
+    # canonical checkout. Read-only against the source checkout; produces a
+    # normal retained candidate eligible for the existing verification, review,
+    # commit, and publication gates. The approved include/protected-exclude
+    # scope is pinned in trusted policy, not caller-chosen. Requires
+    # repository_read (the downstream commit/publish gates carry their own
+    # authorization).
+    WORKING_TREE_CANDIDATE_CAPTURE = "working_tree_candidate_capture"
 
 
 def _policy_path(value: str) -> str:
@@ -34,6 +49,110 @@ def _policy_path(value: str) -> str:
     if not normalized or path.is_absolute() or ".." in path.parts:
         raise ValueError("policy paths must be non-empty relative paths without '..'")
     return path.as_posix()
+
+
+# Names of interpreter/library loader variables a policy-configured command must
+# not set, because they would let a runtime check rebind the interpreter or
+# shared-library search path the bridge runs under (an injection vector). PATH
+# is intentionally allowed so a host-runtime check can discover tools like
+# ``docker``; the bridge never inherits its full process environment anyway.
+_FORBIDDEN_ENV_KEYS = frozenset(
+    {
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+        "SHLIB_PATH",
+        "LIBPATH",
+        "PERL5LIB",
+        "PERL5OPT",
+        "RUBYOPT",
+    }
+)
+
+
+def _validate_command_argv(value: object, *, label: str, exe_label: str) -> tuple[str, ...]:
+    """Validate a fixed command argument vector shared by every command model.
+
+    The argv must be a list of 1–64 non-empty, NUL-free, ≤2000-character
+    arguments. ``{python}`` is allowed only as the executable (argv[0]) and is
+    expanded to ``sys.executable`` at run time; a shell executable (sh, bash,
+    ...) is rejected so no configured command can ever become a shell surface.
+    ``label``/``exe_label`` parameterize the error messages so each model keeps
+    its own wording (existing tests assert the exact text).
+    """
+    if isinstance(value, (str, bytes)) or value is None:
+        raise ValueError(f"{label} argv must be a list of arguments")
+    arguments = tuple(str(item) for item in value)  # type: ignore[arg-type]
+    if not 1 <= len(arguments) <= 64:
+        raise ValueError(f"{label} argv must contain 1 through 64 arguments")
+    for argument in arguments:
+        if not argument or len(argument) > 2000 or "\x00" in argument:
+            raise ValueError(
+                f"{label} arguments must be non-empty, NUL-free, and at "
+                "most 2000 characters"
+            )
+    if "{python}" in arguments[1:]:
+        raise ValueError(f"{{python}} is allowed only as the {exe_label} executable")
+    executable = PurePosixPath(arguments[0].replace("\\", "/")).name.lower()
+    if executable.removesuffix(".exe") in {
+        "sh",
+        "bash",
+        "dash",
+        "zsh",
+        "ksh",
+        "fish",
+        "powershell",
+        "pwsh",
+        "cmd",
+    }:
+        raise ValueError(f"{label} commands must not invoke a shell")
+    return arguments
+
+
+def _validate_env_mapping(value: object) -> dict[str, str]:
+    """Validate a policy-defined environment mapping for a runtime command.
+
+    Keys must be uppercase ``[A-Z_][A-Z0-9_]*`` env names (≤128 chars) and not
+    fall in the forbidden interpreter/loader set. Values must be NUL-free
+    strings ≤4000 chars. Up to 64 entries. The bridge never returns these
+    values wholesale (introspection redacts them); this only guards the shape.
+    """
+    if value is None:
+        return {}
+    if isinstance(value, (str, bytes)):
+        raise ValueError("environment must be a mapping of string keys to string values")
+    if not isinstance(value, dict):
+        raise ValueError("environment must be a mapping of string keys to string values")
+    if len(value) > 64:
+        raise ValueError("environment may contain at most 64 entries")
+    import re
+
+    key_pattern = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
+    result: dict[str, str] = {}
+    for raw_key, raw_value in value.items():
+        key = str(raw_key)
+        if not key_pattern.match(key):
+            raise ValueError(
+                "environment keys must be uppercase [A-Z_][A-Z0-9_]* names"
+            )
+        if key in _FORBIDDEN_ENV_KEYS:
+            raise ValueError(
+                f"environment key {key!r} is forbidden (it would rebind the "
+                "interpreter or shared-library search path)"
+            )
+        text = str(raw_value)
+        if "\x00" in text or len(text) > 4000:
+            raise ValueError(
+                "environment values must be NUL-free and at most 4000 characters"
+            )
+        result[key] = text
+    return result
 
 
 class VerificationCommand(BaseModel):
@@ -47,33 +166,7 @@ class VerificationCommand(BaseModel):
     @field_validator("argv", mode="before")
     @classmethod
     def validate_argv(cls, value: object) -> tuple[str, ...]:
-        if isinstance(value, (str, bytes)) or value is None:
-            raise ValueError("verification argv must be a list of arguments")
-        arguments = tuple(str(item) for item in value)  # type: ignore[arg-type]
-        if not 1 <= len(arguments) <= 64:
-            raise ValueError("verification argv must contain 1 through 64 arguments")
-        for argument in arguments:
-            if not argument or len(argument) > 2000 or "\x00" in argument:
-                raise ValueError(
-                    "verification arguments must be non-empty, NUL-free, and at "
-                    "most 2000 characters"
-                )
-        if "{python}" in arguments[1:]:
-            raise ValueError("{python} is allowed only as the verification executable")
-        executable = PurePosixPath(arguments[0].replace("\\", "/")).name.lower()
-        if executable.removesuffix(".exe") in {
-            "sh",
-            "bash",
-            "dash",
-            "zsh",
-            "ksh",
-            "fish",
-            "powershell",
-            "pwsh",
-            "cmd",
-        }:
-            raise ValueError("verification commands must not invoke a shell")
-        return arguments
+        return _validate_command_argv(value, label="verification", exe_label="verification")
 
     @field_validator("python_path", mode="before")
     @classmethod
@@ -106,33 +199,104 @@ class SupplyChainCommand(BaseModel):
     @field_validator("argv", mode="before")
     @classmethod
     def validate_argv(cls, value: object) -> tuple[str, ...]:
-        if isinstance(value, (str, bytes)) or value is None:
-            raise ValueError("supply-chain argv must be a list of arguments")
-        arguments = tuple(str(item) for item in value)  # type: ignore[arg-type]
-        if not 1 <= len(arguments) <= 64:
-            raise ValueError("supply-chain argv must contain 1 through 64 arguments")
-        for argument in arguments:
-            if not argument or len(argument) > 2000 or "\x00" in argument:
-                raise ValueError(
-                    "supply-chain arguments must be non-empty, NUL-free, and at "
-                    "most 2000 characters"
-                )
-        if "{python}" in arguments[1:]:
-            raise ValueError("{python} is allowed only as the supply-chain executable")
-        executable = PurePosixPath(arguments[0].replace("\\", "/")).name.lower()
-        if executable.removesuffix(".exe") in {
-            "sh",
-            "bash",
-            "dash",
-            "zsh",
-            "ksh",
-            "fish",
-            "powershell",
-            "pwsh",
-            "cmd",
-        }:
-            raise ValueError("supply-chain commands must not invoke a shell")
-        return arguments
+        return _validate_command_argv(value, label="supply-chain", exe_label="supply-chain")
+
+
+class RuntimeVerificationCommand(BaseModel):
+    """One policy-named runtime verification check (MCPB-011).
+
+    A fixed argument vector for a check that must run against the project's
+    canonical checkout with host-runtime access (Docker daemon, loopback
+    networking, host-managed services, integration-test infrastructure). The
+    MCP caller selects only the ``id``; the executable, argv, environment,
+    working directory, and timeout are all defined here in trusted local policy
+    and can never be supplied by the caller. Executed directly with
+    ``asyncio.create_subprocess_exec`` (no shell). Separate from
+    ``VerificationCommand``, which runs against an isolated candidate worktree.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    argv: tuple[str, ...]
+    environment: dict[str, str] = Field(default_factory=dict)
+    execution_mode: Literal["host"] = "host"
+    timeout_seconds: int | None = Field(default=None, ge=1, le=3600)
+
+    @field_validator("argv", mode="before")
+    @classmethod
+    def validate_argv(cls, value: object) -> tuple[str, ...]:
+        return _validate_command_argv(
+            value, label="runtime verification", exe_label="runtime verification"
+        )
+
+    @field_validator("environment", mode="before")
+    @classmethod
+    def validate_environment(cls, value: object) -> dict[str, str]:
+        return _validate_env_mapping(value)
+
+
+def _capture_scope_path(value: str) -> str:
+    """Validate one include/protected-exclude path for the capture scope.
+
+    Mirrors ``_policy_path`` (non-empty, relative, no ``..``) but additionally
+    allows the recursive glob suffix ``**`` so a policy may declare
+    ``docs/**``. ``**`` is permitted only as a trailing full segment (``a/**``
+    or ``a/**/b`` is rejected; only ``a/**`` is accepted) to keep glob
+    semantics deterministic and one-dimensional.
+    """
+    normalized = value.replace("\\", "/").strip()
+    path = PurePosixPath(normalized)
+    if not normalized or path.is_absolute() or ".." in path.parts:
+        raise ValueError(
+            "capture scope paths must be non-empty relative paths without '..'"
+        )
+    parts = path.parts
+    for index, part in enumerate(parts):
+        if part == "**":
+            if index != len(parts) - 1:
+                raise ValueError("'**' is allowed only as the final path segment")
+        elif part in ("", "."):
+            raise ValueError("capture scope paths must not contain empty or '.' segments")
+    return path.as_posix()
+
+
+class WorkingTreeCaptureScope(BaseModel):
+    """The approved capture scope for one project (MCPB-012).
+
+    Pinned in trusted local policy (``projects.json``) so the MCP caller cannot
+    widen, narrow, or guess the include/protected-exclude set. When the
+    ``working_tree_candidate_capture`` capability is granted, the caller's
+    include/protected-exclude paths must equal these exactly (as sets); the
+    protected exclusions always override the inclusions.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    include_paths: tuple[str, ...]
+    protected_exclude_paths: tuple[str, ...] = ()
+
+    @field_validator("include_paths", "protected_exclude_paths", mode="before")
+    @classmethod
+    def validate_paths(cls, value: object) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if isinstance(value, (str, bytes)):
+            raise ValueError("capture scope paths must be a list of strings")
+        paths = tuple(_capture_scope_path(str(item)) for item in value)  # type: ignore[arg-type]
+        if len(paths) != len(set(paths)):
+            raise ValueError("capture scope paths must not contain duplicates")
+        return paths
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "WorkingTreeCaptureScope":
+        if not self.include_paths:
+            raise ValueError("working_tree_capture_scope requires a non-empty include_paths")
+        # A protected-exclude path that is also an include is allowed: the
+        # protected exclusion wins and removes it from the manifest. But two
+        # include paths must not overlap (one selecting a strict superset of the
+        # other), because that would make the captured manifest ambiguous.
+        return self
 
 
 class ProjectPolicy(BaseModel):
@@ -149,6 +313,8 @@ class ProjectPolicy(BaseModel):
     commit_roots: tuple[str, ...] = ()
     verification_commands: tuple[VerificationCommand, ...] = ()
     supply_chain_scans: tuple[SupplyChainCommand, ...] = ()
+    runtime_verification_commands: tuple[RuntimeVerificationCommand, ...] = ()
+    working_tree_capture_scope: WorkingTreeCaptureScope | None = None
     protected_paths: tuple[str, ...] = (".git", ".env")
     default_effort: Effort = "high"
     allow_ultracode: bool = True
@@ -271,12 +437,55 @@ class ProjectPolicy(BaseModel):
             and ProjectCapability.REPOSITORY_READ not in self.capabilities
         ):
             raise ValueError("canonical_history_read requires repository_read")
+        # MCPB-011: runtime verification needs repository_read for canonical
+        # git-state inspection, and a project opting in must configure at least
+        # one named check so the capability is never granted empty (a capability
+        # with nothing to select would be misleading authority).
+        if (
+            ProjectCapability.RUNTIME_VERIFICATION in self.capabilities
+            and ProjectCapability.REPOSITORY_READ not in self.capabilities
+        ):
+            raise ValueError("runtime_verification requires repository_read")
+        if (
+            ProjectCapability.RUNTIME_VERIFICATION in self.capabilities
+            and not self.runtime_verification_commands
+        ):
+            raise ValueError(
+                "runtime_verification requires at least one runtime verification "
+                "command"
+            )
+        # MCPB-012: working-tree candidate capture needs repository_read for
+        # read-only canonical working-tree inspection, and a project opting in
+        # must pin its approved include/protected-exclude scope in trusted
+        # policy so the MCP caller can never widen, narrow, or guess it (fail
+        # closed; a capability with no pinned scope would let the caller pick
+        # any paths, which is exactly the authority the threat model forbids).
+        if (
+            ProjectCapability.WORKING_TREE_CANDIDATE_CAPTURE in self.capabilities
+            and ProjectCapability.REPOSITORY_READ not in self.capabilities
+        ):
+            raise ValueError(
+                "working_tree_candidate_capture requires repository_read"
+            )
+        if (
+            ProjectCapability.WORKING_TREE_CANDIDATE_CAPTURE in self.capabilities
+            and self.working_tree_capture_scope is None
+        ):
+            raise ValueError(
+                "working_tree_candidate_capture requires a pinned "
+                "working_tree_capture_scope in policy"
+            )
         command_ids = [command.id for command in self.verification_commands]
         if len(command_ids) != len(set(command_ids)):
             raise ValueError("verification command IDs must be unique per project")
         scan_ids = [scan.id for scan in self.supply_chain_scans]
         if len(scan_ids) != len(set(scan_ids)):
             raise ValueError("supply-chain scan IDs must be unique per project")
+        runtime_ids = [command.id for command in self.runtime_verification_commands]
+        if len(runtime_ids) != len(set(runtime_ids)):
+            raise ValueError(
+                "runtime verification command IDs must be unique per project"
+            )
         return self
 
     def public_metadata(self) -> dict[str, object]:

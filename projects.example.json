@@ -39,7 +39,8 @@
         "verification_commit",
         "job_introspection",
         "policy_introspection",
-        "canonical_history_read"
+        "canonical_history_read",
+        "runtime_verification"
       ],
       "markdown_write_roots": [
         "docs"
@@ -72,9 +73,77 @@
           ]
         }
       ],
+      "runtime_verification_commands": [
+        {
+          "id": "integration-runtime",
+          "argv": [
+            "{python}",
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "tests"
+          ],
+          "execution_mode": "host",
+          "timeout_seconds": 600
+        }
+      ],
       "default_effort": "high",
       "allow_ultracode": true,
       "self_managed": true
+    },
+    {
+      "id": "research-workspace",
+      "display_name": "Research Workspace",
+      "description": "Example of working_tree_candidate_capture: capture approved dirty-tree doc changes while protecting local state files",
+      "root": "/home/example/research-workspace",
+      "enabled": false,
+      "require_git": true,
+      "capabilities": [
+        "repository_read",
+        "markdown_write",
+        "claude_edit",
+        "candidate_review",
+        "verification_commit",
+        "push_development_commit",
+        "working_tree_candidate_capture"
+      ],
+      "markdown_write_roots": [
+        "."
+      ],
+      "commit_roots": [
+        "."
+      ],
+      "verification_commands": [
+        {
+          "id": "git-diff-check",
+          "argv": [
+            "git",
+            "diff",
+            "--check",
+            "HEAD",
+            "--"
+          ]
+        }
+      ],
+      "protected_paths": [
+        ".git",
+        ".env"
+      ],
+      "working_tree_capture_scope": {
+        "include_paths": [
+          "AGENTS.md",
+          "docs/**"
+        ],
+        "protected_exclude_paths": [
+          ".reasonix/desktop-topic-auto-title-meta.json",
+          ".reasonix/desktop-topic-titles.json"
+        ]
+      },
+      "default_effort": "high",
+      "allow_ultracode": true,
+      "allow_bridge_reviewer": true,
+      "self_managed": false
     }
   ]
 }

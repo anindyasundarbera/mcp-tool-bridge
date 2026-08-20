@@ -95,6 +95,41 @@ def effective_policy_view(
             scan.model_dump(mode="json")
             for scan in sorted(project.supply_chain_scans, key=lambda s: s.id)
         ],
+        # MCPB-011: runtime verification commands are exposed sanitized — the
+        # check IDs, execution class, and (redacted) argv reveal the configured
+        # runtime-check surface, but environment values are always replaced
+        # with "<redacted>" so no secret, token, or host path leaks via
+        # introspection. Keys stay visible so a caller can see which env vars a
+        # check consumes without learning their values.
+        "runtime_verification_commands": [
+            {
+                "id": command.id,
+                "execution_mode": command.execution_mode,
+                "argv": list(command.argv),
+                "has_environment": bool(command.environment),
+                "environment": {
+                    key: "<redacted>" for key in sorted(command.environment)
+                },
+                "timeout_seconds": command.timeout_seconds,
+            }
+            for command in sorted(
+                project.runtime_verification_commands, key=lambda c: c.id
+            )
+        ],
+        # MCPB-012: the approved working-tree capture scope is exposed so an
+        # orchestrator can echo the exact approved include/protected-exclude
+        # paths back into the capture tools. The scope is pinned in trusted
+        # local policy and is the only set the capture tools will accept.
+        "working_tree_capture_scope": (
+            {
+                "include_paths": sorted(project.working_tree_capture_scope.include_paths),
+                "protected_exclude_paths": sorted(
+                    project.working_tree_capture_scope.protected_exclude_paths
+                ),
+            }
+            if project.working_tree_capture_scope is not None
+            else None
+        ),
         "default_effort": project.default_effort,
         "allow_ultracode": project.allow_ultracode,
         "self_managed": project.self_managed,

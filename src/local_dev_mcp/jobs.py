@@ -858,6 +858,77 @@ class DevelopmentJobManager:
             )
         return job
 
+    def new_job_id(self) -> str:
+        """Allocate a unique job ID without starting a Claude run (MCPB-012).
+
+        Working-tree candidate capture needs a job ID before the worktree is
+        created (the worktree path is derived from it) and before a job record
+        exists, so the capture manager allocates the ID here and later hands it
+        to ``register_captured_candidate``. Thread-safe against the in-memory
+        and durable stores via the same uniqueness check ``_new_job_id`` uses.
+        """
+        return self._new_job_id()
+
+    async def register_captured_candidate(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        worktree: JobWorktree,
+        candidate: dict[str, Any],
+        *,
+        effort: Effort = "high",
+    ) -> DevelopmentJob:
+        """Register a retained candidate captured from a dirty working tree.
+
+        MCPB-012: creates a development job directly in the ``COMPLETED``,
+        inactive, uncommitted state — never running Claude — so the existing
+        ``verification_worktree`` / ``committed_candidate`` / review / verify /
+        commit / publish gates accept it unchanged. The capture manager owns
+        worktree creation and overlay; this method only durably registers the
+        result (job row, progress sidecar, audit events, authority record) so
+        the captured candidate is restart-safe and indistinguishable from a
+        Claude-produced candidate at the gate boundary.
+        """
+        validate_effort(project, effort)
+        async with self._state_lock:
+            if job_id in self._jobs or store.job_id_exists(self._db, job_id):
+                raise DevelopmentJobError("captured job id already exists")
+            job = DevelopmentJob(
+                job_id=job_id,
+                project_id=project.id,
+                effort=effort,
+                status=JobStatus.COMPLETED,
+                worktree=worktree,
+                candidate=candidate,
+            )
+            self._jobs[job.job_id] = job
+            self._persist_progress(job)
+            self._record_event(
+                job,
+                "created",
+                {"capture": True, "base_head": worktree.base_head},
+                authority={
+                    "actor": "ChatGPT",
+                    "authority_source": "chatgpt_confirmation",
+                    "scope": "working_tree_capture",
+                    "classification": "observed",
+                    "detail": {"base_head": worktree.base_head},
+                },
+            )
+            self._record_event(
+                job,
+                "terminal",
+                {"status": "completed", "capture": True},
+                authority={
+                    "actor": "bridge",
+                    "authority_source": "bridge_internal",
+                    "scope": "terminal_transition",
+                    "classification": "observed",
+                },
+            )
+            self._persist_job(job)
+            return job
+
     async def start(
         self,
         project: ProjectPolicy,

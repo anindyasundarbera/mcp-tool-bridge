@@ -69,6 +69,10 @@ class Settings:
     verification_command_timeout_seconds: int
     max_verification_output_bytes: int
     max_commit_message_chars: int
+    runtime_verification_command_timeout_seconds: int
+    max_runtime_verification_output_bytes: int
+    max_working_tree_capture_manifest_paths: int
+    max_working_tree_capture_file_bytes: int
     verification_deterministic_repetitions: int
     claude_soft_turns: int
     claude_extension_turns: int
@@ -150,6 +154,18 @@ class Settings:
             ),
             max_commit_message_chars=_positive_int(
                 env, "MAX_COMMIT_MESSAGE_CHARS", 500
+            ),
+            runtime_verification_command_timeout_seconds=_positive_int(
+                env, "RUNTIME_VERIFICATION_COMMAND_TIMEOUT_SECONDS", 1200
+            ),
+            max_runtime_verification_output_bytes=_positive_int(
+                env, "MAX_RUNTIME_VERIFICATION_OUTPUT_BYTES", 1048576
+            ),
+            max_working_tree_capture_manifest_paths=_positive_int(
+                env, "MAX_WORKING_TREE_CAPTURE_MANIFEST_PATHS", 500
+            ),
+            max_working_tree_capture_file_bytes=_positive_int(
+                env, "MAX_WORKING_TREE_CAPTURE_FILE_BYTES", 10485760
             ),
             verification_deterministic_repetitions=_positive_int(
                 env, "VERIFICATION_DETERMINISTIC_REPETITIONS", 1

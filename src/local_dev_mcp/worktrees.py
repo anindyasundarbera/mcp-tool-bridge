@@ -385,6 +385,117 @@ class GitWorktreeManager:
                 except (GitCommandError, OSError):
                     pass
 
+    async def create_detached_at_head(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        base_head: str,
+    ) -> JobWorktree:
+        """Create a detached worktree at an exact ``base_head`` (MCPB-012).
+
+        Unlike ``create``, this does NOT require the canonical checkout to be
+        clean: the whole purpose of working-tree candidate capture is to read a
+        dirty checkout. Only read-only git is run against the source checkout
+        (``rev-parse`` and ``worktree add --detach``); the source working tree,
+        index, refs, and configuration are never staged, reset, restored,
+        checked out, cleaned, or written. The new worktree is pinned to
+        ``base_head`` (the exact canonical HEAD the caller bound the capture to)
+        and must come up clean at that commit.
+        """
+        root = self._root_for(project)
+        project_directory = _ensure_private_directory(root / project.id)
+
+        path = project_directory / job_id
+        if path.exists() or path.is_symlink():
+            raise WorktreeError("job worktree path already exists")
+
+        timeout = self.settings.git_command_timeout_seconds
+        local_head = await run_git(
+            project.root,
+            "rev-parse",
+            "--verify",
+            "HEAD",
+            timeout_seconds=timeout,
+        )
+        if local_head.lower() != base_head.lower():
+            raise WorktreeError(
+                f"canonical HEAD {local_head[:12]} does not match the bound "
+                f"base_head {base_head[:12]}"
+            )
+
+        created = False
+        completed = False
+        try:
+            await run_git(
+                project.root,
+                "worktree",
+                "add",
+                "--detach",
+                "--",
+                str(path),
+                base_head,
+                timeout_seconds=timeout,
+            )
+            created = True
+
+            after_head = await run_git(
+                project.root,
+                "rev-parse",
+                "--verify",
+                "HEAD",
+                timeout_seconds=timeout,
+            )
+            if after_head.lower() != local_head.lower():
+                raise WorktreeError(
+                    "canonical HEAD moved during worktree creation"
+                )
+
+            resolved = path.resolve(strict=True)
+            if resolved.parent != project_directory.resolve(strict=True):
+                raise WorktreeError("job worktree escaped the configured worktree root")
+            worktree_root = await run_git(
+                resolved,
+                "rev-parse",
+                "--show-toplevel",
+                timeout_seconds=timeout,
+            )
+            worktree_head = await run_git(
+                resolved,
+                "rev-parse",
+                "--verify",
+                "HEAD",
+                timeout_seconds=timeout,
+            )
+            worktree_status = await run_git(
+                resolved,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                timeout_seconds=timeout,
+            )
+            if Path(worktree_root).resolve(strict=True) != resolved:
+                raise WorktreeError("created job path is not a Git worktree root")
+            if worktree_head.lower() != base_head.lower() or worktree_status:
+                raise WorktreeError("created job worktree has an invalid baseline")
+            completed = True
+            return JobWorktree(path=resolved, base_head=base_head.lower())
+        except (GitCommandError, OSError) as exc:
+            raise WorktreeError(str(exc)) from exc
+        finally:
+            if created and not completed:
+                try:
+                    await run_git(
+                        project.root,
+                        "worktree",
+                        "remove",
+                        "--force",
+                        "--",
+                        str(path),
+                        timeout_seconds=timeout,
+                    )
+                except (GitCommandError, OSError):
+                    pass
+
     async def validate_resume(
         self,
         project: ProjectPolicy,

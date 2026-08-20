@@ -191,6 +191,40 @@ CREATE TABLE IF NOT EXISTS supply_chain_scans (
     scanned_at TEXT NOT NULL,
     detail_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS runtime_verifications (
+    runtime_verification_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    check_id TEXT NOT NULL,
+    expected_head TEXT NOT NULL,
+    verified_head TEXT NOT NULL,
+    status TEXT NOT NULL,
+    exit_code INTEGER,
+    started_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    stdout_json TEXT NOT NULL,
+    stderr_json TEXT NOT NULL,
+    stdout_hash TEXT NOT NULL,
+    stderr_hash TEXT NOT NULL,
+    policy_fingerprint TEXT NOT NULL,
+    evidence_fingerprint TEXT NOT NULL,
+    repository_json TEXT NOT NULL,
+    verified_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS working_tree_captures (
+    capture_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    base_head TEXT NOT NULL,
+    working_tree_fingerprint TEXT NOT NULL,
+    candidate_fingerprint TEXT NOT NULL,
+    include_paths_json TEXT NOT NULL,
+    protected_exclude_paths_json TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    protected_exclude_manifest_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error TEXT,
+    captured_at TEXT NOT NULL
+);
 """
 
 _UPSERT_JOB = """
@@ -998,3 +1032,118 @@ def mark_authorization_used(
             (authorization_id,),
         )
         return cursor.rowcount > 0
+
+
+_INSERT_RUNTIME_VERIFICATION = """
+INSERT INTO runtime_verifications (
+    runtime_verification_id, project_id, check_id, expected_head, verified_head,
+    status, exit_code, started_at, completed_at, stdout_json, stderr_json,
+    stdout_hash, stderr_hash, policy_fingerprint, evidence_fingerprint,
+    repository_json, verified_at
+) VALUES (
+    :runtime_verification_id, :project_id, :check_id, :expected_head,
+    :verified_head, :status, :exit_code, :started_at, :completed_at,
+    :stdout_json, :stderr_json, :stdout_hash, :stderr_hash, :policy_fingerprint,
+    :evidence_fingerprint, :repository_json, :verified_at
+)
+"""
+
+
+def insert_runtime_verification_row(
+    connection: sqlite3.Connection, row: dict[str, Any]
+) -> None:
+    """Append one runtime-verification evidence row as a single ACID transaction.
+
+    MCPB-011: an append-only audit ledger keyed by ``runtime_verification_id``
+    (the ``rtv_``-prefixed namespace, never the candidate ``verification_id``
+    namespace). Both PASS and bounded FAIL records are persisted so an
+    orchestrator or operator can audit every runtime check; only bounded,
+    redacted data is stored. No single-use bound: a check may run many times
+    over a project's lifetime, mirroring the append-only ``syncs`` audit table.
+    """
+    with connection:
+        connection.execute(_INSERT_RUNTIME_VERIFICATION, row)
+
+
+def load_runtime_verification_rows(
+    connection: sqlite3.Connection,
+    project_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return persisted runtime-verification rows as dicts, oldest first.
+
+    Optionally filtered by ``project_id``. Read-only accessor for inspection;
+    the ``runtime_verifications`` table is append-only.
+    """
+    if project_id is None:
+        return [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM runtime_verifications ORDER BY verified_at ASC, "
+                "runtime_verification_id ASC"
+            ).fetchall()
+        ]
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM runtime_verifications WHERE project_id = ? "
+            "ORDER BY verified_at ASC, runtime_verification_id ASC",
+            (project_id,),
+        ).fetchall()
+    ]
+
+
+_INSERT_WORKING_TREE_CAPTURE = """
+INSERT INTO working_tree_captures (
+    capture_id, project_id, job_id, base_head, working_tree_fingerprint,
+    candidate_fingerprint, include_paths_json, protected_exclude_paths_json,
+    manifest_json, protected_exclude_manifest_json, status, error, captured_at
+) VALUES (
+    :capture_id, :project_id, :job_id, :base_head, :working_tree_fingerprint,
+    :candidate_fingerprint, :include_paths_json, :protected_exclude_paths_json,
+    :manifest_json, :protected_exclude_manifest_json, :status, :error,
+    :captured_at
+)
+"""
+
+
+def insert_working_tree_capture_row(
+    connection: sqlite3.Connection, row: dict[str, Any]
+) -> None:
+    """Append one working-tree capture evidence row as a single ACID transaction.
+
+    MCPB-012: an append-only audit ledger keyed by ``capture_id`` (equal to the
+    retained job's ``job_id`` for successful captures; a random id with an empty
+    ``job_id`` for rejected attempts). Both successful and rejected captures are
+    persisted so an orchestrator or operator can audit every capture attempt and
+    its race/provenance outcome; only successful captures bind a usable job.
+    Mirrors the append-only ``runtime_verifications`` audit table.
+    """
+    with connection:
+        connection.execute(_INSERT_WORKING_TREE_CAPTURE, row)
+
+
+def load_working_tree_capture_rows(
+    connection: sqlite3.Connection,
+    project_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return persisted working-tree capture rows as dicts, oldest first.
+
+    Optionally filtered by ``project_id``. Read-only accessor for inspection;
+    the ``working_tree_captures`` table is append-only.
+    """
+    if project_id is None:
+        return [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM working_tree_captures "
+                "ORDER BY captured_at ASC, capture_id ASC"
+            ).fetchall()
+        ]
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM working_tree_captures WHERE project_id = ? "
+            "ORDER BY captured_at ASC, capture_id ASC",
+            (project_id,),
+        ).fetchall()
+    ]

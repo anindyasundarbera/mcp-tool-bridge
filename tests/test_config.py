@@ -193,5 +193,216 @@ class CandidateReviewPolicyTests(unittest.TestCase):
         )
 
 
+def _runtime_command(**overrides: object) -> dict[str, object]:
+    command: dict[str, object] = {"id": "integration", "argv": ["{python}", "-c", "1"]}
+    command.update(overrides)
+    return command
+
+
+class RuntimeVerificationPolicyTests(unittest.TestCase):
+    def test_runtime_verification_without_repository_read_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError, "runtime_verification requires repository_read"
+        ):
+            _policy(
+                capabilities=["runtime_verification"],
+                runtime_verification_commands=[_runtime_command()],
+            )
+
+    def test_runtime_verification_without_commands_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError,
+            "runtime_verification requires at least one runtime verification command",
+        ):
+            _policy(capabilities=["repository_read", "runtime_verification"])
+
+    def test_runtime_verification_with_repository_read_and_command_is_accepted(
+        self,
+    ) -> None:
+        policy = _policy(
+            capabilities=["repository_read", "runtime_verification"],
+            runtime_verification_commands=[_runtime_command()],
+        )
+        self.assertIn(
+            "runtime_verification", {c.value for c in policy.capabilities}
+        )
+        self.assertEqual(len(policy.runtime_verification_commands), 1)
+
+    def test_duplicate_runtime_verification_command_ids_are_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError,
+            "runtime verification command IDs must be unique per project",
+        ):
+            _policy(
+                capabilities=["repository_read", "runtime_verification"],
+                runtime_verification_commands=[
+                    _runtime_command(),
+                    _runtime_command(),
+                ],
+            )
+
+    def test_runtime_verification_shell_argv_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError, "runtime verification commands must not invoke a shell"
+        ):
+            _policy(
+                capabilities=["repository_read", "runtime_verification"],
+                runtime_verification_commands=[
+                    {"id": "sh", "argv": ["bash", "-c", "true"]},
+                ],
+            )
+
+    def test_runtime_verification_forbidden_env_key_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError,
+            "environment key 'LD_PRELOAD' is forbidden",
+        ):
+            _policy(
+                capabilities=["repository_read", "runtime_verification"],
+                runtime_verification_commands=[
+                    {
+                        "id": "env",
+                        "argv": ["{python}", "-c", "1"],
+                        "environment": {"LD_PRELOAD": "/x/lib.so"},
+                    },
+                ],
+            )
+
+    def test_runtime_verification_bad_env_key_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError, "environment keys must be uppercase"
+        ):
+            _policy(
+                capabilities=["repository_read", "runtime_verification"],
+                runtime_verification_commands=[
+                    {
+                        "id": "env",
+                        "argv": ["{python}", "-c", "1"],
+                        "environment": {"lower-key": "value"},
+                    },
+                ],
+            )
+
+    def test_runtime_verification_invalid_execution_mode_is_rejected(self) -> None:
+        with self.assertRaises(ValidationError):
+            _policy(
+                capabilities=["repository_read", "runtime_verification"],
+                runtime_verification_commands=[
+                    {"id": "x", "argv": ["{python}", "-c", "1"], "execution_mode": "container"},
+                ],
+            )
+
+    def test_runtime_verification_empty_argv_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError, "runtime verification argv must contain 1 through 64 arguments"
+        ):
+            _policy(
+                capabilities=["repository_read", "runtime_verification"],
+                runtime_verification_commands=[{"id": "x", "argv": []}],
+            )
+
+
+def _capture_scope(**overrides: object) -> dict[str, object]:
+    scope: dict[str, object] = {
+        "include_paths": ["AGENTS.md", "docs/**"],
+        "protected_exclude_paths": [".reasonix/a.json"],
+    }
+    scope.update(overrides)
+    return scope
+
+
+class WorkingTreeCapturePolicyTests(unittest.TestCase):
+    def test_capture_without_repository_read_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError,
+            "working_tree_candidate_capture requires repository_read",
+        ):
+            _policy(
+                capabilities=["claude_edit", "working_tree_candidate_capture"],
+                working_tree_capture_scope=_capture_scope(),
+            )
+
+    def test_capture_without_pinned_scope_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError,
+            "working_tree_candidate_capture requires a pinned working_tree_capture_scope",
+        ):
+            _policy(
+                capabilities=["repository_read", "working_tree_candidate_capture"],
+            )
+
+    def test_capture_with_repository_read_and_scope_is_accepted(self) -> None:
+        policy = _policy(
+            capabilities=["repository_read", "working_tree_candidate_capture"],
+            commit_roots=["."],
+            working_tree_capture_scope=_capture_scope(),
+        )
+        self.assertIn(
+            "working_tree_candidate_capture",
+            {c.value for c in policy.capabilities},
+        )
+        assert policy.working_tree_capture_scope is not None
+        self.assertEqual(
+            policy.working_tree_capture_scope.include_paths,
+            ("AGENTS.md", "docs/**"),
+        )
+
+    def test_scope_requires_non_empty_include_paths(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError,
+            "working_tree_capture_scope requires a non-empty include_paths",
+        ):
+            _policy(
+                capabilities=["repository_read", "working_tree_candidate_capture"],
+                working_tree_capture_scope=_capture_scope(include_paths=[]),
+            )
+
+    def test_scope_rejects_absolute_and_traversal_paths(self) -> None:
+        for bad in ("/etc/passwd", "../escape", "a/../b", "docs/../secret.md"):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(
+                    ValidationError,
+                    "capture scope paths must be non-empty relative paths without '..'",
+                ):
+                    _policy(
+                        capabilities=[
+                            "repository_read",
+                            "working_tree_candidate_capture",
+                        ],
+                        working_tree_capture_scope=_capture_scope(
+                            include_paths=[bad]
+                        ),
+                    )
+
+    def test_scope_rejects_glob_not_in_final_segment(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError, "'\\*\\*' is allowed only as the final path segment"
+        ):
+            _policy(
+                capabilities=["repository_read", "working_tree_candidate_capture"],
+                working_tree_capture_scope=_capture_scope(
+                    include_paths=["docs/**/x.md"]
+                ),
+            )
+
+    def test_scope_rejects_duplicate_paths(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError, "capture scope paths must not contain duplicates"
+        ):
+            _policy(
+                capabilities=["repository_read", "working_tree_candidate_capture"],
+                working_tree_capture_scope=_capture_scope(
+                    include_paths=["AGENTS.md", "AGENTS.md"]
+                ),
+            )
+
+    def test_scope_rejects_string_paths_value(self) -> None:
+        with self.assertRaises(ValidationError):
+            _policy(
+                capabilities=["repository_read", "working_tree_candidate_capture"],
+                working_tree_capture_scope=_capture_scope(include_paths="AGENTS.md"),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

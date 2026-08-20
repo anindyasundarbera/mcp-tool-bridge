@@ -45,7 +45,7 @@ class ServerSchemaTests(unittest.TestCase):
             )
             tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
 
-        self.assertEqual(len(tools), 28)
+        self.assertEqual(len(tools), 31)
         reader_tools = {
             "list_project_markdown",
             "search_project_markdown",
@@ -59,6 +59,20 @@ class ServerSchemaTests(unittest.TestCase):
             self.assertTrue(tools[name].annotations.readOnlyHint)
             self.assertFalse(tools[name].annotations.destructiveHint)
             self.assertFalse(tools[name].annotations.openWorldHint)
+        # MCPB-012: working-tree capture adds exactly two tools. Preflight is
+        # read-only; capture is a non-destructive candidate-producing action.
+        capture_tools = {
+            "preflight_working_tree_capture",
+            "working_tree_candidate_capture",
+        }
+        self.assertTrue(capture_tools.issubset(tools))
+        self.assertTrue(tools["preflight_working_tree_capture"].annotations.readOnlyHint)
+        self.assertFalse(
+            tools["preflight_working_tree_capture"].annotations.destructiveHint
+        )
+        self.assertFalse(
+            tools["working_tree_candidate_capture"].annotations.destructiveHint
+        )
 
         range_schema = tools["read_project_file_range"].parameters
         self.assertEqual(range_schema["properties"]["start_line"]["minimum"], 1)
@@ -231,6 +245,33 @@ class ServerSchemaTests(unittest.TestCase):
             resolve_schema["properties"]["commit_sha"]["pattern"],
             r"^[0-9a-fA-F]{40}$",
         )
+
+        # MCPB-011: run_runtime_verification executes a host process (not
+        # read-only) but is evidence-only (no Git mutation, so not destructive),
+        # and is open-world (host runtime). Its schema must expose exactly the
+        # three caller-visible parameters and nothing that could smuggle a
+        # command, argv, environment, working directory, or timeout.
+        runtime = tools["run_runtime_verification"]
+        self.assertFalse(runtime.annotations.readOnlyHint)
+        self.assertFalse(runtime.annotations.destructiveHint)
+        self.assertFalse(runtime.annotations.idempotentHint)
+        self.assertTrue(runtime.annotations.openWorldHint)
+        runtime_schema = runtime.parameters
+        self.assertEqual(
+            set(runtime_schema["properties"]),
+            {"project_id", "check_id", "expected_head"},
+        )
+        self.assertEqual(
+            runtime_schema["properties"]["check_id"]["pattern"],
+            r"^[a-z][a-z0-9_-]{0,63}$",
+        )
+        self.assertEqual(
+            runtime_schema["properties"]["expected_head"]["pattern"],
+            r"^[0-9a-f]{40}$",
+        )
+        for forbidden in ("command", "argv", "env", "environment", "cwd",
+                          "timeout", "executable", "shell", "path", "paths"):
+            self.assertNotIn(forbidden, runtime_schema["properties"])
 
     def test_writer_and_development_jobs_share_the_project_modifying_lock(self) -> None:
         class BlockingWriter:

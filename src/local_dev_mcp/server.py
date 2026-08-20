@@ -20,6 +20,14 @@ from .review import ReviewError, ReviewManager
 from .writer import RepositoryWriter, WriteMode
 from .verification import PublicationManager, VerificationCommitManager
 from .sync import SyncError, SyncManager
+from .runtime_verification import (
+    RuntimeVerificationError,
+    RuntimeVerificationManager,
+)
+from .working_tree_capture import (
+    WorkingTreeCaptureError,
+    WorkingTreeCaptureManager,
+)
 
 
 def create_server(
@@ -37,6 +45,8 @@ def create_server(
     evidence: EvidenceBundleManager | None = None,
     pr: PullRequestManager | None = None,
     canonicalization: CanonicalizationResolver | None = None,
+    runtime: RuntimeVerificationManager | None = None,
+    capture: WorkingTreeCaptureManager | None = None,
 ) -> FastMCP:
     active_settings = settings or Settings.from_env()
     active_registry = registry or ProjectRegistry.load(
@@ -95,6 +105,17 @@ def create_server(
         active_jobs,
         active_pr,
         active_sync,
+        projects=active_registry.projects(),
+    )
+    active_runtime = runtime or RuntimeVerificationManager(
+        active_settings,
+        active_locks,
+        projects=active_registry.projects(),
+    )
+    active_capture = capture or WorkingTreeCaptureManager(
+        active_settings,
+        active_locks,
+        active_jobs,
         projects=active_registry.projects(),
     )
 
@@ -1327,6 +1348,244 @@ def create_server(
             project_id, ProjectCapability.CANONICAL_HISTORY_READ
         )
         return await active_canonicalization.resolve(project, commit_sha)
+
+    @mcp.tool(
+        name="run_runtime_verification",
+        description=(
+            "Run one named, policy-authorized runtime verification check against "
+            "the project's clean canonical checkout at an exact expected HEAD and "
+            "return content-addressed PASS/FAIL evidence. The caller supplies only "
+            "the project ID, the check ID (selecting a check defined in trusted local "
+            "policy), and the expected 40-hex HEAD; the executable, argv, environment, "
+            "working directory, and timeout are all fixed in local policy and can "
+            "never be supplied by the caller. No shell is involved. A successful "
+            "check produces evidence only — it never stages, commits, pushes, merges, "
+            "tags, opens a PR, moves a ref, or grants commit authority. Opt-in via "
+            "the runtime_verification project capability (which requires "
+            "repository_read)."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=True,
+        ),
+    )
+    async def run_runtime_verification(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        check_id: Annotated[
+            str,
+            Field(
+                description=(
+                    "ID of a runtime verification check configured in the project's "
+                    "policy. Used only as a lookup key; never executed."
+                ),
+                pattern=r"^[a-z][a-z0-9_-]{0,63}$",
+            ),
+        ],
+        expected_head: Annotated[
+            str,
+            Field(
+                description=(
+                    "Exact lowercase 40-hex HEAD the canonical checkout must be at; "
+                    "obtain it from get_project_status."
+                ),
+                pattern=r"^[0-9a-f]{40}$",
+            ),
+        ],
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.RUNTIME_VERIFICATION
+        )
+        try:
+            return await active_runtime.run(project, check_id, expected_head)
+        except RuntimeVerificationError as exc:
+            raise ValueError(str(exc)) from exc
+
+    @mcp.tool(
+        name="preflight_working_tree_capture",
+        description=(
+            "Read-only preflight for working_tree_candidate_capture. Binds the "
+            "exact canonical HEAD, resolves the approved capture scope against the "
+            "current dirty working tree, and returns the ordered manifest, the "
+            "protected-exclusion manifest, and a content-addressed working-tree "
+            "fingerprint — without creating a worktree or retaining any candidate. "
+            "The caller must supply include_paths and protected_exclude_paths that "
+            "exactly equal (as sets) the scope pinned in trusted local policy "
+            "(exposed by get_effective_project_policy under working_tree_capture_scope); "
+            "the caller cannot widen, narrow, or guess the scope. Echo the returned "
+            "base_head and working_tree_fingerprint into working_tree_candidate_capture "
+            "so the capture can prove it acted on this exact state. The canonical "
+            "checkout is never modified. Opt-in via the working_tree_candidate_capture "
+            "project capability (which requires repository_read)."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
+    async def preflight_working_tree_capture(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        include_paths: Annotated[
+            list[str],
+            Field(
+                description=(
+                    "Explicit include path list. Must equal the policy-pinned "
+                    "working_tree_capture_scope.include_paths as a set. A bare path "
+                    "matches that exact file; a trailing 'dir/**' matches everything "
+                    "beneath dir/."
+                ),
+            ),
+        ],
+        protected_exclude_paths: Annotated[
+            list[str],
+            Field(
+                description=(
+                    "Explicit protected-exclude path list. Must equal the "
+                    "policy-pinned working_tree_capture_scope.protected_exclude_paths "
+                    "as a set (may be empty). These paths are never captured and are "
+                    "fingerprinted for drift detection."
+                ),
+            ),
+        ],
+        expected_base_head: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional exact lowercase 40-hex HEAD the canonical checkout "
+                    "must be at; when given the preflight fails if HEAD differs."
+                ),
+                pattern=r"^[0-9a-f]{40}$",
+            ),
+        ] = None,
+        expected_working_tree_fingerprint: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional 64-hex working-tree fingerprint from a prior preflight; "
+                    "when given the preflight reports whether the current state matches."
+                ),
+                pattern=r"^[0-9a-f]{64}$",
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.WORKING_TREE_CANDIDATE_CAPTURE
+        )
+        try:
+            return await active_capture.preflight(
+                project,
+                include_paths,
+                protected_exclude_paths,
+                expected_base_head=expected_base_head,
+                expected_working_tree_fingerprint=expected_working_tree_fingerprint,
+            )
+        except WorkingTreeCaptureError as exc:
+            raise ValueError(str(exc)) from exc
+
+    @mcp.tool(
+        name="working_tree_candidate_capture",
+        description=(
+            "Capture an approved set of uncommitted working-tree changes from the "
+            "project's dirty canonical checkout into a retained BridgeLab candidate "
+            "WITHOUT modifying the canonical checkout. The capture is read-only "
+            "against the source: it never stages, resets, restores, checks out, "
+            "cleans, or writes any canonical file, and never alters the index, Git "
+            "configuration, remotes, branches, or .reasonix content. The caller must "
+            "supply include_paths and protected_exclude_paths that exactly equal (as "
+            "sets) the scope pinned in trusted local policy; protected exclusions "
+            "always override inclusions and never appear in the candidate. A detached "
+            "candidate worktree is created at the exact bound HEAD and overlaid with "
+            "only the selected, fingerprinted changes; the source working-tree "
+            "fingerprint is recomputed before success and any drift (HEAD moved, a "
+            "selected or protected-excluded file changed) fails the capture and leaves "
+            "no usable candidate. The retained candidate is a normal governed candidate "
+            "eligible for verify_development_job, candidate_review, "
+            "verification_commit, and push_development_commit. Opt-in via the "
+            "working_tree_candidate_capture project capability (which requires "
+            "repository_read)."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=False,
+        ),
+    )
+    async def working_tree_candidate_capture(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        include_paths: Annotated[
+            list[str],
+            Field(
+                description=(
+                    "Explicit include path list. Must equal the policy-pinned "
+                    "working_tree_capture_scope.include_paths as a set."
+                ),
+            ),
+        ],
+        protected_exclude_paths: Annotated[
+            list[str],
+            Field(
+                description=(
+                    "Explicit protected-exclude path list. Must equal the "
+                    "policy-pinned working_tree_capture_scope.protected_exclude_paths "
+                    "as a set (may be empty)."
+                ),
+            ),
+        ],
+        expected_base_head: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Exact lowercase 40-hex HEAD from a prior preflight; the capture "
+                    "fails if the canonical checkout is not at this HEAD."
+                ),
+                pattern=r"^[0-9a-f]{40}$",
+            ),
+        ] = None,
+        expected_working_tree_fingerprint: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "64-hex working-tree fingerprint from a prior preflight; the "
+                    "capture fails if the working tree changed since preflight."
+                ),
+                pattern=r"^[0-9a-f]{64}$",
+            ),
+        ] = None,
+        effort: Annotated[
+            str,
+            Field(
+                description="Claude effort level recorded on the retained job.",
+                pattern=r"^(high|ultracode)$",
+            ),
+        ] = "high",
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.WORKING_TREE_CANDIDATE_CAPTURE
+        )
+        try:
+            return await active_capture.capture(
+                project,
+                include_paths,
+                protected_exclude_paths,
+                expected_base_head=expected_base_head,
+                expected_working_tree_fingerprint=expected_working_tree_fingerprint,
+                effort=effort,
+            )
+        except WorkingTreeCaptureError as exc:
+            raise ValueError(str(exc)) from exc
 
     return mcp
 
