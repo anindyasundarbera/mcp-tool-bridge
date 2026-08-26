@@ -90,6 +90,41 @@ def _record_json_loads(value: str | None) -> Any:
         return None
 
 
+def compute_verdict_hash(
+    verdict: dict[str, Any],
+    base_head: str,
+    diff_fingerprint: str,
+    paths: tuple[str, ...] | list[str],
+) -> str:
+    """M-EV-04: content-address a review with a stable, deterministic hash.
+
+    The hash is a 64-hex SHA-256 over a canonical JSON envelope of:
+
+    * ``verdict`` — the structured verdict dict (re-serialized with
+      ``sort_keys=True`` so key order never affects the hash);
+    * ``base_head`` — the reviewed base HEAD;
+    * ``diff_fingerprint`` — the candidate diff fingerprint;
+    * ``paths`` — the candidate changed-path list, sorted lexicographically so
+      a re-ordered path set (verification re-derives the set independently of
+      order) hashes identically.
+
+    The canonicalization is deterministic (``sort_keys=True``,
+    ``ensure_ascii=False``) and bounded by ``MAX_REVIEW_VERDICT_CHARS`` (the
+    verdict is already validated/bounded upstream). The hash changes when the
+    verdict text changes or when any binding field (``base_head``,
+    ``diff_fingerprint``, the sorted ``paths`` set) changes — so an
+    orchestrator can detect drift without re-reading the verdict.
+    """
+    envelope = {
+        "verdict": verdict,
+        "base_head": base_head,
+        "diff_fingerprint": diff_fingerprint,
+        "paths": sorted(paths),
+    }
+    canonical = json.dumps(envelope, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 @dataclass(slots=True)
 class ReviewRecord:
     review_id: str
@@ -115,6 +150,12 @@ class ReviewRecord:
     toolchain_digest: str | None = None
     expires_at: str | None = None
     authority_ref: str | None = None
+    # M-EV-04: content-addressing hash, persisted in the ``review_content``
+    # sidecar. ``verdict_hash`` is a 64-hex SHA-256 over a deterministic
+    # canonicalization of the verdict text + the binding fields (``base_head``,
+    # ``diff_fingerprint``, the sorted ``paths`` list). NULL until the review is
+    # persisted; re-loaded from the sidecar on restart.
+    verdict_hash: str | None = None
 
 
 def review_to_row(record: ReviewRecord) -> dict[str, Any]:
@@ -140,12 +181,16 @@ def review_from_row(
     toolchain_digest: str | None = None,
     expires_at: str | None = None,
     authority_ref: str | None = None,
+    verdict_hash: str | None = None,
 ) -> ReviewRecord | None:
     """Rebuild a review record from a dict row, or None if unparseable.
 
     M-EV-03: the optional binding fields come from the ``review_bindings``
     sidecar (loaded separately by the caller) so the record carries its
     evidence-binding envelope without the ``reviews`` table being altered.
+
+    M-EV-04: ``verdict_hash`` comes from the ``review_content`` sidecar (loaded
+    separately by the caller) so the record carries its content-addressing hash.
     """
     paths = _record_json_loads(row.get("paths_json"))
     verdict = _record_json_loads(row.get("verdict_json"))
@@ -167,6 +212,7 @@ def review_from_row(
             toolchain_digest=toolchain_digest,
             expires_at=expires_at,
             authority_ref=authority_ref,
+            verdict_hash=verdict_hash,
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -381,13 +427,20 @@ class ReviewManager:
         M-EV-03: also loads the ``review_bindings`` sidecar so each
         re-hydrated record carries its ``reviewer_independence_class``,
         ``toolchain_digest``, ``expires_at``, and ``authority_ref`` envelope.
+
+        M-EV-04: also loads the ``review_content`` sidecar so each re-hydrated
+        record carries its ``verdict_hash`` (content-addressing hash).
         """
         bindings = {
             row["review_id"]: row for row in store.load_review_binding_rows(self._db)
         }
+        contents = {
+            row["review_id"]: row for row in store.load_review_content_rows(self._db)
+        }
         for row in store.load_review_rows(self._db):
             review_id = row["review_id"]
             binding = bindings.get(review_id)
+            content = contents.get(review_id)
             record = review_from_row(
                 row,
                 reviewer_independence_class=(
@@ -396,6 +449,9 @@ class ReviewManager:
                 toolchain_digest=binding.get("toolchain_digest") if binding else None,
                 expires_at=binding.get("expires_at") if binding else None,
                 authority_ref=binding.get("authority_ref") if binding else None,
+                verdict_hash=(
+                    content.get("verdict_hash") if content else None
+                ),
             )
             if record is not None:
                 self._reviews[record.review_id] = record
@@ -412,7 +468,21 @@ class ReviewManager:
         The binding is always written (even when the fields are NULL) so a
         reload sees the binding envelope exists; the commit-gate expiry check
         reads it back.
+
+        M-EV-04: also upserts the ``review_content`` sidecar row so the
+        record's ``verdict_hash`` (content-addressing hash over the verdict text
+        + binding fields) is durable. The hash is (re)computed here from the
+        record's current fields so a mutated verdict or binding set is
+        re-hashed on every persist — the sidecar is always in sync with the
+        in-memory record. The hash is also stamped back onto the record so the
+        caller sees it without a reload.
         """
+        record.verdict_hash = compute_verdict_hash(
+            record.verdict,
+            record.base_head,
+            record.diff_fingerprint,
+            record.paths,
+        )
         store.upsert_review_row(self._db, review_to_row(record))
         store.upsert_review_binding_row(
             self._db,
@@ -422,6 +492,13 @@ class ReviewManager:
                 "reviewer_independence_class": record.reviewer_independence_class,
                 "expires_at": record.expires_at,
                 "authority_ref": record.authority_ref,
+            },
+        )
+        store.upsert_review_content_row(
+            self._db,
+            {
+                "review_id": record.review_id,
+                "verdict_hash": record.verdict_hash,
             },
         )
 
@@ -680,6 +757,8 @@ class ReviewManager:
                     "reviewed_at": record.reviewed_at,
                     "reviewer_id": record.reviewer_id,
                     "reviewer_independence_class": record.reviewer_independence_class,
+                    # M-EV-04: content-addressing hash over the verdict + bindings.
+                    "verdict_hash": record.verdict_hash,
                 },
                 self._redact_paths(project, worktree),
             )
@@ -765,6 +844,8 @@ class ReviewManager:
                 "reviewed_at": record.reviewed_at,
                 "reviewer_id": record.reviewer_id,
                 "reviewer_independence_class": record.reviewer_independence_class,
+                # M-EV-04: content-addressing hash over the verdict + bindings.
+                "verdict_hash": record.verdict_hash,
                 "review": redacted_result,
             }
 
@@ -838,9 +919,46 @@ class ReviewManager:
                     "reviewer_id": record.reviewer_id,
                     "used": record.used,
                     "verdict": record.verdict,
+                    # M-EV-04: content-addressing hash over the verdict + bindings.
+                    "verdict_hash": record.verdict_hash,
                 },
                 self._redact_paths_for_job(project, job_id),
             )
+
+    def get_review_closure_chain(self, review_id: str) -> dict[str, Any]:
+        """M-EV-04: return the content-address + finding->revision->closure chain.
+
+        Given a ``review_id``, returns ``{"review_id", "verdict_hash",
+        "resolutions": [...]}`` where each resolution is a
+        ``{"finding_ref", "resolving_job_id", "resolving_checkpoint_id",
+        "resolved_at"}`` row from the ``revision_resolves_finding`` sidecar.
+        Raises ``ReviewError`` if the review is unknown. Read-only; takes no
+        lock (it reads durable sidecar rows that are append-only). Internal —
+        no new MCP tool; an introspection/snapshot path may surface it.
+        """
+        if review_id not in self._reviews and not store.review_id_exists(
+            self._db, review_id
+        ):
+            raise ReviewError("unknown review_id")
+        content = store.load_review_content_row(self._db, review_id)
+        verdict_hash = content.get("verdict_hash") if content else None
+        rows = store.load_revision_resolves_finding_rows_for_review(
+            self._db, review_id
+        )
+        resolutions = [
+            {
+                "finding_ref": row.get("finding_ref"),
+                "resolving_job_id": row.get("resolving_job_id"),
+                "resolving_checkpoint_id": row.get("resolving_checkpoint_id"),
+                "resolved_at": row.get("resolved_at"),
+            }
+            for row in rows
+        ]
+        return {
+            "review_id": review_id,
+            "verdict_hash": verdict_hash,
+            "resolutions": resolutions,
+        }
 
     async def validate_for_commit(
         self,

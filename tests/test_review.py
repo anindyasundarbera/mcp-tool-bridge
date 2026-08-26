@@ -1129,6 +1129,281 @@ class ReviewManagerTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectRegistryError, "does not allow candidate_review"):
             registry.resolve("other", ProjectCapability.CANDIDATE_REVIEW)
 
+    # -- M-EV-04: review content-addressing + revision->finding links ---------
+
+    def test_verdict_hash_is_stable_for_identical_verdict_and_bindings(self) -> None:
+        """M-EV-04: ``verdict_hash`` is a 64-hex SHA-256, stable for an
+        identical verdict + binding fields, and round-trips through the
+        ``review_content`` sidecar on reload."""
+        from local_dev_mcp.review import compute_verdict_hash
+
+        async def exercise() -> tuple[str, str, str, str | None, str | None]:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            _, jobs, _, review = self._managers(project, edit)
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+            verdict = {"summary": "ok", "issues": [], "recommendation": "approve"}
+            recorded = await review.record_candidate_review(
+                project, job_id, verdict, reviewer_id="alice"
+            )
+            review_id = recorded["review_id"]
+            # The hash is a 64-hex SHA-256 surfaced in the response.
+            h1 = recorded["verdict_hash"]
+            self.assertRegex(str(h1), r"^[0-9a-f]{64}$")
+            # The in-memory record carries it.
+            self.assertEqual(review._reviews[review_id].verdict_hash, h1)
+            # The sidecar row round-trips.
+            from local_dev_mcp import store as store_module
+            content = store_module.load_review_content_row(review._db, review_id)
+            sidecar_hash = content["verdict_hash"] if content else None
+            # get_candidate_review surfaces it too.
+            fetched = await review.get_candidate_review(project, job_id, review_id)
+            fetched_hash = fetched["verdict_hash"]
+            # Recomputing from the same inputs yields the same hash.
+            recomputed = compute_verdict_hash(
+                verdict, recorded["base_head"], recorded["diff_fingerprint"],
+                tuple(recorded["paths"]),
+            )
+            return (
+                str(h1), str(sidecar_hash), str(fetched_hash), str(recomputed),
+                content is not None,
+            )
+
+        h1, sidecar_hash, fetched_hash, recomputed, content_exists = asyncio.run(exercise())
+        self.assertEqual(h1, sidecar_hash)
+        self.assertEqual(h1, fetched_hash)
+        self.assertEqual(h1, recomputed)
+        self.assertTrue(content_exists)
+
+    def test_verdict_hash_changes_when_verdict_text_changes(self) -> None:
+        """M-EV-04: the hash changes when the verdict text changes (same
+        bindings) and when a binding field changes (same verdict text)."""
+        from local_dev_mcp.review import compute_verdict_hash
+
+        verdict_a = {"summary": "ok", "issues": [], "recommendation": "approve"}
+        verdict_b = {"summary": "needs work", "issues": ["x"], "recommendation": "reject"}
+        base = "0" * 40
+        fp = "abc123"
+        paths = ("src/a.py", "src/b.py")
+        h_va = compute_verdict_hash(verdict_a, base, fp, paths)
+        h_vb = compute_verdict_hash(verdict_b, base, fp, paths)
+        self.assertNotEqual(h_va, h_vb)
+        # Binding field change: different base_head -> different hash.
+        h_base = compute_verdict_hash(verdict_a, "1" * 40, fp, paths)
+        self.assertNotEqual(h_va, h_base)
+        # Binding field change: different diff_fingerprint -> different hash.
+        h_fp = compute_verdict_hash(verdict_a, base, "different", paths)
+        self.assertNotEqual(h_va, h_fp)
+        # Binding field change: different paths set -> different hash.
+        h_paths = compute_verdict_hash(verdict_a, base, fp, ("src/c.py",))
+        self.assertNotEqual(h_va, h_paths)
+        # Path ORDER does not affect the hash (sorted canonicalization).
+        h_order = compute_verdict_hash(verdict_a, base, fp, ("src/b.py", "src/a.py"))
+        self.assertEqual(h_va, h_order)
+        # Identical inputs always yield the same hash (deterministic).
+        self.assertEqual(h_va, compute_verdict_hash(verdict_a, base, fp, paths))
+
+    def test_verdict_hash_survives_restart(self) -> None:
+        """M-EV-04: a fresh ReviewManager re-hydrates ``verdict_hash`` from the
+        ``review_content`` sidecar."""
+        async def exercise() -> tuple[str, str | None]:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            locks = ProjectLockManager()
+            jobs = DevelopmentJobManager(
+                self.settings, locks, EditingExecutor(edit), projects=(project,)
+            )
+            review = ReviewManager(
+                self.settings, locks, jobs, ReviewExecutor(), projects=(project,)
+            )
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+            recorded = await review.record_candidate_review(
+                project, job_id, {"summary": "ok"}, reviewer_id="alice"
+            )
+            review_id = recorded["review_id"]
+            h1 = recorded["verdict_hash"]
+
+            # Restart: fresh managers re-hydrate the review_content sidecar.
+            locks_b = ProjectLockManager()
+            jobs_b = DevelopmentJobManager(
+                self.settings, locks_b, EditingExecutor(edit), projects=(project,)
+            )
+            review_b = ReviewManager(
+                self.settings, locks_b, jobs_b, ReviewExecutor(), projects=(project,)
+            )
+            reread = review_b._reviews.get(review_id)
+            return str(h1), (reread.verdict_hash if reread else None)
+
+        h1, reread_hash = asyncio.run(exercise())
+        self.assertEqual(h1, reread_hash)
+
+    def test_revision_job_records_resolves_finding_rows(self) -> None:
+        """M-EV-04: a revision job records ``revision_resolves_finding`` rows
+        linking its checkpoint to the review findings it addresses."""
+        async def exercise() -> tuple[int, int, str | None, int | None, int | None]:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            locks, jobs, _, review = self._managers(project, edit)
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+            recorded = await review.record_candidate_review(
+                project, job_id,
+                {"summary": "ok", "issues": ["fix-x", "fix-y"], "recommendation": "reject"},
+                reviewer_id="alice",
+            )
+            review_id = recorded["review_id"]
+
+            # The completed job has at least one checkpoint recorded by _run.
+            from local_dev_mcp import store as store_module
+            checkpoint = store_module.load_latest_checkpoint(jobs._db, job_id)
+            self.assertIsNotNone(checkpoint)
+            checkpoint_id = checkpoint["checkpoint_id"]
+
+            # Record the revision-resolves-finding links (internal method).
+            written = jobs.record_revision_resolves_findings(
+                job_id, review_id, ["fix-x", "fix-y"]
+            )
+            # Two rows (one per finding_ref).
+            rows = store_module.load_revision_resolves_finding_rows_for_review(
+                jobs._db, review_id
+            )
+            return (
+                written,
+                len(rows),
+                rows[0]["finding_ref"] if rows else None,
+                rows[0]["resolving_checkpoint_id"] if rows else None,
+                checkpoint_id,
+            )
+
+        written, count, ref0, cp_id_row, cp_id = asyncio.run(exercise())
+        self.assertEqual(written, 2)
+        self.assertEqual(count, 2)
+        self.assertEqual(ref0, "fix-x")
+        self.assertIsNotNone(cp_id)
+        self.assertEqual(cp_id_row, cp_id)
+
+    def test_revision_resolves_single_verdict_with_null_finding_ref(self) -> None:
+        """M-EV-04: an empty/None finding_refs list records a single row with a
+        NULL ``finding_ref`` (the review has a single verdict)."""
+        async def exercise() -> tuple[int, int, object | None]:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            locks, jobs, _, review = self._managers(project, edit)
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+            recorded = await review.record_candidate_review(
+                project, job_id, {"summary": "ok"}, reviewer_id="alice"
+            )
+            review_id = recorded["review_id"]
+
+            written = jobs.record_revision_resolves_findings(job_id, review_id, None)
+            from local_dev_mcp import store as store_module
+            rows = store_module.load_revision_resolves_finding_rows_for_review(
+                jobs._db, review_id
+            )
+            return written, len(rows), rows[0]["finding_ref"] if rows else "missing"
+
+        written, count, ref = asyncio.run(exercise())
+        self.assertEqual(written, 1)
+        self.assertEqual(count, 1)
+        self.assertIsNone(ref)
+
+    def test_revision_resolves_finding_is_non_fatal_for_unknown_ids(self) -> None:
+        """M-EV-04: unknown job_id or review_id writes nothing and is non-fatal."""
+        async def exercise() -> int:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            locks, jobs, _, _ = self._managers(project, edit)
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+            # Unknown review_id -> 0 rows, no raise.
+            written = jobs.record_revision_resolves_findings(
+                job_id, "nonexistent-review", ["x"]
+            )
+            # Unknown job_id -> 0 rows, no raise.
+            written += jobs.record_revision_resolves_findings(
+                "nonexistent-job", "nonexistent-review", ["x"]
+            )
+            return written
+
+        self.assertEqual(asyncio.run(exercise()), 0)
+
+    def test_review_closure_chain_is_queryable(self) -> None:
+        """M-EV-04: ``ReviewManager.get_review_closure_chain(review_id)`` returns
+        the verdict_hash + the finding->revision->closure rows."""
+        async def exercise() -> dict[str, Any]:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            locks, jobs, _, review = self._managers(project, edit)
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+            recorded = await review.record_candidate_review(
+                project, job_id,
+                {"summary": "ok", "issues": ["fix-x", "fix-y"], "recommendation": "reject"},
+                reviewer_id="alice",
+            )
+            review_id = recorded["review_id"]
+            verdict_hash = recorded["verdict_hash"]
+
+            jobs.record_revision_resolves_findings(
+                job_id, review_id, ["fix-x", "fix-y"]
+            )
+            chain = review.get_review_closure_chain(review_id)
+            return {
+                "review_id": chain["review_id"],
+                "expected_review_id": review_id,
+                "verdict_hash": chain["verdict_hash"],
+                "count": len(chain["resolutions"]),
+                "refs": [r["finding_ref"] for r in chain["resolutions"]],
+                "resolving_job_ids": [
+                    r["resolving_job_id"] for r in chain["resolutions"]
+                ],
+                "verdict_hash_match": chain["verdict_hash"] == verdict_hash,
+            }
+
+        result = asyncio.run(exercise())
+        self.assertEqual(result["review_id"], result["expected_review_id"])
+        self.assertTrue(result["verdict_hash_match"])
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(result["refs"], ["fix-x", "fix-y"])
+        self.assertTrue(
+            all(jid == result["resolving_job_ids"][0] for jid in result["resolving_job_ids"])
+        )
+
+    def test_review_closure_chain_unknown_review_raises(self) -> None:
+        """M-EV-04: an unknown review_id raises ReviewError."""
+        async def exercise() -> None:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            _, jobs, _, review = self._managers(project, edit)
+            with self.assertRaisesRegex(ReviewError, "unknown review_id"):
+                review.get_review_closure_chain("nonexistent-review")
+
+        asyncio.run(exercise())
+
 
 class ReviewReconciliationTests(unittest.TestCase):
     """M-GV-07: reconcile_reviews for divergent verdicts + reconciled commit gate."""

@@ -817,6 +817,70 @@ class DevelopmentJobManager:
         return paths
 
     # ------------------------------------------------------------------
+    # M-EV-04: revision -> finding links.
+    #
+    # When a follow-up job revises a candidate after a review, this records
+    # ``revision_resolves_finding`` rows linking the new/revision job's
+    # checkpoint to the review findings it addresses. Internal and non-fatal:
+    # a persistence failure is swallowed (the revision still proceeds) and no
+    # new MCP tool is exposed. The queryable finding->revision->closure chain
+    # lives in the sidecar; ``ReviewManager.get_review_closure_chain`` reads it.
+    # ------------------------------------------------------------------
+
+    def record_revision_resolves_findings(
+        self,
+        job_id: str,
+        review_id: str,
+        finding_refs: list[str] | None,
+    ) -> int:
+        """Record ``revision_resolves_finding`` rows linking a revision job to
+        the review findings it addresses.
+
+        ``job_id`` is the revision job (the follow-up that re-touches the
+        candidate after a review). ``review_id`` is the review whose findings
+        the revision addresses. ``finding_refs`` is a list of finding
+        identifiers within the review (e.g. an index or a hash of a finding
+        snippet); an empty/None list records a single row with a NULL
+        ``finding_ref`` (the review has a single verdict).
+
+        The resolving checkpoint is the job's latest checkpoint
+        (``store.load_latest_checkpoint``) if one exists; otherwise NULL (the
+        revision was recorded before the first checkpoint). Non-fatal: any
+        store error is swallowed and the method returns 0 so the revision path
+        never aborts on a linkage failure. Returns the number of rows written.
+        Internal — no new MCP tool.
+        """
+        if not store.job_id_exists(self._db, job_id):
+            return 0
+        if not store.review_id_exists(self._db, review_id):
+            return 0
+        refs: list[str | None]
+        if not finding_refs:
+            refs = [None]
+        else:
+            refs = list(finding_refs)
+        checkpoint = store.load_latest_checkpoint(self._db, job_id)
+        checkpoint_id = checkpoint.get("checkpoint_id") if checkpoint else None
+        written = 0
+        for ref in refs:
+            try:
+                store.insert_revision_resolves_finding_row(
+                    self._db,
+                    {
+                        "review_id": review_id,
+                        "resolving_job_id": job_id,
+                        "resolving_checkpoint_id": checkpoint_id,
+                        "finding_ref": ref,
+                        "resolved_at": _timestamp(),
+                    },
+                )
+                written += 1
+            except Exception:
+                # Non-fatal: a linkage failure must never abort the revision.
+                pass
+        return written
+
+    # ------------------------------------------------------------------
     # M-CT-07: progress-intelligence detection helpers.
     #
     # Each helper is best-effort, bounded, and non-fatal. They load the last

@@ -278,6 +278,24 @@ CREATE TABLE IF NOT EXISTS review_bindings (
     FOREIGN KEY (review_id) REFERENCES reviews(review_id)
       ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS review_content (
+    review_id TEXT PRIMARY KEY,
+    verdict_hash TEXT NOT NULL,
+    FOREIGN KEY (review_id) REFERENCES reviews(review_id)
+      ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS revision_resolves_finding (
+    link_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    review_id TEXT NOT NULL,
+    resolving_job_id TEXT NOT NULL,
+    resolving_checkpoint_id INTEGER,
+    finding_ref TEXT,
+    resolved_at TEXT NOT NULL,
+    FOREIGN KEY (review_id) REFERENCES reviews(review_id)
+      ON DELETE CASCADE,
+    FOREIGN KEY (resolving_checkpoint_id) REFERENCES job_checkpoints(checkpoint_id)
+      ON DELETE CASCADE
+);
 """
 
 _UPSERT_JOB = """
@@ -794,6 +812,119 @@ def load_review_binding_row(
         (review_id,),
     ).fetchone()
     return dict(row) if row is not None else None
+
+
+# -- M-EV-04: review content-addressing -------------------------------------
+# A 1:1 sidecar to ``reviews`` keyed by ``review_id`` (FK with
+# ``ON DELETE CASCADE``) holding the ``verdict_hash`` — a 64-hex SHA-256 over a
+# stable, deterministic canonicalization of the verdict text and the binding
+# fields (``base_head``, ``diff_fingerprint``, the sorted ``paths`` list). The
+# hash lets an orchestrator content-address a review without re-reading its
+# verdict, and detect drift if the verdict or bindings change. Additive:
+# ``CREATE TABLE IF NOT EXISTS``, never alters ``reviews``, ``SCHEMA_VERSION``
+# stays 1.
+
+_UPSERT_REVIEW_CONTENT = """
+INSERT INTO review_content (
+    review_id, verdict_hash
+) VALUES (
+    :review_id, :verdict_hash
+)
+ON CONFLICT(review_id) DO UPDATE SET
+    verdict_hash = excluded.verdict_hash
+"""
+
+
+def upsert_review_content_row(
+    connection: sqlite3.Connection, row: dict[str, Any]
+) -> None:
+    """Persist one review-content sidecar row as a single ACID transaction."""
+    with connection:
+        connection.execute(_UPSERT_REVIEW_CONTENT, row)
+
+
+def load_review_content_rows(
+    connection: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Return every persisted review-content sidecar row as a dict."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM review_content"
+        ).fetchall()
+    ]
+
+
+def load_review_content_row(
+    connection: sqlite3.Connection, review_id: str
+) -> dict[str, Any] | None:
+    """Return one review-content sidecar row, or None."""
+    row = connection.execute(
+        "SELECT * FROM review_content WHERE review_id = ?",
+        (review_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+# -- M-EV-04: revision -> finding links -------------------------------------
+# An append-only audit ledger linking a revision job's checkpoint to the
+# review findings it addresses. ``link_id`` is an autoincrement PK;
+# ``review_id`` FK->reviews ``ON DELETE CASCADE``; ``resolving_job_id`` is the
+# revision job; ``resolving_checkpoint_id`` FK->job_checkpoints (nullable so a
+# revision recorded before the first checkpoint still links);
+# ``finding_ref`` is an identifier of the finding within the review (an index,
+# a hash of a finding snippet, or NULL when the review has a single verdict);
+# ``resolved_at`` is an ISO-8601 timestamp. Additive: ``CREATE TABLE IF NOT
+# EXISTS``, ``SCHEMA_VERSION`` stays 1.
+
+_INSERT_REVISION_RESOLVES_FINDING = """
+INSERT INTO revision_resolves_finding (
+    review_id, resolving_job_id, resolving_checkpoint_id, finding_ref, resolved_at
+) VALUES (
+    :review_id, :resolving_job_id, :resolving_checkpoint_id, :finding_ref,
+    :resolved_at
+)
+"""
+
+
+def insert_revision_resolves_finding_row(
+    connection: sqlite3.Connection, row: dict[str, Any]
+) -> None:
+    """Append one revision-resolves-finding row as a single ACID transaction."""
+    with connection:
+        connection.execute(_INSERT_REVISION_RESOLVES_FINDING, row)
+
+
+def load_revision_resolves_finding_rows_for_review(
+    connection: sqlite3.Connection, review_id: str
+) -> list[dict[str, Any]]:
+    """Return one review's revision-resolves-finding rows as dicts, oldest first.
+
+    The queryable finding->revision->closure chain: each row links a finding
+    reference in the review to the job/checkpoint that resolved it.
+    """
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM revision_resolves_finding WHERE review_id = ? "
+            "ORDER BY link_id ASC",
+            (review_id,),
+        ).fetchall()
+    ]
+
+
+def load_revision_resolves_finding_rows_for_job(
+    connection: sqlite3.Connection, job_id: str
+) -> list[dict[str, Any]]:
+    """Return one job's revision-resolves-finding rows as dicts, oldest first."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM revision_resolves_finding WHERE resolving_job_id = ? "
+            "ORDER BY link_id ASC",
+            (job_id,),
+        ).fetchall()
+    ]
 
 
 def job_id_exists(connection: sqlite3.Connection, job_id: str) -> bool:
