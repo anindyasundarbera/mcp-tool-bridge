@@ -247,10 +247,11 @@ Authoritative, newcomer-oriented docs live in [`docs/`](docs/README.md):
 including the rule that **any change after a capability addition must be
 committed**.
 
-> The root-level `DEVELOPMENT_GUIDE.md` and `MANUAL_INSTALLATION_GUIDE.md`
-> describe a separate, exploratory RAG-augmentation effort (LightRAG /
-> RAG-Anything / tokengate). They are **not** documentation for the bridge
-> itself; the files above are.
+> `docs/exploratory-rag/` holds two archived notes
+> (`DEVELOPMENT_GUIDE.md`, `MANUAL_INSTALLATION_GUIDE.md`) from a separate,
+> exploratory RAG-augmentation effort (LightRAG / RAG-Anything / tokengate).
+> They are **not** documentation for the bridge itself; they were relocated
+> from the repo root so the root stays authoritative for the bridge.
 
 ---
 

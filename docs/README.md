@@ -56,6 +56,14 @@ state**.
 
 ---
 
+## Archived (not bridge documentation)
+
+| Document | What it covers |
+|---|---|
+| [exploratory-rag/](exploratory-rag/README.md) | Archived notes from a separate RAG-augmentation effort (LightRAG / RAG-Anything / tokengate). Relocated from the repo root; not bridge docs. |
+
+---
+
 ## How to read this directory
 
 - **New to the project?** Read the root `README.md`, then
