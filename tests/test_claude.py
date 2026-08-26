@@ -89,6 +89,102 @@ class ClaudeCommandTests(unittest.TestCase):
                 )
 
 
+class LaunchCommandTests(unittest.TestCase):
+    _CURRENT_PREFIX = [
+        "ollama",
+        "launch",
+        "claude",
+        "--model",
+        "glm-5.2:cloud",
+        "--yes",
+        "--",
+        "-p",
+    ]
+
+    def test_default_launch_command_matches_current_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = build_claude_command(
+                settings(root / "projects.json"), policy(root), "high"
+            )
+        self.assertEqual(command[: len(self._CURRENT_PREFIX)], self._CURRENT_PREFIX)
+        # The security tail is appended after the operator-owned prefix.
+        self.assertIn("--strict-mcp-config", command)
+        self.assertIn("Read,Glob,Grep,Edit,Write", command)
+
+    def test_custom_launch_command_substitutes_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = build_claude_command(
+                settings(root / "projects.json", CLAUDE_LAUNCH_COMMAND="claude --model {model} -p"),
+                policy(root),
+                "high",
+            )
+        # The custom prefix is honored, {model} is substituted, and the
+        # bridge-enforced security tail is still appended unchanged.
+        self.assertEqual(command[0], "claude")
+        self.assertEqual(command[command.index("--model") + 1], "glm-5.2:cloud")
+        self.assertNotIn("{model}", command)
+        self.assertIn("--disallowedTools", command)
+        self.assertIn("Bash", command)
+        self.assertIn("--strict-mcp-config", command)
+        self.assertIn("--permission-mode", command)
+        self.assertEqual(command[command.index("--effort") + 1], "high")
+
+    def test_custom_launch_command_missing_model_token_rejected(self) -> None:
+        # The {model} token is required at config-load time, so a template
+        # without it never reaches the builder.
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "standalone '\\{model\\}'"):
+                settings(
+                    Path(directory) / "projects.json",
+                    CLAUDE_LAUNCH_COMMAND="claude -p",
+                )
+
+    def test_custom_launch_command_honors_project_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = policy(root, claude_model="custom:model")
+            command = build_claude_command(
+                settings(root / "projects.json", CLAUDE_LAUNCH_COMMAND="claude --model {model} -p"),
+                project,
+                "high",
+            )
+        self.assertEqual(command[command.index("--model") + 1], "custom:model")
+
+    def test_reviewer_launch_command_honored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = build_reviewer_command(
+                settings(
+                    root / "projects.json",
+                    CLAUDE_REVIEW_LAUNCH_COMMAND="claude --model {model} --review -p",
+                ),
+                policy(root),
+                "high",
+            )
+        self.assertEqual(command[0], "claude")
+        self.assertIn("--review", command)
+        # The reviewer security tail (read-only tools, default permission mode)
+        # is still appended and unchanged.
+        self.assertIn("Read,Glob,Grep", command)
+        self.assertNotIn("Read,Glob,Grep,Edit,Write", command)
+        self.assertEqual(command[command.index("--permission-mode") + 1], "default")
+
+    def test_resume_segment_inserted_before_security_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = build_claude_command(
+                settings(root / "projects.json"),
+                policy(root),
+                "high",
+                "bridge-session",
+            )
+        self.assertEqual(command[command.index("--resume") + 1], "bridge-session")
+        # --resume lands after the operator prefix, before --permission-mode.
+        self.assertLess(command.index("--resume"), command.index("--permission-mode"))
+
+
 class ContinuityCommandTests(unittest.TestCase):
     def test_max_turns_override_takes_precedence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -22,6 +22,16 @@ def settings(base: Path) -> Settings:
     )
 
 
+def settings_with(base: Path, **env: str) -> Settings:
+    payload = {
+        "PROJECTS_CONFIG_PATH": str(base / "projects.json"),
+        "JOB_WORKTREE_ROOT": str(base / "jobs"),
+        "CANDIDATE_MCP_PORT": "9101",
+    }
+    payload.update(env)
+    return Settings.from_env(payload)
+
+
 def policy(root: Path, project_id: str = "test-project", **overrides: object) -> ProjectPolicy:
     data: dict[str, object] = {
         "id": project_id,
@@ -349,6 +359,105 @@ class DevelopmentJobManagerTests(unittest.TestCase):
             await wait_for_status(
                 manager, other, str(second["job_id"]), {"completed"}
             )
+
+        asyncio.run(exercise())
+
+
+class EffortResolutionTests(unittest.TestCase):
+    """Omitting ``effort`` resolves via project default -> CLAUDE_DEFAULT_EFFORT."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        initialize_git_repository(self.root)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _manager(self, settings_obj: Settings) -> tuple[DevelopmentJobManager, "ImmediateExecutor"]:
+        executor = ImmediateExecutor()
+        manager = DevelopmentJobManager(
+            settings_obj,
+            ProjectLockManager(),
+            executor,  # type: ignore[arg-type]
+        )
+        return manager, executor
+
+    def test_project_default_effort_used_when_call_omits(self) -> None:
+        async def exercise() -> None:
+            project = policy(self.root, default_effort="ultracode", allow_ultracode=True)
+            manager, executor = self._manager(settings(self.base))
+            started = await manager.start(project, "work", None)
+            await wait_for_status(
+                manager, project, str(started["job_id"]), {"completed"}
+            )
+            self.assertEqual(executor.calls[0]["effort"], "ultracode")
+
+        asyncio.run(exercise())
+
+    def test_global_default_used_when_project_omits(self) -> None:
+        async def exercise() -> None:
+            # default_effort omitted -> None -> inherits CLAUDE_DEFAULT_EFFORT.
+            project = policy(self.root, allow_ultracode=True)
+            manager, executor = self._manager(
+                settings_with(self.base, CLAUDE_DEFAULT_EFFORT="ultracode")
+            )
+            started = await manager.start(project, "work", None)
+            await wait_for_status(
+                manager, project, str(started["job_id"]), {"completed"}
+            )
+            self.assertEqual(executor.calls[0]["effort"], "ultracode")
+
+        asyncio.run(exercise())
+
+    def test_no_overrides_resolve_to_high(self) -> None:
+        async def exercise() -> None:
+            project = policy(self.root)  # default_effort None, allow_ultracode True
+            manager, executor = self._manager(settings(self.base))
+            started = await manager.start(project, "work", None)
+            await wait_for_status(
+                manager, project, str(started["job_id"]), {"completed"}
+            )
+            self.assertEqual(executor.calls[0]["effort"], "high")
+
+        asyncio.run(exercise())
+
+    def test_explicit_call_effort_wins_over_project_default(self) -> None:
+        async def exercise() -> None:
+            project = policy(self.root, default_effort="ultracode", allow_ultracode=True)
+            manager, executor = self._manager(settings(self.base))
+            started = await manager.start(project, "work", "high")
+            await wait_for_status(
+                manager, project, str(started["job_id"]), {"completed"}
+            )
+            self.assertEqual(executor.calls[0]["effort"], "high")
+
+        asyncio.run(exercise())
+
+    def test_global_ultracode_fails_closed_for_disallowing_project(self) -> None:
+        async def exercise() -> None:
+            project = policy(self.root, allow_ultracode=False)
+            manager, _ = self._manager(
+                settings_with(self.base, CLAUDE_DEFAULT_EFFORT="ultracode")
+            )
+            with self.assertRaisesRegex(ValueError, "does not allow ultracode"):
+                await manager.start(project, "work", None)
+
+        asyncio.run(exercise())
+
+    def test_resume_resolves_none_effort(self) -> None:
+        async def exercise() -> None:
+            project = policy(self.root, default_effort="ultracode", allow_ultracode=True)
+            manager, executor = self._manager(settings(self.base))
+            started = await manager.start(project, "first", "high")
+            job_id = str(started["job_id"])
+            await wait_for_status(manager, project, job_id, {"completed"})
+            # Resume a completed job (fresh attempt, retained worktree) omitting
+            # effort; the project default (ultracode) should be applied.
+            await manager.resume(project, job_id, "continue", None)
+            await wait_for_status(manager, project, job_id, {"completed"})
+            self.assertEqual(executor.calls[1]["effort"], "ultracode")
 
         asyncio.run(exercise())
 

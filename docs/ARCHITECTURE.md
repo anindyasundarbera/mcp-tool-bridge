@@ -39,9 +39,9 @@ model, see [CAPABILITIES.md](CAPABILITIES.md). For the security rules, see
 ```
 
 The public surface is a single ngrok HTTPS endpoint protected by the OpenAI
-connector mTLS CA. Only the MCP server port is exposed; Ollama and the local
-filesystem are never directly reachable. Everything behind the endpoint is a
-FastMCP HTTP server on localhost.
+connector mTLS CA. Only the MCP server port is exposed; the configured Claude
+launcher and the local filesystem are never directly reachable. Everything
+behind the endpoint is a FastMCP HTTP server on localhost.
 
 ---
 
@@ -169,7 +169,7 @@ All bridge code lives in `src/local_dev_mcp/`. Dependency direction is one-way:
 | `git.py` | `project_status()` and git helpers; fixed argv, no shell; `GitCommandError` |
 | `worktrees.py` | Worktree creation/cleanup, clean-baseline checks, `validate_resume`, private-dir helpers |
 | `jobs.py` | `DevelopmentJobManager` — start/get/resume/cancel/list, checkpointing, budget enforcement, crash reconciliation, structured `_snapshot` |
-| `claude.py` | `ClaudeExecutor` — builds the `claude` argv, drives json/stream-json modes, parses turns/tool-failures/usage, reviewer command |
+| `claude.py` | `ClaudeExecutor` — builds the `claude` argv from the configurable `CLAUDE_LAUNCH_COMMAND`/`CLAUDE_REVIEW_LAUNCH_COMMAND` templates (substituting `{model}`), appends the bridge-enforced security tail, drives json/stream-json modes, parses turns/tool-failures/usage, reviewer command |
 | `candidate.py` | Candidate state helpers (changed paths, fingerprints) |
 | `reader.py` | `RepositoryReader` — bounded Markdown list/search/read/range/outline/metadata; injection-defense option |
 | `writer.py` | `RepositoryWriter` — SHA-256-guarded create/update beneath approved write roots |
@@ -187,7 +187,7 @@ All bridge code lives in `src/local_dev_mcp/`. Dependency direction is one-way:
 | `store.py` | **The only module that knows the on-disk schema.** SQLite open/migrate, upsert/load helpers for all 20 tables |
 
 ### Tests
-`tests/` holds 340+ `unittest` tests with no network, model, ngrok, Ollama, or
+`tests/` holds 340+ `unittest` tests with no network, model, ngrok, launcher, or
 real-repository dependency. Managers are driven through fake executors so
 lifecycle behavior is deterministic. A few tool-count canary tests assert the
 exact tool surface and must be bumped when a tool is added.

@@ -29,6 +29,26 @@ class DevelopmentJobError(RuntimeError):
     """Raised when a development job request is invalid or unauthorized."""
 
 
+def resolve_effort(
+    project: ProjectPolicy,
+    effort: Effort | None,
+    settings: Settings,
+) -> Effort:
+    """Resolve a possibly-``None`` effort to a concrete value.
+
+    Precedence: the explicit per-call value (if any) → the project's
+    ``default_effort`` → the global ``CLAUDE_DEFAULT_EFFORT``. The returned
+    value is still subject to ``validate_effort`` (per-project
+    ``allow_ultracode``) at the call site, so a global ``ultracode`` default
+    against a disallowing project fails closed at job start.
+    """
+    if effort is not None:
+        return effort
+    if project.default_effort is not None:
+        return project.default_effort
+    return settings.claude_default_effort
+
+
 class JobStatus(StrEnum):
     QUEUED = "queued"
     PREPARING_WORKTREE = "preparing_worktree"
@@ -876,7 +896,7 @@ class DevelopmentJobManager:
         worktree: JobWorktree,
         candidate: dict[str, Any],
         *,
-        effort: Effort = "high",
+        effort: Effort | None = None,
     ) -> DevelopmentJob:
         """Register a retained candidate captured from a dirty working tree.
 
@@ -889,6 +909,7 @@ class DevelopmentJobManager:
         the captured candidate is restart-safe and indistinguishable from a
         Claude-produced candidate at the gate boundary.
         """
+        effort = resolve_effort(project, effort, self.settings)
         validate_effort(project, effort)
         async with self._state_lock:
             if job_id in self._jobs or store.job_id_exists(self._db, job_id):
@@ -933,9 +954,10 @@ class DevelopmentJobManager:
         self,
         project: ProjectPolicy,
         text: str,
-        effort: Effort,
+        effort: Effort | None = None,
         requested_base: str | None = None,
     ) -> dict[str, Any]:
+        effort = resolve_effort(project, effort, self.settings)
         specification = self._validate_input(project, text, effort)
         async with self._state_lock:
             job = DevelopmentJob(
@@ -969,7 +991,8 @@ class DevelopmentJobManager:
         project: ProjectPolicy,
         parent_job_id: str,
         text: str,
-        effort: Effort,
+        effort: Effort | None = None,
+        *,
         mandate: dict[str, Any],
     ) -> dict[str, Any]:
         """M-GV-06: spawn a bounded child job delegated from a parent job.
@@ -984,6 +1007,7 @@ class DevelopmentJobManager:
         Internal-first: no new MCP tool; a parent job spawns children via this
         manager method.
         """
+        effort = resolve_effort(project, effort, self.settings)
         specification = self._validate_input(project, text, effort)
         mandate = self._validate_mandate(mandate)
         async with self._state_lock:
@@ -1052,8 +1076,9 @@ class DevelopmentJobManager:
         project: ProjectPolicy,
         job_id: str,
         text: str,
-        effort: Effort,
+        effort: Effort | None = None,
     ) -> dict[str, Any]:
+        effort = resolve_effort(project, effort, self.settings)
         specification = self._validate_input(project, text, effort)
         async with self._state_lock:
             job = self._require_job(project, job_id)

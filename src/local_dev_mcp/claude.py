@@ -17,6 +17,20 @@ def validate_effort(project: ProjectPolicy, effort: Effort) -> None:
         raise ValueError(f"project {project.id!r} does not allow ultracode")
 
 
+def _substitute_model(
+    template: tuple[str, ...], model: str
+) -> list[str]:
+    """Expand the launch template, replacing the standalone ``{model}`` token.
+
+    Only an exact ``"{model}"`` element is replaced (token-equality), never a
+    substring — so ``prefix{model}`` stays literal. The template (everything up
+    to and including the operator-owned ``--`` passthrough, e.g.
+    ``ollama launch claude --model {model} --yes -- -p``) is operator-owned via
+    ``CLAUDE_LAUNCH_COMMAND``; the bridge appends the security tail afterwards.
+    """
+    return [model if token == "{model}" else token for token in template]
+
+
 def build_claude_command(
     settings: Settings,
     project: ProjectPolicy,
@@ -33,16 +47,7 @@ def build_claude_command(
         max_turns = max_turns_override
     else:
         max_turns = project.claude_max_turns or settings.claude_max_turns
-    command = [
-        "ollama",
-        "launch",
-        "claude",
-        "--model",
-        model,
-        "--yes",
-        "--",
-        "-p",
-    ]
+    command = _substitute_model(settings.claude_launch_command, model)
     if resume_session_id is not None:
         if (
             not resume_session_id
@@ -92,16 +97,7 @@ def build_reviewer_command(
     validate_effort(project, effort)
     model = project.claude_model or settings.claude_model
     max_turns = project.claude_max_turns or settings.claude_max_turns
-    command = [
-        "ollama",
-        "launch",
-        "claude",
-        "--model",
-        model,
-        "--yes",
-        "--",
-        "-p",
-    ]
+    command = _substitute_model(settings.claude_review_launch_command, model)
     command.extend(
         [
             "--permission-mode",

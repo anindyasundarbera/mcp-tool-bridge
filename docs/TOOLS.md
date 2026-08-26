@@ -87,7 +87,7 @@ opaque job ID immediately. Use `high` for routine work; `ultracode` only for
 complex architecture, difficult reasoning, migrations, or substantial
 cross-module implementation. The configured checkout is never edited directly;
 Bash, web, and secondary MCP tools are disabled.
-- **Params**: `project_id`, `text` (≥1 char, the full work order), `effort` (`"high"` | `"ultracode"`, default `"high"`), `requested_base?` (40-hex; when set, must be the current tip of `origin`'s default branch after a fetch — branches the job off that fetched remote tip instead of local HEAD; omit for offline/local-only projects)
+- **Params**: `project_id`, `text` (≥1 char, the full work order), `effort` (`"high"` | `"ultracode"`, optional; omitted → project `default_effort` → `CLAUDE_DEFAULT_EFFORT`), `requested_base?` (40-hex; when set, must be the current tip of `origin`'s default branch after a fetch — branches the job off that fetched remote tip instead of local HEAD; omit for offline/local-only projects)
 - **Annotations**: **destructive**, not idempotent, open-world
 - **Refuses** when the canonical checkout is behind `origin/<default>` and no `requested_base` is pinned (stale-base guard).
 
@@ -103,7 +103,7 @@ Continue a terminal or `paused_*` job in its retained worktree using only the
 Claude session ID previously captured by this bridge. Callers provide a job ID
 and never a raw session ID. Keeps the cumulative budget; seeds the drafter
 from the last checkpoint's changed-path set.
-- **Params**: `project_id`, `job_id`, `text` (≥1 char), `effort` (default `"high"`)
+- **Params**: `project_id`, `job_id`, `text` (≥1 char), `effort` (optional; omitted → project `default_effort` → `CLAUDE_DEFAULT_EFFORT`)
 - **Annotations**: **destructive**, not idempotent, open-world
 - **Rejects** non-resumable states (`failed_infrastructure`, `quarantined_provenance`).
 
@@ -144,7 +144,7 @@ from the drafting session; only Read, Glob, Grep) over a completed candidate.
 Requires the project to allow a bridge-spawned reviewer
 (`allow_bridge_reviewer`). Returns a single-use `review_id` bound to the
 candidate state, attested as reviewer_id `"bridge-reviewer"`.
-- **Params**: `project_id`, `job_id`, `effort` (default `"high"`)
+- **Params**: `project_id`, `job_id`, `effort` (optional; omitted → project `default_effort` → `CLAUDE_DEFAULT_EFFORT`)
 - **Annotations**: not destructive, not idempotent, open-world
 
 ### `get_candidate_review`
@@ -315,7 +315,7 @@ with only the selected, fingerprinted changes; the source working-tree
 fingerprint is recomputed before success and any drift fails the capture and
 leaves no usable candidate. The retained candidate is a normal governed
 candidate eligible for verify/review/commit/publish.
-- **Params**: `project_id`, `include_paths`, `protected_exclude_paths`, `expected_base_head?` (40-hex), `expected_working_tree_fingerprint?` (64-hex), `effort` (`"high"` | `"ultracode"`, default `"high"`)
+- **Params**: `project_id`, `include_paths`, `protected_exclude_paths`, `expected_base_head?` (40-hex), `expected_working_tree_fingerprint?` (64-hex), `effort` (`"high"` | `"ultracode"`, optional; omitted → project `default_effort` → `CLAUDE_DEFAULT_EFFORT`)
 - **Annotations**: not destructive, not idempotent, closed-world
 
 ---

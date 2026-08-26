@@ -139,7 +139,7 @@ These apply to every milestone. The full list with reasoning is in
 [`docs/SECURITY.md`](docs/SECURITY.md); the critical subset:
 
 - OpenAI connector mTLS protects the public ngrok endpoint. Expose only the
-  MCP server port; never expose Ollama directly.
+  MCP server port; never expose the configured Claude launcher directly.
 - The local project registry (`projects.json`) is the only authorization
   source of truth. Unknown, disabled, malformed, or unauthorized projects fail
   closed. Enforce authorization and validation in server code, never in model
@@ -210,7 +210,7 @@ Before declaring a phase complete:
 9. Update `README.md`, the relevant `docs/`, `.env.example`, and the next
    session handoff.
 
-Live ngrok, Ollama, Claude, and real-repository smoke tests are separate from
+Live ngrok, launcher, Claude, and real-repository smoke tests are separate from
 core tests and must be identified as such. Do not fabricate their results.
 
 ## 9. Session start checklist
@@ -237,8 +237,7 @@ enabler, named M-AL-01 (not MCPB-011, which the roadmap reserves for the
 Evidence release M-EV-01).
 
 Next gap after M-AL-01: Evidence release → requirement traceability (see
-[`docs/MCPB-ROADMAP.md`](docs/MCPB-ROADMAP.md) and
-[`docs/NEXT-SESSION-CAPABILITY-ELEVATION.md`](docs/NEXT-SESSION-CAPABILITY-ELEVATION.md)).
+[`docs/MCPB-ROADMAP.md`](docs/MCPB-ROADMAP.md)).
 
 When you land any capability change from this point on, follow §3 and commit
 it; explicitly authorize any desired push, PR, live installation/restart, or

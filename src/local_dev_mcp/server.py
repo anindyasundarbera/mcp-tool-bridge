@@ -430,14 +430,15 @@ def create_server(
             ),
         ],
         effort: Annotated[
-            Effort,
+            Effort | None,
             Field(
                 description=(
                     "Use high for routine work; use ultracode only for complex "
-                    "reasoning or substantial implementation."
+                    "reasoning or substantial implementation. Omit to use the "
+                    "project's default_effort, then CLAUDE_DEFAULT_EFFORT."
                 )
             ),
-        ] = "high",
+        ] = None,
         requested_base: Annotated[
             str | None,
             Field(
@@ -519,14 +520,15 @@ def create_server(
             ),
         ],
         effort: Annotated[
-            Effort,
+            Effort | None,
             Field(
                 description=(
                     "Use high for routine work; use ultracode only for complex "
-                    "reasoning or substantial implementation."
+                    "reasoning or substantial implementation. Omit to use the "
+                    "project's default_effort, then CLAUDE_DEFAULT_EFFORT."
                 )
             ),
-        ] = "high",
+        ] = None,
     ) -> dict[str, Any]:
         project = active_registry.resolve(project_id, ProjectCapability.CLAUDE_EDIT)
         return await active_jobs.resume(project, job_id, text, effort)
@@ -762,14 +764,15 @@ def create_server(
             ),
         ],
         effort: Annotated[
-            Effort,
+            Effort | None,
             Field(
                 description=(
                     "Use high for routine review; use ultracode only for complex "
-                    "review requiring deep reasoning."
+                    "review requiring deep reasoning. Omit to use the project's "
+                    "default_effort, then CLAUDE_DEFAULT_EFFORT."
                 )
             ),
-        ] = "high",
+        ] = None,
     ) -> dict[str, Any]:
         project = active_registry.resolve(
             project_id, ProjectCapability.CANDIDATE_REVIEW
@@ -1571,12 +1574,14 @@ def create_server(
             ),
         ] = None,
         effort: Annotated[
-            str,
+            Effort | None,
             Field(
-                description="Claude effort level recorded on the retained job.",
-                pattern=r"^(high|ultracode)$",
+                description=(
+                    "Claude effort level recorded on the retained job. Omit to "
+                    "use the project's default_effort, then CLAUDE_DEFAULT_EFFORT."
+                )
             ),
-        ] = "high",
+        ] = None,
     ) -> dict[str, Any]:
         project = active_registry.resolve(
             project_id, ProjectCapability.WORKING_TREE_CANDIDATE_CAPTURE

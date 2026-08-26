@@ -49,7 +49,7 @@ from typing import Any
 from . import store
 from .config import Settings
 from .git import GitCommandError, run_git
-from .jobs import DevelopmentJobError, DevelopmentJobManager
+from .jobs import DevelopmentJobError, DevelopmentJobManager, resolve_effort
 from .models import (
     ProjectCapability,
     ProjectPolicy,
@@ -822,7 +822,7 @@ class WorkingTreeCaptureManager:
         expected_base_head: str | None = None,
         expected_working_tree_fingerprint: str | None = None,
         *,
-        effort: str = "high",
+        effort: str | None = None,
     ) -> dict[str, Any]:
         """Capture the approved working-tree scope into a retained candidate.
 
@@ -833,6 +833,7 @@ class WorkingTreeCaptureManager:
         failure the worktree is force-removed and no candidate is retained; a
         rejected audit row is persisted instead.
         """
+        effort = resolve_effort(project, effort, self.settings)
         scope = self._resolve_scope(project, include_paths, protected_exclude_paths)
         redaction_paths = self._redaction_paths(project)
         policy_fingerprint = _policy_fingerprint(project)
@@ -930,7 +931,7 @@ class WorkingTreeCaptureManager:
                     "candidate_fingerprint": candidate_fingerprint,
                 }
                 job = await self._jobs.register_captured_candidate(
-                    project, job_id, worktree, candidate, effort=effort  # type: ignore[arg-type]
+                    project, job_id, worktree, candidate, effort=effort
                 )
                 registered = True
 

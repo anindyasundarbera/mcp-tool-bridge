@@ -35,6 +35,15 @@
 - Local `main` may be stale; run `git fetch --prune origin` before any
   base-branch reasoning.
 
+> **Implementation history.** The dated snapshot above is a point-in-time
+> audit, not a live progress log. Authoritative implementation state lives in
+> `git log` and the per-milestone decision records (`docs/MCPB-0NN.md` +
+> briefs): MCPB-001→012 and M-AL-01 have all shipped (see `docs/README.md` for
+> the milestone index). Subsequent configurability/docs work — making the
+> Claude launch command and default effort `.env`-configurable, widening the
+> tool `effort` params to optional, and pruning stale session-handoff notes —
+> landed after this audit and is not re-tracked here.
+
 > **Security constraints (verbatim, non-negotiable).** Never commit/push/merge/
 > tag/restart production or merge without explicit user request. No
 > `bypassPermissions` or unrestricted Bash; no `shell=True`; fixed argument

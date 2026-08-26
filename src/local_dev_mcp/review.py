@@ -48,7 +48,7 @@ from . import store
 from .claude import ClaudeExecutor
 from .config import Settings
 from .git import GitCommandError
-from .jobs import DevelopmentJobError, DevelopmentJobManager
+from .jobs import DevelopmentJobError, DevelopmentJobManager, resolve_effort
 from .models import Effort, ProjectPolicy
 from .registry import ProjectLockManager
 from .verification import (
@@ -582,7 +582,7 @@ class ReviewManager:
         self,
         project: ProjectPolicy,
         job_id: str,
-        effort: Effort,
+        effort: Effort | None = None,
     ) -> dict[str, Any]:
         """Spawn a fresh, read-only Claude reviewer over the candidate.
 
@@ -595,6 +595,7 @@ class ReviewManager:
         """
         if not project.allow_bridge_reviewer:
             raise ReviewError("project does not allow a bridge-spawned reviewer")
+        effort = resolve_effort(project, effort, self.settings)
         lock = await self._locks.for_project(project.id)
         async with lock:
             worktree = await self._reviewable_worktree_locked(project, job_id)

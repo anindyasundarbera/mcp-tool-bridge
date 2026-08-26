@@ -342,7 +342,10 @@ class ProjectPolicy(BaseModel):
     runtime_verification_commands: tuple[RuntimeVerificationCommand, ...] = ()
     working_tree_capture_scope: WorkingTreeCaptureScope | None = None
     protected_paths: tuple[str, ...] = (".git", ".env")
-    default_effort: Effort = "high"
+    # ``None`` means "inherit the global ``CLAUDE_DEFAULT_EFFORT``" rather than
+    # pinning a per-project default, so a bridge-wide default actually takes
+    # effect for projects that do not opt out of it.
+    default_effort: Effort | None = None
     allow_ultracode: bool = True
     self_managed: bool = False
     requires_review: bool = False

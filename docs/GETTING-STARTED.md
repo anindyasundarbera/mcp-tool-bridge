@@ -45,7 +45,16 @@ Edit `.env`:
 - `OPENAI_MTLS_CA_PATH` — path to the mTLS CA bundle (default
   `openai-connectors-mtls-ca.pem`).
 - `CLAUDE_MODEL` — the underlying model Claude Code jobs use (default
-  `glm-5.2:cloud`).
+  `glm-5.2:cloud`). A project can override this per-project with `claude_model`.
+- `CLAUDE_LAUNCH_COMMAND` — how the bridge starts the Claude Code drafter
+  (shell-split with `shlex`; the standalone `{model}` token is the substitution
+  point). Default runs `claude` under `ollama launch`; to use the `claude` CLI
+  directly set `CLAUDE_LAUNCH_COMMAND=claude --model {model} -p`. The bridge
+  always appends the security tail regardless of this value.
+- `CLAUDE_REVIEW_LAUNCH_COMMAND` — same, for the one-shot read-only reviewer
+  (defaults to the same prefix).
+- `CLAUDE_DEFAULT_EFFORT` — global default effort when a tool call and the
+  project both omit one (`high` or `ultracode`; default `high`).
 
 `.env`, `projects.json`, `openai-connectors-mtls-ca.pem`, `.venv`, and
 certificates are gitignored and must never enter Git.
@@ -136,7 +145,7 @@ starts an isolated no-edit job, and polls its result:
 .venv/bin/python test_client.py --project my-app
 ```
 
-Core unit tests have no network, model, ngrok, Ollama, or real-repo dependency:
+Core unit tests have no network, model, ngrok, launcher, or real-repo dependency:
 ```bash
 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 ```
@@ -212,6 +221,9 @@ positive int/float/port by `Settings.from_env()`.
 | `MCP_HOST` | `127.0.0.1` | FastMCP bind host |
 | `JOB_WORKTREE_ROOT` | `~/.local/state/local-dev-mcp/worktrees` | private root for worktrees + `.state` |
 | `CLAUDE_MODEL` | `glm-5.2:cloud` | underlying model for Claude jobs |
+| `CLAUDE_LAUNCH_COMMAND` | `ollama launch claude --model {model} --yes -- -p` | drafter launch prefix (`{model}` substituted; security tail always appended) |
+| `CLAUDE_REVIEW_LAUNCH_COMMAND` | `ollama launch claude --model {model} --yes -- -p` | reviewer launch prefix |
+| `CLAUDE_DEFAULT_EFFORT` | `high` | global default effort (call > project `default_effort` > this) |
 | `CLAUDE_TIMEOUT_SECONDS` | 1800 | maximum Claude run time |
 | `CLAUDE_MAX_TURNS` | 30 | default per-slice turn limit |
 | `CLAUDE_SOFT_TURNS` | 30 | soft warn at this cumulative turn count |

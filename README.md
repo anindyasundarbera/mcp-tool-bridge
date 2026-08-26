@@ -136,7 +136,8 @@ URL; otherwise ngrok issues an ephemeral URL that changes every run.
 
 The connector URL is `https://<ngrok-domain>/mcp`. The ngrok endpoint is
 protected by the OpenAI connector mTLS CA (`openai-connectors-mtls-ca.pem`);
-Ollama is never exposed directly.
+the configured Claude launcher is never exposed directly — only the bridge
+talks to it over a local process boundary.
 
 The two halves can also run separately in two terminals:
 ```bash
@@ -146,7 +147,7 @@ python tunnel.py
 
 ## Test
 
-Core tests have no network, model, ngrok, Ollama, or real-repository
+Core tests have no network, model, ngrok, launcher, or real-repository
 dependency:
 
 ```bash
@@ -216,12 +217,36 @@ defaults). Project authorization lives in `projects.json` (see
 `mcp-servers.json` at the repo root is a convenience catalog of the MCP servers
 used in this development environment (not consumed by the bridge itself).
 
+### Configuring the Claude invocation
+
+The bridge starts Claude Code via a configurable launch command (shell-split
+with `shlex`). The default `CLAUDE_LAUNCH_COMMAND` runs `claude` under
+`ollama launch`; to run the `claude` CLI directly instead, set:
+
+```bash
+CLAUDE_LAUNCH_COMMAND=claude --model {model} -p
+```
+
+The standalone `{model}` token is the substitution point — the bridge replaces
+it with the resolved model (`project.claude_model` → `CLAUDE_MODEL`). Everything
+up to and including the operator-owned `--` passthrough is yours; the bridge
+always appends the **security tail** afterwards (`--permission-mode`,
+`--tools`, `--disallowedTools Bash WebFetch WebSearch mcp__*`,
+`--strict-mcp-config`, `--disable-slash-commands`, `--max-turns`,
+`--output-format`, `--effort`) regardless of the launcher, so the governed
+boundary cannot drift. A separate `CLAUDE_REVIEW_LAUNCH_COMMAND` governs the
+one-shot read-only reviewer (defaults to the same prefix). Effort resolves as
+per-call value → project `default_effort` → `CLAUDE_DEFAULT_EFFORT`.
+
 | Setting | Default | Purpose |
 |---|---:|---|
 | `MCP_PORT` | 8000 | FastMCP HTTP listen port |
 | `CANDIDATE_MCP_PORT` | 8001 | Self-managed candidate probe port (must differ) |
 | `JOB_WORKTREE_ROOT` | `~/.local/state/local-dev-mcp/worktrees` | Private root for detached worktrees + `.state` |
 | `CLAUDE_MODEL` | `glm-5.2:cloud` | Underlying model for Claude Code jobs |
+| `CLAUDE_LAUNCH_COMMAND` | `ollama launch claude --model {model} --yes -- -p` | Drafter launch prefix (`{model}` substituted) |
+| `CLAUDE_REVIEW_LAUNCH_COMMAND` | `ollama launch claude --model {model} --yes -- -p` | Reviewer launch prefix |
+| `CLAUDE_DEFAULT_EFFORT` | `high` | Global default effort when call and project omit one |
 | `CLAUDE_TIMEOUT_SECONDS` | 1800 | Maximum Claude run time |
 | `CLAUDE_HARD_TURNS` | 120 | Absolute cumulative turn cap |
 | `MAX_INPUT_CHARS` | 100,000 | Maximum job instruction length |

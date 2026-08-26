@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
+
+from .models import Effort
 
 
 def _positive_int(environment: Mapping[str, str], name: str, default: int) -> int:
@@ -46,6 +49,91 @@ def _absolute_path(environment: Mapping[str, str], name: str, default: str) -> P
     return path
 
 
+# The default launch prefix. Stored as a literal tuple (NOT re-split from a
+# string) so the out-of-the-box path is byte-identical to the previous
+# hardcoded argv. The standalone ``"{model}"`` token is the substitution point
+# that ``build_claude_command`` replaces with the resolved model. Everything
+# before ``--`` is operator/wrapper-owned passthrough (here ``ollama launch``);
+# the bridge never touches it.
+_DEFAULT_LAUNCH_COMMAND: tuple[str, ...] = (
+    "ollama",
+    "launch",
+    "claude",
+    "--model",
+    "{model}",
+    "--yes",
+    "--",
+    "-p",
+)
+_MODEL_TOKEN = "{model}"
+_MAX_LAUNCH_TOKENS = 16
+_MAX_LAUNCH_TOKEN_CHARS = 2000
+
+
+def _launch_command(
+    environment: Mapping[str, str],
+    name: str,
+    default: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Parse an operator-supplied launch command via ``shlex.split``.
+
+    Absent → the pre-split default tuple (byte-identical to today). Present →
+    shell-style splitting into 1–16 tokens, each non-empty, NUL-free, and
+    ≤2000 chars. The command MUST contain a standalone ``{model}`` token (exact
+    element equality — ``prefix{model}`` substrings are rejected) so the bridge
+    has a substitution point. No shell is ever invoked (the bridge uses
+    ``create_subprocess_exec``), so the executable name is not constrained here.
+    """
+    raw = environment.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        tokens = shlex.split(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} is not valid shell syntax: {exc}") from exc
+    if not tokens:
+        raise RuntimeError(f"{name} must not be empty")
+    if len(tokens) > _MAX_LAUNCH_TOKENS:
+        raise RuntimeError(
+            f"{name} must have at most {_MAX_LAUNCH_TOKENS} tokens"
+        )
+    for token in tokens:
+        if not token:
+            raise RuntimeError(f"{name} must not contain empty tokens")
+        if "\x00" in token:
+            raise RuntimeError(f"{name} must not contain NUL bytes")
+        if len(token) > _MAX_LAUNCH_TOKEN_CHARS:
+            raise RuntimeError(
+                f"{name} tokens must be at most {_MAX_LAUNCH_TOKEN_CHARS} chars"
+            )
+    if _MODEL_TOKEN not in tokens:
+        raise RuntimeError(
+            f"{name} must contain a standalone '{_MODEL_TOKEN}' token "
+            f"as the model substitution point"
+        )
+    return tuple(tokens)
+
+
+def _effort(
+    environment: Mapping[str, str],
+    name: str,
+    default: Effort,
+) -> Effort:
+    """Validate a global default effort value (``high`` or ``ultracode``).
+
+    Per-project ``allow_ultracode`` is enforced separately by ``validate_effort``
+    at job-start time, so a global ``ultracode`` default against a disallowing
+    project fails closed there — which is the correct, safe behavior.
+    """
+    raw = environment.get(name)
+    if raw is None or raw == "":
+        return default
+    value = raw.strip()
+    if value not in ("high", "ultracode"):
+        raise RuntimeError(f"{name} must be 'high' or 'ultracode'")
+    return value  # type: ignore[return-value]
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     projects_config_path: Path
@@ -85,6 +173,9 @@ class Settings:
     claude_stream_json: bool
     max_delegations_per_job: int
     reader_injection_defense: bool
+    claude_launch_command: tuple[str, ...]
+    claude_review_launch_command: tuple[str, ...]
+    claude_default_effort: Effort
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str] | None = None) -> "Settings":
@@ -195,4 +286,13 @@ class Settings:
                 env, "MAX_DELEGATIONS_PER_JOB", 3
             ),
             reader_injection_defense=_truthy(env, "READER_INJECTION_DEFENSE"),
+            claude_launch_command=_launch_command(
+                env, "CLAUDE_LAUNCH_COMMAND", _DEFAULT_LAUNCH_COMMAND
+            ),
+            claude_review_launch_command=_launch_command(
+                env, "CLAUDE_REVIEW_LAUNCH_COMMAND", _DEFAULT_LAUNCH_COMMAND
+            ),
+            claude_default_effort=_effort(
+                env, "CLAUDE_DEFAULT_EFFORT", "high"
+            ),
         )

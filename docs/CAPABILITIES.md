@@ -125,8 +125,8 @@ Top level (a `ProjectRegistryDocument`, Pydantic, `extra="forbid"`):
 | `supply_chain_scans` | list of `SupplyChainCommand` | severity-gated commit-time scans |
 | `runtime_verification_commands` | list of `RuntimeVerificationCommand` | host-runtime checks |
 | `working_tree_capture_scope` | `WorkingTreeCaptureScope` or null | pinned include/protected-exclude scope |
-| `default_effort` | `"high"` \| `"ultracode"` (default `high`) | per-project default |
-| `allow_ultracode` | bool (default true) | must be true if `default_effort` is `ultracode` |
+| `default_effort` | `"high"` \| `"ultracode"` or null (default null) | per-project default; null inherits the global `CLAUDE_DEFAULT_EFFORT` |
+| `allow_ultracode` | bool (default true) | must be true if `default_effort` is `ultracode`; a global `ultracode` default is rejected at job start when false |
 | `self_managed` | bool (default false) | enables candidate self-test; forbids `markdown_write` |
 | `requires_review` | bool (default false) | commit requires a consumed `review_id` |
 | `allow_bridge_reviewer` | bool (default false) | enables `run_independent_review` |

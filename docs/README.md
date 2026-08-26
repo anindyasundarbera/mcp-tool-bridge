@@ -49,8 +49,6 @@ state**.
 | Document | What it covers |
 |---|---|
 | [MCPB-ROADMAP.md](MCPB-ROADMAP.md) | The capability roadmap: audits all 149 capability items against the real codebase (DONE/PARTIAL/MISSING) and turns each unclosed gap into an implementable milestone |
-| [NEXT-SESSION-CAPABILITY-ELEVATION.md](NEXT-SESSION-CAPABILITY-ELEVATION.md) | Handoff for the capability-elevation session (tasks 1–8) |
-| [NEXT-SESSION-MCPB-003.md](NEXT-SESSION-MCPB-003.md) … [NEXT-SESSION-MCPB-006.md](NEXT-SESSION-MCPB-006.md) | Per-milestone next-session handoffs |
 | [MCPB-CAPABILITY-ELEVATION.html](MCPB-CAPABILITY-ELEVATION.html) | Open-source scan report: 11 capability elevations in priority order + 3 plan-changing findings |
 | [MIGRATION_FROM_V1.md](MIGRATION_FROM_V1.md) | Migrating from the v1 single-project bridge to the multi-project v2 registry |
 

@@ -30,6 +30,17 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse(settings.reader_injection_defense)
         self.assertTrue(settings.projects_config_path.is_absolute())
         self.assertEqual(settings.projects_config_path.name, "projects.json")
+        # The default launch command is the literal tuple, byte-identical to the
+        # previous hardcoded argv, so the out-of-the-box behavior is unchanged.
+        self.assertEqual(
+            settings.claude_launch_command,
+            ("ollama", "launch", "claude", "--model", "{model}", "--yes", "--", "-p"),
+        )
+        self.assertEqual(
+            settings.claude_review_launch_command,
+            ("ollama", "launch", "claude", "--model", "{model}", "--yes", "--", "-p"),
+        )
+        self.assertEqual(settings.claude_default_effort, "high")
 
     def test_reader_injection_defense_flag(self) -> None:
         self.assertFalse(Settings.from_env({}).reader_injection_defense)
@@ -64,6 +75,76 @@ class SettingsTests(unittest.TestCase):
     def test_accepts_absolute_config_path(self) -> None:
         settings = Settings.from_env({"PROJECTS_CONFIG_PATH": "/tmp/projects.json"})
         self.assertEqual(settings.projects_config_path, Path("/tmp/projects.json"))
+
+
+class LaunchCommandSettingsTests(unittest.TestCase):
+    def test_custom_launch_command_shlex_split(self) -> None:
+        settings = Settings.from_env(
+            {"CLAUDE_LAUNCH_COMMAND": "claude --model {model} -p"}
+        )
+        self.assertEqual(
+            settings.claude_launch_command,
+            ("claude", "--model", "{model}", "-p"),
+        )
+
+    def test_review_launch_command_is_independent(self) -> None:
+        settings = Settings.from_env(
+            {
+                "CLAUDE_LAUNCH_COMMAND": "claude --model {model} -p",
+                "CLAUDE_REVIEW_LAUNCH_COMMAND": "claude --model {model} --review -p",
+            }
+        )
+        self.assertEqual(settings.claude_launch_command[-1], "-p")
+        self.assertIn("--review", settings.claude_review_launch_command)
+
+    def test_rejects_launch_command_without_model_token(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "standalone '\\{model\\}'"):
+            Settings.from_env({"CLAUDE_LAUNCH_COMMAND": "claude -p"})
+
+    def test_rejects_model_substring_token(self) -> None:
+        # ``prefix{model}`` is not a standalone token and must be rejected so the
+        # bridge never silently emits a literal ``prefix{model}`` to the runtime.
+        with self.assertRaisesRegex(RuntimeError, "standalone '\\{model\\}'"):
+            Settings.from_env({"CLAUDE_LAUNCH_COMMAND": "claude --model prefix{model} -p"})
+
+    def test_rejects_empty_launch_command(self) -> None:
+        # Whitespace-only splits to zero tokens.
+        with self.assertRaisesRegex(RuntimeError, "must not be empty"):
+            Settings.from_env({"CLAUDE_LAUNCH_COMMAND": "   "})
+
+    def test_rejects_empty_token_in_launch_command(self) -> None:
+        # A quoted empty argument is an empty token, which is also rejected.
+        with self.assertRaisesRegex(RuntimeError, "empty tokens"):
+            Settings.from_env({"CLAUDE_LAUNCH_COMMAND": "claude '' {model}"})
+
+    def test_rejects_too_many_tokens(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "at most 16 tokens"):
+            Settings.from_env(
+                {"CLAUDE_LAUNCH_COMMAND": " ".join(["x"] * 17) + " {model}"}
+            )
+
+    def test_empty_string_falls_back_to_default(self) -> None:
+        settings = Settings.from_env({"CLAUDE_LAUNCH_COMMAND": ""})
+        self.assertEqual(settings.claude_launch_command[0], "ollama")
+
+
+class DefaultEffortSettingsTests(unittest.TestCase):
+    def test_claude_default_effort_validation(self) -> None:
+        self.assertEqual(
+            Settings.from_env({"CLAUDE_DEFAULT_EFFORT": "high"}).claude_default_effort,
+            "high",
+        )
+        self.assertEqual(
+            Settings.from_env({"CLAUDE_DEFAULT_EFFORT": "ultracode"}).claude_default_effort,
+            "ultracode",
+        )
+        with self.assertRaisesRegex(RuntimeError, "must be 'high' or 'ultracode'"):
+            Settings.from_env({"CLAUDE_DEFAULT_EFFORT": "bogus"})
+        # Empty/absent falls back to the default.
+        self.assertEqual(
+            Settings.from_env({"CLAUDE_DEFAULT_EFFORT": ""}).claude_default_effort,
+            "high",
+        )
 
 
 def _policy(**overrides: object) -> ProjectPolicy:

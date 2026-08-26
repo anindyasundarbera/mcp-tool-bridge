@@ -124,7 +124,7 @@ class ServerSchemaTests(unittest.TestCase):
         )
         self.assertEqual(
             tools["resume_development_job"].parameters["properties"]["effort"]["default"],
-            "high",
+            None,
         )
 
         verification_tools = {

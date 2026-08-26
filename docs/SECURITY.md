@@ -18,7 +18,8 @@ These hold for every tool, every milestone, and every project configuration.
 A milestone that needs to relax one requires an explicit, recorded decision.
 
 1. **OpenAI connector mTLS protects the public ngrok endpoint.** Expose only
-   the MCP server port; never expose Ollama or the local filesystem directly.
+   the MCP server port; never expose the configured Claude launcher or the local
+   filesystem directly.
 2. **The local project registry (`projects.json`) is the only authorization
    source of truth.** Unknown, disabled, malformed, or unauthorized projects
    fail closed. Enforce authorization and validation in server code; do not
