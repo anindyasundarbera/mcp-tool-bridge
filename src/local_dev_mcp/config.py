@@ -47,6 +47,23 @@ def _positive_float(environment: Mapping[str, str], name: str, default: float) -
     return value
 
 
+def _non_negative_float(environment: Mapping[str, str], name: str, default: float) -> float:
+    """Parse a non-negative float (>= 0). 0/unset means disabled.
+
+    Used for opt-in thresholds such as the scope-growth factor: a value of 0
+    disables the trigger so existing projects are unaffected (the disabled
+    path is the default).
+    """
+    raw = environment.get(name, str(default))
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number") from exc
+    if value < 0:
+        raise RuntimeError(f"{name} must be greater than or equal to zero")
+    return value
+
+
 def _port(environment: Mapping[str, str], name: str, default: int) -> int:
     value = _positive_int(environment, name, default)
     if value > 65535:
@@ -189,6 +206,24 @@ class Settings:
     claude_hard_wall_seconds: int
     claude_checkpoint_interval_seconds: float
     claude_checkpoint_max: int
+    # M-CT-07: progress-intelligence enrichment thresholds. Additive pause
+    # conditions that compose with the existing no-progress/hard-turns/wall
+    # checks (M-CT-02). All bounded and disabled-by-default where sensible.
+    # ``claude_oscillation_window``: min consecutive checkpoints to compare
+    #   for the oscillating-edits trigger (a path flip-flops between two
+    #   contents). Default 4.
+    # ``claude_oscillation_alternations``: min content alternations between
+    #   two distinct fingerprints within the window. Default 2.
+    # ``claude_scope_growth_factor``: cumulative changed-path count must
+    #   exceed ``earliest_count * factor`` (when no declared scope is
+    #   present). 0.0 disables the factor path (the default). A declared
+    #   ``delegation_mandate.outputs`` scope is always enforced regardless.
+    # ``claude_progress_intel_window``: cap on the number of recent
+    #   checkpoints loaded for comparison. Default 8.
+    claude_oscillation_window: int
+    claude_oscillation_alternations: int
+    claude_scope_growth_factor: float
+    claude_progress_intel_window: int
     claude_stream_json: bool
     max_delegations_per_job: int
     reader_injection_defense: bool
@@ -302,6 +337,18 @@ class Settings:
             ),
             claude_checkpoint_max=_positive_int(
                 env, "CLAUDE_CHECKPOINT_MAX", 500
+            ),
+            claude_oscillation_window=_positive_int(
+                env, "CLAUDE_OSCILLATION_WINDOW", 4
+            ),
+            claude_oscillation_alternations=_positive_int(
+                env, "CLAUDE_OSCILLATION_ALTERNATIONS", 2
+            ),
+            claude_scope_growth_factor=_non_negative_float(
+                env, "CLAUDE_SCOPE_GROWTH_FACTOR", 0.0
+            ),
+            claude_progress_intel_window=_positive_int(
+                env, "CLAUDE_PROGRESS_INTEL_WINDOW", 8
             ),
             claude_stream_json=_truthy(env, "CLAUDE_STREAM_JSON"),
             max_delegations_per_job=_positive_int(

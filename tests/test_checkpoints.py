@@ -262,6 +262,136 @@ class StreamingDetailExecutor:
         }
 
 
+class OscillatingEditsExecutor:
+    """M-CT-07: writes the same file with alternating content (A/B/A/B) across
+    slices and returns a max_turns terminal reason each time.
+
+    The changed-path set stays ``{file.txt}`` while the content (and thus the
+    partial fingerprint) flip-flops between two distinct values. With the
+    default oscillation window (4) and alternations (2), the progress-
+    intelligence helper detects the oscillation and the ``_run`` loop pauses
+    with ``pause_reason == "oscillating_edits"`` before the generic no-progress
+    check fires.
+    """
+
+    def __init__(self, num_turns: int = 5) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.num_turns = num_turns
+
+    async def execute(
+        self,
+        project: ProjectPolicy,
+        specification: str,
+        effort: str,
+        *,
+        root: Path | None = None,
+        resume_session_id: str | None = None,
+        max_turns: int | None = None,
+    ) -> dict[str, Any]:
+        assert root is not None
+        n = len(self.calls) + 1
+        self.calls.append(
+            {"root": root, "resume_session_id": resume_session_id, "max_turns": max_turns}
+        )
+        # Alternate between two distinct contents so the partial fingerprint
+        # flip-flops while the path set stays {file.txt}.
+        content = "a\n" if n % 2 == 1 else "b\n"
+        (root / "file.txt").write_text(content, encoding="utf-8")
+        return {
+            "status": "failed",
+            "terminal_reason": "max_turns",
+            "num_turns": self.num_turns,
+            "session_id": "bridge-session-oscillate",
+            "result": f"slice {n}",
+        }
+
+
+class ScopeGrowthExecutor:
+    """M-CT-07: writes a new file each slice so the cumulative changed-path
+    count grows without bound.
+
+    With ``CLAUDE_SCOPE_GROWTH_FACTOR=3.0`` and one file per slice, the
+    cumulative count crosses ``earliest_count * factor`` at the fourth slice
+    and the ``_run`` loop pauses with ``pause_reason == "scope_growth"``.
+    """
+
+    def __init__(self, num_turns: int = 5) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.num_turns = num_turns
+
+    async def execute(
+        self,
+        project: ProjectPolicy,
+        specification: str,
+        effort: str,
+        *,
+        root: Path | None = None,
+        resume_session_id: str | None = None,
+        max_turns: int | None = None,
+    ) -> dict[str, Any]:
+        assert root is not None
+        n = len(self.calls) + 1
+        self.calls.append(
+            {"root": root, "resume_session_id": resume_session_id, "max_turns": max_turns}
+        )
+        (root / f"step{n}.txt").write_text(f"step {n}\n", encoding="utf-8")
+        return {
+            "status": "failed",
+            "terminal_reason": "max_turns",
+            "num_turns": self.num_turns,
+            "session_id": "bridge-session-scope",
+            "result": f"slice {n}",
+        }
+
+
+class WeakenedTestsExecutor:
+    """M-CT-07: writes a Python test file with a shrinking assertion count
+    while reporting a green (passed) test result via stream events.
+
+    The first slice writes ``test_something.py`` with 5 assertions; the second
+    rewrites it with 2. The detail sidecar's ``tests_json`` carries a passed
+    ``test_result`` event on both slices, so the weakened-tests helper detects
+    the assertion-count drop while the test stays green and the ``_run`` loop
+    pauses with ``pause_reason == "weakened_tests"``.
+    """
+
+    def __init__(self, num_turns: int = 5) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.num_turns = num_turns
+
+    async def execute(
+        self,
+        project: ProjectPolicy,
+        specification: str,
+        effort: str,
+        *,
+        root: Path | None = None,
+        resume_session_id: str | None = None,
+        max_turns: int | None = None,
+    ) -> dict[str, Any]:
+        assert root is not None
+        n = len(self.calls) + 1
+        self.calls.append(
+            {"root": root, "resume_session_id": resume_session_id, "max_turns": max_turns}
+        )
+        # First slice: 5 assertions. Second slice: 2 assertions (weakened).
+        count = 5 if n == 1 else 2
+        lines = [f"    assert {i} == {i}\n" for i in range(1, count + 1)]
+        (root / "test_something.py").write_text(
+            "def test_weak():\n" + "".join(lines), encoding="utf-8"
+        )
+        return {
+            "status": "failed",
+            "terminal_reason": "max_turns",
+            "num_turns": self.num_turns,
+            "session_id": "bridge-session-weakened",
+            "result": f"slice {n}",
+            "stream_events": [
+                {"type": "test_result", "data": {"name": "test_weak", "passed": True}},
+            ],
+        }
+
+
 class CheckpointTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -708,6 +838,114 @@ class CheckpointTests(unittest.TestCase):
                 manager, self.project, job_id, {"completed"}
             )
             self.assertTrue(completed["budget"]["soft_warned"])
+
+        asyncio.run(exercise())
+
+    def test_oscillating_edits_pause_with_distinct_reason(self) -> None:
+        """M-CT-07: a path that flip-flops between two contents across >=4
+        checkpoints pauses with ``pause_reason == "oscillating_edits"`` rather
+        than the generic no-progress label.
+
+        The fake executor writes ``file.txt`` with alternating content (A/B)
+        on each max_turns slice. The changed-path set stays ``{file.txt}``
+        while the partial fingerprint alternates; the progress-intelligence
+        helper detects the oscillation and the ``_run`` loop pauses before
+        the generic no-progress budget check fires.
+        """
+
+        async def exercise() -> None:
+            settings = continuity_settings(
+                self.base,
+                CLAUDE_MAX_NO_PROGRESS_TURNS="100",
+                CLAUDE_MAX_EXTENSIONS="10",
+                CLAUDE_HARD_TURNS="1000",
+                CLAUDE_CHECKPOINT_INTERVAL_SECONDS="999",
+            )
+            executor = OscillatingEditsExecutor(num_turns=5)
+            manager = DevelopmentJobManager(
+                settings, ProjectLockManager(), executor  # type: ignore[arg-type]
+            )
+            started = await manager.start(self.project, "work", "high")
+            job_id = str(started["job_id"])
+            paused = await wait_for_status(
+                manager, self.project, job_id, {"paused_budget_exhausted"}
+            )
+            self.assertEqual(paused["status"], "paused_budget_exhausted")
+            self.assertEqual(paused["pause_reason"], "oscillating_edits")
+            # The executor was invoked at least 3 times (one per slice). With a
+            # boundary + extension checkpoint per slice, the oscillation window
+            # (>=4 checkpoints, >=2 alternations) is satisfied at the third
+            # slice's boundary checkpoint.
+            self.assertGreaterEqual(len(executor.calls), 3)
+
+        asyncio.run(exercise())
+
+    def test_scope_growth_pause_with_distinct_reason(self) -> None:
+        """M-CT-07: a cumulative changed-path count that grows beyond
+        ``earliest_count * factor`` pauses with
+        ``pause_reason == "scope_growth"``.
+
+        The fake executor writes a new file each slice so the cumulative
+        changed-path count grows by one per slice. With a factor of 3.0 and
+        one file in the first checkpoint, the fourth slice crosses the
+        threshold (4 > 1 * 3.0).
+        """
+
+        async def exercise() -> None:
+            settings = continuity_settings(
+                self.base,
+                CLAUDE_SCOPE_GROWTH_FACTOR="3.0",
+                CLAUDE_MAX_NO_PROGRESS_TURNS="100",
+                CLAUDE_MAX_EXTENSIONS="10",
+                CLAUDE_HARD_TURNS="1000",
+                CLAUDE_CHECKPOINT_INTERVAL_SECONDS="999",
+            )
+            executor = ScopeGrowthExecutor(num_turns=5)
+            manager = DevelopmentJobManager(
+                settings, ProjectLockManager(), executor  # type: ignore[arg-type]
+            )
+            started = await manager.start(self.project, "work", "high")
+            job_id = str(started["job_id"])
+            paused = await wait_for_status(
+                manager, self.project, job_id, {"paused_budget_exhausted"}
+            )
+            self.assertEqual(paused["status"], "paused_budget_exhausted")
+            self.assertEqual(paused["pause_reason"], "scope_growth")
+            self.assertGreaterEqual(len(executor.calls), 4)
+
+        asyncio.run(exercise())
+
+    def test_weakened_tests_pause_with_distinct_reason(self) -> None:
+        """M-CT-07: a test file whose assertion count drops while it stays
+        green pauses with ``pause_reason == "weakened_tests"``.
+
+        The fake executor writes ``test_something.py`` with 5 assertions on the
+        first slice and 2 on the second, while reporting a passed
+        ``test_result`` stream event on both. The helper reads the file's
+        assertion markers, compares against the in-memory baseline, and
+        detects the drop.
+        """
+
+        async def exercise() -> None:
+            settings = continuity_settings(
+                self.base,
+                CLAUDE_MAX_NO_PROGRESS_TURNS="100",
+                CLAUDE_MAX_EXTENSIONS="10",
+                CLAUDE_HARD_TURNS="1000",
+                CLAUDE_CHECKPOINT_INTERVAL_SECONDS="999",
+            )
+            executor = WeakenedTestsExecutor(num_turns=5)
+            manager = DevelopmentJobManager(
+                settings, ProjectLockManager(), executor  # type: ignore[arg-type]
+            )
+            started = await manager.start(self.project, "work", "high")
+            job_id = str(started["job_id"])
+            paused = await wait_for_status(
+                manager, self.project, job_id, {"paused_budget_exhausted"}
+            )
+            self.assertEqual(paused["status"], "paused_budget_exhausted")
+            self.assertEqual(paused["pause_reason"], "weakened_tests")
+            self.assertGreaterEqual(len(executor.calls), 2)
 
         asyncio.run(exercise())
 

@@ -276,7 +276,7 @@ authoritative input to the implementation order in "Recommended next action".
 | M-CT-04 | Atomic milestone execution | PARTIAL | Add `completed_milestones`/`remaining_milestones` to `_snapshot` (partition by `closed`); test the `acceptance_command_id` pass/fail/unknown branches; (optional) typed `Milestone` model. |
 | M-CT-05 | BLOCKED_INPUT_REQUIRED + QUARANTINED_PROVENANCE reachable | PARTIAL | Make `_run` enter `QUARANTINED_PROVENANCE` on real provenance corruption (fingerprint mismatch / re-derive failure) instead of raising PublicationError; add a stream-json `input required` signal to `_blocked_input_signal`; reachability tests. |
 | M-CT-06 | Diff summary + validation evidence in terminal report | PARTIAL | Add `diff_summary` (bounded redacted `git diff --stat`) and `validation_evidence` (pass/fail + ids when a verifications/reviews row exists) to `jobs.py:_snapshot`; tests. |
-| M-CT-07 | Progress-intelligence enrichment | PARTIAL | Compare consecutive checkpoints in `_record_checkpoint` for oscillating edits / scope growth / weakened tests; pause with distinct `pause_reason` per trigger; tests. |
+| M-CT-07 | Progress-intelligence enrichment | DONE | Compare consecutive checkpoints in `_record_checkpoint` for oscillating edits / scope growth / weakened tests; pause with distinct `pause_reason` per trigger; tests. |
 | M-EV-01 | Requirement traceability | PARTIAL | Wire `RequirementManager` into jobs/server (scan/parse on job create, persist links); surface `requirements_covered` in `get_development_job`/`get_project_status`; full matrix() covered/uncovered/contradictory + deferrals-with-authority; tests. |
 | M-EV-02 | Structured verification result schema + env fingerprint | PARTIAL | Compute `environment_digest` (SHA-256 over python ver + allowlisted env + argv + toolchain pin); add named fields (candidate_fingerprint/base_commit/environment_digest/conclusion or aliases) to verify() response; sidecar `verification_environment` table; tests. |
 | M-EV-03 | Evidence binding completeness | MISSING | Sidecar `verification_bindings`+`review_bindings` (toolchain_digest, reviewer_independence_class, expires_at, authority_ref); stamp independence class on review; reject expired bindings at commit gate; tests. |
@@ -419,20 +419,29 @@ capability are flagged **NEW SURFACE**.
   `get_development_job` on a verified job returns both; no new tool.
 
 #### M-CT-07 Progress-intelligence enrichment
-- **Status:** PARTIAL. **Evidence:** `jobs.py:_run` detects no-progress +
-  tool-failure + extension; missing oscillating-edits, weakened-tests,
-  scope-growth, and confidence signals. **Gap:** ChatGPT's richer escalation
-  triggers.
+- **Status:** DONE. **Evidence:** `jobs.py:_record_checkpoint` now calls
+  `_detect_progress_intelligence`, which loads the last
+  `claude_progress_intel_window` (default 8) checkpoints and runs three
+  additive triggers — oscillating edits, scope growth, weakened tests — each
+  pausing as `PAUSED_BUDGET_EXHAUSTED` with a distinct `pause_reason`
+  (`oscillating_edits` / `scope_growth` / `weakened_tests`). The triggers
+  compose with the existing no-progress/hard-turns/wall (M-CT-02) checks and
+  take precedence so the specific reason is not masked. Thresholds are in
+  `config.py` (oscillation window 4, alternations 2, scope-growth factor 0.0
+  = disabled by default, progress-intel window 8); no new MCP tool, no new
+  table, `SCHEMA_VERSION` stays 1, tool-count canary stays 32.
 - **Build:** `jobs.py:_record_checkpoint` — compare consecutive checkpoints:
-  oscillating edits (a path flip-flops between two contents over N samples),
-  scope growth (changed-path count grows beyond the spec's declared scope),
+  oscillating edits (a path set flip-flops between two fingerprints over N
+  samples, scoped to the most recent changed-path set), scope growth
+  (cumulative changed-path count exceeds a declared `delegation_mandate.outputs`
+  scope, or `earliest_count * factor` when no declared scope and factor > 0),
   weakened-tests (a test file's assertion count drops while it stays green —
-  best-effort via the reader). On detection, pause as
-  `PAUSED_BUDGET_EXHAUSTED` with a specific `pause_reason`. Confidence/elapsed
-  remain best-effort labels in the report. **Tests:** `tests/test_checkpoints.py`
-  — an oscillating executor pauses with the oscillation reason; scope-growth
-  pauses. **Acceptance:** the three triggers pause with distinct reasons; no
-  new tool.
+  best-effort via a bounded path-safe worktree read; non-fatal if unreadable).
+  On detection, pause as `PAUSED_BUDGET_EXHAUSTED` with a specific
+  `pause_reason`; a `progress_intel` audit event is recorded. **Tests:**
+  `tests/test_checkpoints.py` — an oscillating executor pauses with the
+  oscillation reason; scope-growth pauses; weakened-tests pauses. **Acceptance:**
+  the three triggers pause with distinct reasons; no new tool.
 
 ### Release 2 — Evidence (the next release to implement)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import secrets
 import stat
 import subprocess
@@ -356,6 +357,57 @@ def _json_loads(value: str | None) -> Any:
         return None
 
 
+# M-CT-07: best-effort test-file detection and assertion counting. Bounded and
+# non-fatal: an unreadable or non-UTF-8 file yields ``None``/``False`` so the
+# weakened-tests trigger never crashes the run loop.
+
+_TEST_FILE_PATTERN = re.compile(r"(^|/)(test_[^/]+\.py|[^/]+_test\.py)$", re.IGNORECASE)
+
+
+def _looks_like_test_file(relative: str) -> bool:
+    """Heuristic: does a relative path look like a Python test file?"""
+    return bool(_TEST_FILE_PATTERN.search(relative))
+
+
+# Bounded read ceiling for the assertion-count heuristic (256 KiB). A test
+# file larger than this is treated as unreadable so the detection helper stays
+# bounded in both time and memory.
+_TEST_ASSERTION_READ_LIMIT = 262144
+
+
+def _count_test_assertions(worktree_path: Path, relative: str) -> int | None:
+    """Best-effort count of assertion markers in one test file.
+
+    Reads the file from the worktree (path-safe: the relative path is taken
+    from the checkpoint's changed-path set, never caller-supplied), counts
+    non-comment lines containing ``assert`` (a rough proxy covering both
+    ``assert`` statements and ``self.assertX`` unittest calls), and returns
+    the count. Non-fatal: any error (missing file, decode failure, oversize)
+    yields ``None`` so the caller simply skips the file.
+    """
+    try:
+        full = worktree_path / relative
+        if not full.is_file():
+            return None
+        size = full.stat().st_size
+        if size > _TEST_ASSERTION_READ_LIMIT:
+            return None
+        data = full.read_bytes()
+        if len(data) > _TEST_ASSERTION_READ_LIMIT:
+            return None
+        text = data.decode("utf-8", errors="replace")
+        count = 0
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if "assert" in line:
+                count += 1
+        return count
+    except Exception:
+        return None
+
+
 def job_to_row(job: DevelopmentJob) -> dict[str, Any]:
     """Serialize a job to a dict row for the durable store."""
     worktree_path: str | None = None
@@ -461,6 +513,13 @@ class DevelopmentJobManager:
         # detect progress between checkpoints within a single ``_run``. Not
         # persisted: it is re-derived from checkpoints on resume.
         self._last_changed_paths: dict[str, tuple[str, ...]] = {}
+        # M-CT-07: per-run (in-memory only) progress-intelligence state. Not
+        # persisted: re-derived from checkpoints on resume. ``_progress_intel_reasons``
+        # caches the first detected trigger per job (monotonic — once detected the
+        # condition stays true). ``_test_assertion_baselines`` holds the first
+        # observed assertion count per test file so a later drop can be detected.
+        self._progress_intel_reasons: dict[str, str] = {}
+        self._test_assertion_baselines: dict[str, dict[str, int]] = {}
         # Durable state: re-hydrate every job from disk so a server restart no
         # longer amnesiates in-flight or completed work. Done synchronously in
         # __init__ (only filesystem/DB work, no await) so it works before the
@@ -740,7 +799,207 @@ class DevelopmentJobManager:
             store.insert_checkpoint_detail_row(self._db, detail)
         except Exception:
             pass
+        # M-CT-07: progress-intelligence enrichment. Compare the recent
+        # consecutive checkpoints for oscillating edits, scope growth, and
+        # weakened tests. Non-fatal and bounded: a detection failure never
+        # blocks checkpointing, and the comparison is capped to the last
+        # ``claude_progress_intel_window`` checkpoints. The detected reason is
+        # cached monotonically (once a trigger fires it stays fired) so the
+        # ``_run`` loop can pause at the next slice boundary with a distinct
+        # ``pause_reason`` per trigger.
+        try:
+            reason = self._detect_progress_intelligence(job)
+            if reason is not None:
+                self._progress_intel_reasons.setdefault(job.job_id, reason)
+        except Exception:
+            # A detection helper must never crash the run loop.
+            pass
         return paths
+
+    # ------------------------------------------------------------------
+    # M-CT-07: progress-intelligence detection helpers.
+    #
+    # Each helper is best-effort, bounded, and non-fatal. They load the last
+    # ``claude_progress_intel_window`` checkpoints (ordered by seq) via the
+    # existing ``store.load_checkpoint_rows`` path and return a distinct
+    # ``pause_reason`` string when their trigger fires, or ``None``.
+    # ------------------------------------------------------------------
+
+    def _detect_progress_intelligence(self, job: DevelopmentJob) -> str | None:
+        """Run all three M-CT-07 triggers against the recent checkpoints.
+
+        Returns the first detected ``pause_reason`` (oscillating_edits /
+        scope_growth / weakened_tests), or ``None`` when no trigger fires.
+        The checks are ordered cheapest-first and short-circuit on the first
+        hit. Bounded: at most ``claude_progress_intel_window`` checkpoints are
+        loaded and compared.
+        """
+        window = self.settings.claude_progress_intel_window
+        rows = store.load_checkpoint_rows(self._db, job.job_id)
+        if len(rows) < 2:
+            return None
+        recent = rows[-window:]
+        reason = self._detect_oscillating_edits(job, recent)
+        if reason is not None:
+            return reason
+        reason = self._detect_scope_growth(job, recent)
+        if reason is not None:
+            return reason
+        reason = self._detect_weakened_tests(job, recent)
+        if reason is not None:
+            return reason
+        return None
+
+    def _detect_oscillating_edits(
+        self, job: DevelopmentJob, checkpoints: list[dict[str, Any]]
+    ) -> str | None:
+        """A path set flip-flops between two contents over N samples.
+
+        A trigger fires when, within the window, there are at least
+        ``claude_oscillation_window`` checkpoints carrying a fingerprint, the
+        fingerprints take exactly two distinct values, and the number of
+        alternations (transitions between the two values) is at least
+        ``claude_oscillation_alternations``. The comparison is scoped to
+        checkpoints that share the most recent changed-path set so a scope
+        change is not misread as oscillation.
+        """
+        window = self.settings.claude_oscillation_window
+        alternations_min = self.settings.claude_oscillation_alternations
+        if len(checkpoints) < window:
+            return None
+        # Build (paths_frozenset, fingerprint) pairs, skipping checkpoints with
+        # no fingerprint (the sampler may record None mid-flight).
+        pairs: list[tuple[frozenset[str], str]] = []
+        for cp in checkpoints:
+            fp = cp.get("partial_fingerprint")
+            if not fp:
+                continue
+            paths = _json_loads(cp.get("changed_paths_json"))
+            paths_set = frozenset(paths) if isinstance(paths, list) else frozenset()
+            pairs.append((paths_set, fp))
+        if len(pairs) < window:
+            return None
+        # Scope the oscillation test to the most recent path set so a growing
+        # scope is not misclassified as a flip-flop.
+        recent_paths = pairs[-1][0]
+        sub = [fp for (p, fp) in pairs if p == recent_paths]
+        if len(sub) < window:
+            return None
+        distinct = set(sub)
+        if len(distinct) != 2:
+            return None
+        alternations = sum(1 for i in range(1, len(sub)) if sub[i] != sub[i - 1])
+        if alternations < alternations_min:
+            return None
+        return "oscillating_edits"
+
+    def _detect_scope_growth(
+        self, job: DevelopmentJob, checkpoints: list[dict[str, Any]]
+    ) -> str | None:
+        """The cumulative changed-path count grows beyond the declared scope.
+
+        A trigger fires when the union of changed paths across the window
+        exceeds a declared scope (``delegation_mandate.outputs`` when present)
+        or, when no declared scope is available and the configurable factor is
+        positive, exceeds ``earliest_count * factor``. The factor path is
+        disabled by default (``claude_scope_growth_factor == 0``).
+        """
+        if not checkpoints:
+            return None
+        cumulative: set[str] = set()
+        for cp in checkpoints:
+            paths = _json_loads(cp.get("changed_paths_json"))
+            if isinstance(paths, list):
+                cumulative.update(str(p) for p in paths)
+        cumulative_count = len(cumulative)
+        # Declared scope: a delegated child's mandate ``outputs`` is the
+        # authoritative bound. Always enforced when present.
+        declared: int | None = None
+        if job.delegation_mandate is not None:
+            outputs = job.delegation_mandate.get("outputs")
+            if isinstance(outputs, list):
+                declared = len(outputs)
+        if declared is not None:
+            if cumulative_count > declared:
+                return "scope_growth"
+            return None
+        # Fallback: configurable growth factor over the earliest checkpoint.
+        factor = self.settings.claude_scope_growth_factor
+        if factor <= 0:
+            return None
+        earliest_paths = _json_loads(checkpoints[0].get("changed_paths_json"))
+        earliest_count = (
+            len(earliest_paths) if isinstance(earliest_paths, list) else 0
+        )
+        if earliest_count > 0 and cumulative_count > earliest_count * factor:
+            return "scope_growth"
+        return None
+
+    def _detect_weakened_tests(
+        self, job: DevelopmentJob, checkpoints: list[dict[str, Any]]
+    ) -> str | None:
+        """A test file's assertion count drops while it stays green.
+
+        Best-effort: reads each test file in the most recent changed set from
+        the worktree, counts assertion markers, and compares against the first
+        observed count for that file (the baseline, kept in-memory per run). A
+        drop triggers only when the latest checkpoint's detail sidecar shows
+        a green (passed) test. Non-fatal: an unreadable file or a missing
+        detail row yields no trigger.
+        """
+        if job.worktree is None or not checkpoints:
+            return None
+        latest = checkpoints[-1]
+        latest_paths = _json_loads(latest.get("changed_paths_json"))
+        if not isinstance(latest_paths, list):
+            return None
+        test_files = [p for p in latest_paths if _looks_like_test_file(str(p))]
+        if not test_files:
+            return None
+        # Confirm the latest checkpoint has at least one green test via the
+        # detail sidecar. Non-fatal: no detail row means we cannot confirm
+        # green and so do not trigger.
+        if not self._latest_detail_has_green_test(latest):
+            return None
+        baselines = self._test_assertion_baselines.setdefault(job.job_id, {})
+        worktree_path = job.worktree.path
+        for relative in test_files:
+            current = _count_test_assertions(worktree_path, relative)
+            if current is None:
+                continue
+            baseline = baselines.get(relative)
+            if baseline is None:
+                baselines[relative] = current
+                continue
+            if current < baseline:
+                return "weakened_tests"
+            baselines[relative] = current
+        return None
+
+    def _latest_detail_has_green_test(self, checkpoint: dict[str, Any]) -> bool:
+        """Best-effort: does the checkpoint's detail sidecar show a passed test?
+
+        Loads the detail row for one checkpoint and inspects its ``tests_json``
+        for any entry with ``passed == True``. Non-fatal: a missing or
+        unparseable row yields ``False`` (cannot confirm green → no trigger).
+        """
+        checkpoint_id = checkpoint.get("checkpoint_id")
+        if checkpoint_id is None:
+            return False
+        try:
+            detail_rows = store.load_checkpoint_detail_rows(
+                self._db, [int(checkpoint_id)]
+            )
+        except Exception:
+            return False
+        for row in detail_rows:
+            tests = _json_loads(row.get("tests_json"))
+            if not isinstance(tests, list):
+                continue
+            for entry in tests:
+                if isinstance(entry, dict) and entry.get("passed") is True:
+                    return True
+        return False
 
     def _progressed(self, job: DevelopmentJob) -> bool:
         """True if the last checkpoint's changed set differs from the prior one."""
@@ -1607,6 +1866,10 @@ class DevelopmentJobManager:
             job.candidate = None
             job.error = None
             self._last_changed_paths.pop(job.job_id, None)
+            # M-CT-07: clear per-run progress-intelligence state on resume so a
+            # fresh attempt re-derives from the checkpoint ledger.
+            self._progress_intel_reasons.pop(job.job_id, None)
+            self._test_assertion_baselines.pop(job.job_id, None)
             if is_paused:
                 # Continue the paused run: keep the cumulative budget so the
                 # hard cap still bounds the whole mission, and clear the pause
@@ -2308,6 +2571,32 @@ class DevelopmentJobManager:
                     if blocked_message is not None:
                         job.pause_reason = blocked_message
                         terminal = JobStatus.BLOCKED_INPUT_REQUIRED
+                        break
+
+                    # M-CT-07: progress-intelligence triggers (oscillating edits /
+                    # scope growth / weakened tests). Additive pause conditions
+                    # that compose with the existing budget checks below — they
+                    # take precedence so the distinct ``pause_reason`` per trigger
+                    # is not masked by the generic no-progress/hard-turns labels.
+                    # The reason is cached monotonically by
+                    # ``_record_checkpoint``'s detection helper.
+                    progress_intel_reason = self._progress_intel_reasons.get(
+                        job.job_id
+                    )
+                    if progress_intel_reason is not None:
+                        job.pause_reason = progress_intel_reason
+                        self._record_event(
+                            job,
+                            "progress_intel",
+                            {"trigger": progress_intel_reason},
+                            authority={
+                                "actor": "bridge",
+                                "authority_source": "budget_policy",
+                                "scope": "progress_intelligence",
+                                "classification": "inferred",
+                            },
+                        )
+                        terminal = JobStatus.PAUSED_BUDGET_EXHAUSTED
                         break
 
                     # Non-completed: classify against the budget/progress rules
