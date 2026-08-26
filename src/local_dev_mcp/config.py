@@ -224,6 +224,16 @@ class Settings:
     claude_oscillation_alternations: int
     claude_scope_growth_factor: float
     claude_progress_intel_window: int
+    # M-EV-08: artifact retention + GC policy. Both are opt-in ceilings; a
+    # value of 0 disables that retention path (the default) so existing
+    # projects are unaffected. ``evidence_retention_days`` is the policy
+    # ceiling for evidence rows (verifications/reviews/publications/syncs);
+    # GC never deletes promoted evidence regardless of this setting — it is
+    # recorded as policy only. ``checkpoint_retention_days`` drives the
+    # actual time-based GC of non-promoted checkpoint/detail rows older than
+    # the window. See ``store.gc_artifacts`` for the invariant.
+    evidence_retention_days: int
+    checkpoint_retention_days: int
     claude_stream_json: bool
     max_delegations_per_job: int
     reader_injection_defense: bool
@@ -349,6 +359,13 @@ class Settings:
             ),
             claude_progress_intel_window=_positive_int(
                 env, "CLAUDE_PROGRESS_INTEL_WINDOW", 8
+            ),
+            # M-EV-08: artifact retention + GC policy (opt-in, 0 disables).
+            evidence_retention_days=_non_negative_int(
+                env, "EVIDENCE_RETENTION_DAYS", 0
+            ),
+            checkpoint_retention_days=_non_negative_int(
+                env, "CHECKPOINT_RETENTION_DAYS", 0
             ),
             claude_stream_json=_truthy(env, "CLAUDE_STREAM_JSON"),
             max_delegations_per_job=_positive_int(

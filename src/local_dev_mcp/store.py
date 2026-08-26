@@ -296,6 +296,11 @@ CREATE TABLE IF NOT EXISTS revision_resolves_finding (
     FOREIGN KEY (resolving_checkpoint_id) REFERENCES job_checkpoints(checkpoint_id)
       ON DELETE CASCADE
 );
+-- M-EV-08: additive index backing the time-based GC delete in
+-- ``gc_artifacts`` (retention window scan over ``recorded_at``). Additive
+-- only; ``SCHEMA_VERSION`` stays 1.
+CREATE INDEX IF NOT EXISTS idx_job_checkpoints_recorded_at
+    ON job_checkpoints(recorded_at);
 """
 
 _UPSERT_JOB = """
@@ -1216,6 +1221,160 @@ def compact_checkpoints(
             ),
         )
         return int(cursor.rowcount or 0)
+
+
+# M-EV-08: structural checkpoint kinds that GC always retains, mirroring the
+# ``compact_checkpoints`` default ``keep_kinds``. Boundary/extension/milestone
+# rows are small in number and structurally important (they mark slice
+# boundaries, granted extensions, and milestone closures), so time-based GC
+# never reclaims them — only ``sample``/``turn``/``tool`` rows are eligible.
+_GC_KEEP_KINDS: tuple[str, ...] = ("boundary", "extension", "milestone")
+
+
+def gc_artifacts(
+    connection: sqlite3.Connection,
+    evidence_retention_days: int,
+    checkpoint_retention_days: int,
+    *,
+    now_iso: str | None = None,
+) -> int:
+    """Time-based artifact GC for the durable state database.
+
+    Deletes only non-promoted checkpoint (+ cascaded ``job_checkpoint_detail``)
+    rows whose ``recorded_at`` is older than ``now - checkpoint_retention_days``.
+    Returns the number of deleted checkpoint rows.
+
+    Invariant (promoted-evidence-safe):
+
+      Promoted evidence (verifications, reviews, publications, syncs, and the
+      checkpoints they reference) is never deleted by GC; only non-promoted,
+      non-structural checkpoint/detail rows older than the retention window are
+      reclaimed.
+
+    A checkpoint is protected (never deleted) if ANY of:
+
+      * its ``job_id`` has a row in ``verifications`` with ``used = 1`` (a
+        committed verification), OR
+      * its ``job_id`` has a row in ``reviews`` or ``publications``, OR
+      * it is directly referenced by
+        ``revision_resolves_finding.resolving_checkpoint_id``.
+
+    (The ``syncs`` table is project-level with no ``job_id`` column, so it
+    cannot protect a specific job's checkpoints by id; it is still never
+    deleted by GC — only ``job_checkpoints`` are ever touched here.)
+
+    In addition, structural kinds (``boundary``/``extension``/``milestone``)
+    are always retained, mirroring ``compact_checkpoints``. Rows from
+    ``verifications``, ``reviews``, ``publications``, ``syncs``,
+    ``authorizations``, ``requirements``/``requirement_links``,
+    ``verification_environment``, ``verification_bindings``,
+    ``review_bindings``, ``review_content``, and ``source_classifications`` are
+    never touched.
+
+    ``evidence_retention_days`` is accepted as policy config but does not
+    drive any delete here — promoted evidence is never deleted regardless of
+    its value (it is recorded for future policy use and to keep the GC
+    interface self-documenting). ``checkpoint_retention_days == 0`` (the
+    default) disables time-based GC: the function is a no-op and returns 0.
+
+    Deterministic + testable: store never reads the wall clock. The caller may
+    pin the reference time via ``now_iso`` (an ISO-8601 string in the same
+    ``recorded_at`` shape, e.g. ``2026-08-26T00:00:00Z``); when ``None``, the
+    cutoff is computed from the current UTC time at the call site. The cutoff
+    timestamp is compared lexicographically against ``recorded_at`` (both are
+    fixed-width ``YYYY-MM-DDTHH:MM:SSZ`` strings, so string comparison is
+    chronological). ``SCHEMA_VERSION`` stays 1; the supporting index is
+    additive (``CREATE INDEX IF NOT EXISTS``).
+    """
+    if checkpoint_retention_days <= 0:
+        # Time-based GC disabled (the default). evidence_retention_days is
+        # policy-only and never deletes evidence; with checkpoint GC disabled
+        # there is nothing to do.
+        return 0
+
+    # Compute the cutoff timestamp (oldest a checkpoint may be to survive).
+    # ``recorded_at`` is stored as ``YYYY-MM-DDTHH:MM:SSZ``; we build the
+    # cutoff in the same shape so a lexicographic compare is chronological.
+    from datetime import UTC, datetime, timedelta
+
+    if now_iso is None:
+        now_dt = datetime.now(UTC).replace(microsecond=0)
+    else:
+        # Parse the caller-supplied reference time. Accept either a trailing
+        # ``Z`` or a numeric offset; normalize to UTC.
+        now_dt = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=UTC)
+        else:
+            now_dt = now_dt.astimezone(UTC)
+    cutoff_dt = now_dt - timedelta(days=checkpoint_retention_days)
+    cutoff = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    keep_kind_placeholders = ",".join("?" for _ in _GC_KEEP_KINDS)
+
+    # Protected set 1: job_ids that have promoted evidence. A job with a
+    # committed verification (used=1), OR any review/publication row, is
+    # promoted — all of its checkpoints survive GC forever. (The ``syncs``
+    # table is project-level with no ``job_id`` column, so it cannot protect
+    # a specific job's checkpoints; it is still never deleted by GC — only
+    # ``job_checkpoints`` are ever touched here.)
+    protected_job_ids: set[str] = set()
+    for row in connection.execute(
+        "SELECT DISTINCT job_id FROM verifications WHERE used = 1"
+    ).fetchall():
+        protected_job_ids.add(row["job_id"])
+    for statement in (
+        "SELECT DISTINCT job_id FROM reviews",
+        "SELECT DISTINCT job_id FROM publications",
+    ):
+        for row in connection.execute(statement).fetchall():
+            protected_job_ids.add(row["job_id"])
+
+    # Protected set 2: checkpoint_ids directly referenced by a
+    # revision→finding resolution link. These survive GC even if the job has
+    # no promoted evidence row.
+    protected_checkpoint_ids: set[int] = set()
+    for row in connection.execute(
+        "SELECT DISTINCT resolving_checkpoint_id FROM revision_resolves_finding "
+        "WHERE resolving_checkpoint_id IS NOT NULL"
+    ).fetchall():
+        protected_checkpoint_ids.add(int(row["resolving_checkpoint_id"]))
+
+    # Build the DELETE with parameterized NOT-IN guards. Both protected sets
+    # are baked into the query as literals only after failing-closed checks
+    # (the values are internal IDs, never caller-supplied free text). Use
+    # parameter placeholders for the cutoff and the keep-kinds tuple.
+    with connection:
+        if protected_job_ids:
+            job_placeholders = ",".join("?" for _ in protected_job_ids)
+            job_guard = f"AND job_id NOT IN ({job_placeholders}) "
+            job_params: tuple[Any, ...] = tuple(protected_job_ids)
+        else:
+            job_guard = ""
+            job_params = ()
+        if protected_checkpoint_ids:
+            cp_placeholders = ",".join("?" for _ in protected_checkpoint_ids)
+            cp_guard = f"AND checkpoint_id NOT IN ({cp_placeholders}) "
+            cp_params: tuple[Any, ...] = tuple(protected_checkpoint_ids)
+        else:
+            cp_guard = ""
+            cp_params = ()
+        cursor = connection.execute(
+            f"DELETE FROM job_checkpoints "
+            f"WHERE recorded_at < ? "
+            f"AND kind NOT IN ({keep_kind_placeholders}) "
+            f"{job_guard}{cp_guard}",
+            (
+                cutoff,
+                *_GC_KEEP_KINDS,
+                *job_params,
+                *cp_params,
+            ),
+        )
+        deleted = int(cursor.rowcount or 0)
+    # The job_checkpoint_detail rows cascade via the FK ON DELETE CASCADE
+    # (foreign_keys=ON in open_state_db). Callers verify the cascade in tests.
+    return deleted
 
 
 def _seed_source_classifications(connection: sqlite3.Connection) -> None:

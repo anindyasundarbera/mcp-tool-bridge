@@ -284,7 +284,7 @@ authoritative input to the implementation order in "Recommended next action".
 | M-EV-05 | Source classifications + authority-behind-instructions | DONE | — (source_classifications + authority_records tables, seeded vocabulary, _record_event stamps authority_ref; tests) |
 | M-EV-06 | Portable evidence bundle export | DONE | — (NEW SURFACE shipped earlier: `ProjectCapability.EXPORT_EVIDENCE_BUNDLE` + `export_evidence_bundle` tool; this commit closes the audit gap: `RequirementManager` coverage section wired into `EvidenceBundleManager.export_bundle` via lazy `jobs._requirements_manager()`; explicit `.env`/`.venv`/token/cert/`.pem`/`.key`/secrets/`.aws`/`.ssh` exclude filter on changed_paths + diff detail with `sensitive_excluded_count`; non-fatal requirement section; tests/test_evidence_bundle.py SensitivePathFilterTests + coverage cases; zip serialization deferred as optional) |
 | M-EV-07 | Nondeterminism detection + deterministic replay | DONE | — (verification.py:verify runs each command `verification_deterministic_repetitions` times and labels divergence via `_commands_diverge` comparing status/exit_code/stderr → `nondeterminism_labeled` + `infrastructure_status=DEGRADED`; `compute_environment_digest` + per-command `command_digest` (M-EV-02) persisted; tests/test_verification.py M-EV-07 flaky + deterministic-control cases; `replay_verification` NEW-SURFACE tool intentionally deferred — no new surface shipped here) |
-| M-EV-08 | Artifact retention + GC policy | PARTIAL | Add `EVIDENCE_RETENTION_DAYS`/`CHECKPOINT_RETENTION` settings; `store.gc_artifacts` deletes non-promoted checkpoint+detail rows older than retention, never verifications/reviews/publications/syncs; tests. |
+| M-EV-08 | Artifact retention + GC policy | DONE | — (`config.py` `evidence_retention_days`/`checkpoint_retention_days` (env `EVIDENCE_RETENTION_DAYS`/`CHECKPOINT_RETENTION_DAYS`, default 0 = disabled); `store.gc_artifacts` deletes non-promoted non-structural checkpoint+detail rows older than retention, never verifications/reviews/publications/syncs; promoted-evidence guard via protected job_id/checkpoint_id sets; testable via `now_iso` cutoff param; additive `idx_job_checkpoints_recorded_at` index; tests/test_checkpoints.py `ArtifactGcTests`) |
 | M-GV-01 | Durable authorization objects | PARTIAL | Wire `AuthorizationManager` into commit/push/review/export handlers (require unused unexpired project+capability+target authz, mark used in SAME ACID txn); opt-in Settings flag; handler-integration tests; confirm runtime instantiation. |
 | M-GV-02 | Named roles Planner / Evidence-officer / Supervisor | PARTIAL | Implement `build_planner_command`/`build_evidence_officer_command`/`build_supervisor_command` (read-only, Read/Glob/Grep only); wire as capability-gated invocations; tests/test_roles.py. |
 | M-GV-03 | External grounding for genesis/apex authority | MISSING | `ProjectPolicy.apex_authority_ref`; `REQUIRE_APEX_GROUNDING` opt-in; registry rejects ungrounded policy; genesis jobs require ref present+unchanged; tests. |
@@ -622,16 +622,31 @@ capability are flagged **NEW SURFACE**.
   verification is honestly labeled in the structured result.
 
 #### M-EV-08 Artifact retention + GC policy
-- **Status:** PARTIAL. **Evidence:** `store.py:505-538` `compact_checkpoints`
-  prunes checkpoints but there is no project-level retention/GC policy and no
-  guard that promoted evidence is never deleted.
-- **Build:** `config.py` — `EVIDENCE_RETENTION_DAYS` + `CHECKPOINT_RETENTION`;
+- **Status:** DONE. **Evidence:** `config.py` adds `evidence_retention_days`
+  (env `EVIDENCE_RETENTION_DAYS`, default 0 = disabled) and
+  `checkpoint_retention_days` (env `CHECKPOINT_RETENTION_DAYS`, default 0 =
+  disabled) via the existing `_non_negative_int` helper. `store.gc_artifacts`
+  deletes only non-promoted, non-structural checkpoint (+ cascaded
+  `job_checkpoint_detail`) rows older than `now - checkpoint_retention_days`;
+  promoted evidence is never deleted. A checkpoint is protected if its
+  `job_id` has a committed verification (`verifications.used = 1`), or any
+  `reviews`/`publications` row, or it is directly referenced by
+  `revision_resolves_finding.resolving_checkpoint_id`; structural kinds
+  (`boundary`/`extension`/`milestone`) are always retained. Time is made
+  testable via an optional `now_iso` cutoff param (store never reads the wall
+  clock). An additive `idx_job_checkpoints_recorded_at` index backs the
+  retention scan; `SCHEMA_VERSION` stays 1. `compact_checkpoints` is unchanged.
+- **Build:** `config.py` — `EVIDENCE_RETENTION_DAYS` + `CHECKPOINT_RETENTION_DAYS`;
   a `store.py:gc_artifacts` that deletes only non-promoted checkpoint/detail
   rows older than retention, never `verifications`/`reviews`/`publications`/
   `syncs`. Document the invariant in `store.py`.
-- **Tests:** `tests/test_checkpoints.py` — GC deletes old sample checkpoints,
-  keeps a promoted verification's checkpoints forever. **Acceptance:** promoted
-  evidence survives GC; no new tool.
+- **Tests:** `tests/test_checkpoints.py` `ArtifactGcTests` — GC deletes old
+  sample checkpoints, keeps a promoted verification's checkpoints forever;
+  structural (boundary/extension/milestone) and recent rows survive; unused
+  verification does not protect; review/publication protect; resolution-link
+  protects the referenced checkpoint; detail rows cascade; evidence tables
+  are never touched; retention=0 is a no-op; additive index + schema version
+  1. **Acceptance:** promoted evidence survives GC; no new tool.
 
 ### Release 3 — Governance
 

@@ -20,6 +20,7 @@ from local_dev_mcp.models import ProjectPolicy
 from local_dev_mcp.registry import ProjectLockManager
 from local_dev_mcp.store import (
     checkpoint_count,
+    gc_artifacts,
     insert_checkpoint_row,
     load_checkpoint_detail_for_job,
     load_checkpoint_detail_rows,
@@ -1237,6 +1238,407 @@ class CheckpointStoreTests(unittest.TestCase):
                 self.assertEqual(row["tool_failures"], 1)
             finally:
                 connection.close()
+
+
+class ArtifactGcTests(unittest.TestCase):
+    """M-EV-08: time-based, promoted-evidence-safe artifact GC.
+
+    Direct tests of ``store.gc_artifacts`` over a fresh state database. No
+    real subprocess or network: checkpoints and evidence rows are inserted
+    directly, the reference time is pinned via ``now_iso``, and the GC
+    invariant is asserted (promoted evidence and its checkpoints survive GC;
+    only old, non-promoted, non-structural checkpoint/detail rows are
+    reclaimed).
+    """
+
+    def _fresh_db(self) -> tuple[sqlite3.Connection, Path]:
+        temporary = tempfile.TemporaryDirectory()
+        self._tmp = temporary  # keep alive for the test
+        db_path = Path(temporary.name) / "bridge.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = open_state_db(db_path)
+        return connection, db_path
+
+    def _row(
+        self,
+        job_id: str,
+        kind: str,
+        seq: int,
+        recorded_at: str = "2026-08-07T00:00:00Z",
+    ) -> dict[str, Any]:
+        return {
+            "job_id": job_id,
+            "project_id": "test-project",
+            "kind": kind,
+            "seq": seq,
+            "recorded_at": recorded_at,
+            "changed_paths_json": "[]",
+            "partial_fingerprint": None,
+            "tokens_json": None,
+            "event_json": None,
+            "milestone": None,
+        }
+
+    def _insert_verification(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        *,
+        used: int = 1,
+        verification_id: str = "v-1",
+    ) -> None:
+        connection.execute(
+            "INSERT INTO verifications (verification_id, project_id, job_id, "
+            "base_head, diff_fingerprint, paths_json, verified_at, used, "
+            "commands_json) VALUES (?, 'test-project', ?, 'head', 'fp', '[]', "
+            "'2026-08-07T00:00:00Z', ?, '[]')",
+            (verification_id, job_id, used),
+        )
+        connection.commit()
+
+    def _insert_review(
+        self, connection: sqlite3.Connection, job_id: str, review_id: str = "r-1"
+    ) -> None:
+        connection.execute(
+            "INSERT INTO reviews (review_id, project_id, job_id, base_head, "
+            "diff_fingerprint, paths_json, reviewed_at, reviewer_id, "
+            "verdict_json, used) VALUES (?, 'test-project', ?, 'head', 'fp', "
+            "'[]', '2026-08-07T00:00:00Z', 'reviewer', '{}', 0)",
+            (review_id, job_id),
+        )
+        connection.commit()
+
+    def _insert_publication(self, connection: sqlite3.Connection, job_id: str) -> None:
+        connection.execute(
+            "INSERT INTO publications (project_id, job_id, commit_sha, "
+            "branch_name, remote_url, published_at) VALUES ('test-project', ?, "
+            "'sha', 'branch', 'url', '2026-08-07T00:00:00Z')",
+            (job_id,),
+        )
+        connection.commit()
+
+    def _insert_resolution_link(
+        self,
+        connection: sqlite3.Connection,
+        review_id: str,
+        resolving_job_id: str,
+        resolving_checkpoint_id: int,
+    ) -> None:
+        connection.execute(
+            "INSERT INTO revision_resolves_finding (review_id, "
+            "resolving_job_id, resolving_checkpoint_id, finding_ref, "
+            "resolved_at) VALUES (?, ?, ?, 'finding', '2026-08-07T00:00:00Z')",
+            (review_id, resolving_job_id, resolving_checkpoint_id),
+        )
+        connection.commit()
+
+    def test_retention_zero_disabled_deletes_nothing(self) -> None:
+        """With ``checkpoint_retention_days == 0`` (the default) GC is a no-op
+        regardless of checkpoint age: the disabled path returns 0 and no rows
+        are touched."""
+        connection, _ = self._fresh_db()
+        try:
+            for seq in range(5):
+                insert_checkpoint_row(
+                    connection, self._row("job-a", "sample", seq, "2020-01-01T00:00:00Z")
+                )
+            self.assertEqual(checkpoint_count(connection, "job-a"), 5)
+            deleted = gc_artifacts(
+                connection,
+                evidence_retention_days=0,
+                checkpoint_retention_days=0,
+                now_iso="2026-08-26T00:00:00Z",
+            )
+            self.assertEqual(deleted, 0)
+            self.assertEqual(checkpoint_count(connection, "job-a"), 5)
+        finally:
+            connection.close()
+
+    def test_gc_deletes_old_nonpromoted_samples_keeps_structural_and_recent(
+        self,
+    ) -> None:
+        """GC deletes old non-promoted ``sample`` checkpoints beyond the
+        retention window while keeping structural kinds (boundary/extension/
+        milestone) and recent rows."""
+        connection, _ = self._fresh_db()
+        try:
+            # Old sample rows (recorded 2026-08-01) — beyond a 7-day window
+            # pinned at 2026-08-26. All are non-promoted (no evidence).
+            old_sample_ids: list[int] = []
+            for seq in range(3):
+                old_sample_ids.append(
+                    insert_checkpoint_row(
+                        connection,
+                        self._row("job-old", "sample", seq, "2026-08-01T00:00:00Z"),
+                    )
+                )
+            # Old structural rows (same age) — must survive GC.
+            old_boundary_id = insert_checkpoint_row(
+                connection, self._row("job-old", "boundary", 10, "2026-08-01T00:00:00Z")
+            )
+            old_extension_id = insert_checkpoint_row(
+                connection, self._row("job-old", "extension", 11, "2026-08-01T00:00:00Z")
+            )
+            old_milestone_id = insert_checkpoint_row(
+                connection, self._row("job-old", "milestone", 12, "2026-08-01T00:00:00Z")
+            )
+            # Recent sample row (within the 7-day window) — must survive.
+            recent_sample_id = insert_checkpoint_row(
+                connection, self._row("job-old", "sample", 20, "2026-08-24T00:00:00Z")
+            )
+            self.assertEqual(checkpoint_count(connection, "job-old"), 7)
+
+            deleted = gc_artifacts(
+                connection,
+                evidence_retention_days=0,
+                checkpoint_retention_days=7,
+                now_iso="2026-08-26T00:00:00Z",
+            )
+            # The three old sample rows are reclaimed; structural + recent
+            # rows survive.
+            self.assertEqual(deleted, 3)
+            remaining = {
+                row["checkpoint_id"] for row in load_checkpoint_rows(connection, "job-old")
+            }
+            self.assertEqual(remaining, {old_boundary_id, old_extension_id, old_milestone_id, recent_sample_id})
+            for old_sample_id in old_sample_ids:
+                self.assertNotIn(old_sample_id, remaining)
+        finally:
+            connection.close()
+
+    def test_promoted_verification_protects_its_checkpoints_forever(self) -> None:
+        """A checkpoint whose job has a committed verification (``used = 1``)
+        is kept forever even when its ``recorded_at`` is far beyond the
+        retention window — the promoted-evidence guard."""
+        connection, _ = self._fresh_db()
+        try:
+            old_sample_id = insert_checkpoint_row(
+                connection, self._row("job-promoted", "sample", 0, "2020-01-01T00:00:00Z")
+            )
+            insert_checkpoint_row(
+                connection, self._row("job-promoted", "turn", 1, "2020-01-01T00:00:00Z")
+            )
+            # A committed verification promotes the whole job's checkpoints.
+            self._insert_verification(connection, "job-promoted", used=1)
+            self.assertEqual(checkpoint_count(connection, "job-promoted"), 2)
+
+            deleted = gc_artifacts(
+                connection,
+                evidence_retention_days=0,
+                checkpoint_retention_days=7,
+                now_iso="2026-08-26T00:00:00Z",
+            )
+            self.assertEqual(deleted, 0)
+            self.assertEqual(checkpoint_count(connection, "job-promoted"), 2)
+            rows = load_checkpoint_rows(connection, "job-promoted")
+            self.assertEqual(rows[0]["checkpoint_id"], old_sample_id)
+        finally:
+            connection.close()
+
+    def test_unused_verification_does_not_protect(self) -> None:
+        """A verification row with ``used = 0`` is not a committed verification
+        and does not promote its job's checkpoints — old non-structural rows
+        are still eligible for GC."""
+        connection, _ = self._fresh_db()
+        try:
+            old_sample_id = insert_checkpoint_row(
+                connection, self._row("job-unused", "sample", 0, "2020-01-01T00:00:00Z")
+            )
+            # An unused verification does NOT protect.
+            self._insert_verification(
+                connection, "job-unused", used=0, verification_id="v-unused"
+            )
+
+            deleted = gc_artifacts(
+                connection,
+                evidence_retention_days=0,
+                checkpoint_retention_days=7,
+                now_iso="2026-08-26T00:00:00Z",
+            )
+            self.assertEqual(deleted, 1)
+            remaining = {
+                row["checkpoint_id"] for row in load_checkpoint_rows(connection, "job-unused")
+            }
+            self.assertNotIn(old_sample_id, remaining)
+        finally:
+            connection.close()
+
+    def test_review_or_publication_protects_checkpoints(self) -> None:
+        """Any review/publication row on a job promotes its checkpoints — old
+        non-structural rows survive GC. (``syncs`` is project-level with no
+        ``job_id`` column, so it cannot protect a specific job's checkpoints;
+        it is still never deleted by GC — verified in
+        ``test_gc_never_touches_evidence_tables``.)"""
+        connection, _ = self._fresh_db()
+        try:
+            insert_checkpoint_row(
+                connection, self._row("job-review", "sample", 0, "2020-01-01T00:00:00Z")
+            )
+            insert_checkpoint_row(
+                connection, self._row("job-pub", "sample", 0, "2020-01-01T00:00:00Z")
+            )
+            self._insert_review(connection, "job-review", review_id="r-review")
+            self._insert_publication(connection, "job-pub")
+
+            deleted = gc_artifacts(
+                connection,
+                evidence_retention_days=0,
+                checkpoint_retention_days=7,
+                now_iso="2026-08-26T00:00:00Z",
+            )
+            self.assertEqual(deleted, 0)
+            self.assertEqual(checkpoint_count(connection, "job-review"), 1)
+            self.assertEqual(checkpoint_count(connection, "job-pub"), 1)
+        finally:
+            connection.close()
+
+    def test_resolution_link_protects_referenced_checkpoint(self) -> None:
+        """A checkpoint directly referenced by
+        ``revision_resolves_finding.resolving_checkpoint_id`` is kept forever
+        even when old, non-structural, and on a job with no promoted evidence.
+
+        The protection is per-checkpoint (by id), not per-job: another old
+        sample checkpoint on the same job without a resolution link is still
+        reclaimed."""
+        connection, _ = self._fresh_db()
+        try:
+            referenced_id = insert_checkpoint_row(
+                connection, self._row("job-resolve", "sample", 0, "2020-01-01T00:00:00Z")
+            )
+            unreferenced_id = insert_checkpoint_row(
+                connection, self._row("job-resolve", "sample", 1, "2020-01-01T00:00:00Z")
+            )
+            # A review on a DIFFERENT job references the checkpoint. The
+            # checkpoint's own job has no promoted evidence, yet it survives
+            # because it is directly referenced.
+            self._insert_review(connection, "job-other", review_id="r-resolve")
+            self._insert_resolution_link(
+                connection, "r-resolve", "job-resolve", referenced_id
+            )
+
+            deleted = gc_artifacts(
+                connection,
+                evidence_retention_days=0,
+                checkpoint_retention_days=7,
+                now_iso="2026-08-26T00:00:00Z",
+            )
+            # Only the unreferenced old sample is reclaimed.
+            self.assertEqual(deleted, 1)
+            remaining = {
+                row["checkpoint_id"] for row in load_checkpoint_rows(connection, "job-resolve")
+            }
+            self.assertIn(referenced_id, remaining)
+            self.assertNotIn(unreferenced_id, remaining)
+        finally:
+            connection.close()
+
+    def test_gc_cascades_detail_rows(self) -> None:
+        """Deleting an old non-promoted checkpoint cascades to its
+        ``job_checkpoint_detail`` sidecar row (FK ON DELETE CASCADE)."""
+        from local_dev_mcp.store import insert_checkpoint_detail_row, load_checkpoint_detail_rows
+
+        connection, _ = self._fresh_db()
+        try:
+            old_cp_id = insert_checkpoint_row(
+                connection, self._row("job-cascade", "sample", 0, "2020-01-01T00:00:00Z")
+            )
+            insert_checkpoint_detail_row(
+                connection,
+                {
+                    "checkpoint_id": old_cp_id,
+                    "completed_steps_json": '[{"step": "x"}]',
+                    "remaining_steps_json": None,
+                    "tests_json": None,
+                    "decisions_json": None,
+                    "tool_history_json": None,
+                },
+            )
+            # A structural row that must survive, plus its detail.
+            boundary_cp_id = insert_checkpoint_row(
+                connection, self._row("job-cascade", "boundary", 1, "2020-01-01T00:00:00Z")
+            )
+            insert_checkpoint_detail_row(
+                connection,
+                {
+                    "checkpoint_id": boundary_cp_id,
+                    "completed_steps_json": '[{"step": "keep"}]',
+                    "remaining_steps_json": None,
+                    "tests_json": None,
+                    "decisions_json": None,
+                    "tool_history_json": None,
+                },
+            )
+            self.assertEqual(len(load_checkpoint_detail_rows(connection, [old_cp_id, boundary_cp_id])), 2)
+
+            deleted = gc_artifacts(
+                connection,
+                evidence_retention_days=0,
+                checkpoint_retention_days=7,
+                now_iso="2026-08-26T00:00:00Z",
+            )
+            self.assertEqual(deleted, 1)
+            # The old sample's detail row cascaded away.
+            orphan = connection.execute(
+                "SELECT 1 FROM job_checkpoint_detail WHERE checkpoint_id = ?",
+                (old_cp_id,),
+            ).fetchone()
+            self.assertIsNone(orphan)
+            # The structural row's detail survived.
+            survivor = connection.execute(
+                "SELECT 1 FROM job_checkpoint_detail WHERE checkpoint_id = ?",
+                (boundary_cp_id,),
+            ).fetchone()
+            self.assertIsNotNone(survivor)
+        finally:
+            connection.close()
+
+    def test_gc_never_touches_evidence_tables(self) -> None:
+        """GC deletes only ``job_checkpoints`` (+ cascaded detail). Evidence
+        rows in verifications/reviews/publications/syncs are never deleted,
+        even when their job has old, non-promoted-looking checkpoints that are
+        protected solely because the evidence row exists."""
+        connection, _ = self._fresh_db()
+        try:
+            # job-evidence has a review (promotes its checkpoints) and old
+            # samples. GC must not delete the review or the checkpoints.
+            insert_checkpoint_row(
+                connection, self._row("job-evidence", "sample", 0, "2020-01-01T00:00:00Z")
+            )
+            self._insert_review(connection, "job-evidence", review_id="r-keep")
+
+            deleted = gc_artifacts(
+                connection,
+                evidence_retention_days=0,
+                checkpoint_retention_days=7,
+                now_iso="2026-08-26T00:00:00Z",
+            )
+            self.assertEqual(deleted, 0)
+            # The evidence row is intact.
+            review_count = connection.execute(
+                "SELECT COUNT(*) FROM reviews WHERE review_id = 'r-keep'"
+            ).fetchone()[0]
+            self.assertEqual(int(review_count), 1)
+            # And the protected checkpoint survived.
+            self.assertEqual(checkpoint_count(connection, "job-evidence"), 1)
+        finally:
+            connection.close()
+
+    def test_gc_additive_index_created_and_schema_version_stays_1(self) -> None:
+        """M-EV-08: the GC backing index is additive (CREATE INDEX IF NOT
+        EXISTS) and ``SCHEMA_VERSION`` stays 1."""
+        connection, _ = self._fresh_db()
+        try:
+            row = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND name='idx_job_checkpoints_recorded_at'"
+            ).fetchone()
+            self.assertIsNotNone(row)
+            version = connection.execute(
+                "SELECT value FROM schema_meta WHERE key='version'"
+            ).fetchone()[0]
+            self.assertEqual(int(version), 1)
+        finally:
+            connection.close()
 
 
 class ContinuityToolSurfaceTests(unittest.TestCase):
