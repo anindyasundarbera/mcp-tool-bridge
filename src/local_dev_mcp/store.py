@@ -225,6 +225,25 @@ CREATE TABLE IF NOT EXISTS working_tree_captures (
     error TEXT,
     captured_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS oh_ledger (
+    ledger_id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL,
+    canonical_baseline_fingerprint TEXT NOT NULL,
+    disposable_candidate_fingerprint TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    permitted_tools TEXT NOT NULL,
+    observed_tool_usage TEXT NOT NULL,
+    command_results_json TEXT NOT NULL,
+    inspection_result TEXT NOT NULL,
+    canonical_verification_result TEXT NOT NULL,
+    teardown_result TEXT NOT NULL,
+    residue_verification_result TEXT NOT NULL,
+    evidence_bundle_id TEXT NOT NULL,
+    evidence_fingerprint TEXT NOT NULL,
+    final_verdict TEXT NOT NULL,
+    failure_reason TEXT,
+    recorded_at TEXT NOT NULL
+);
 """
 
 _UPSERT_JOB = """
@@ -1147,3 +1166,33 @@ def load_working_tree_capture_rows(
             (project_id,),
         ).fetchall()
     ]
+def insert_oh_ledger_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
+    """Append one OH-001D ledger record as a single ACID transaction."""
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO oh_ledger (
+                ledger_id, operation_id, canonical_baseline_fingerprint,
+                disposable_candidate_fingerprint, session_id, permitted_tools,
+                observed_tool_usage, command_results_json, inspection_result,
+                canonical_verification_result, teardown_result,
+                residue_verification_result, evidence_bundle_id,
+                evidence_fingerprint, final_verdict, failure_reason, recorded_at
+            ) VALUES (
+                :ledger_id, :operation_id, :canonical_baseline_fingerprint,
+                :disposable_candidate_fingerprint, :session_id, :permitted_tools,
+                :observed_tool_usage, :command_results_json, :inspection_result,
+                :canonical_verification_result, :teardown_result,
+                :residue_verification_result, :evidence_bundle_id,
+                :evidence_fingerprint, :final_verdict, :failure_reason, :recorded_at
+            )
+            """,
+            row,
+        )
+
+def load_oh_ledger_row(connection: sqlite3.Connection, ledger_id: str) -> dict[str, Any] | None:
+    """Return one OH-001D ledger record by ID, or None."""
+    row = connection.execute(
+        "SELECT * FROM oh_ledger WHERE ledger_id = ?", (ledger_id,)
+    ).fetchone()
+    return dict(row) if row is not None else None

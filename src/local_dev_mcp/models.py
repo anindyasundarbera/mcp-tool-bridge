@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -41,6 +41,7 @@ class ProjectCapability(StrEnum):
     # repository_read (the downstream commit/publish gates carry their own
     # authorization).
     WORKING_TREE_CANDIDATE_CAPTURE = "working_tree_candidate_capture"
+    GOVERNED_DISPOSABLE_RUNTIME_ACTION_EXECUTION = "governed_disposable_runtime_action_execution"
 
 
 def _policy_path(value: str) -> str:
@@ -299,6 +300,30 @@ class WorkingTreeCaptureScope(BaseModel):
         return self
 
 
+class OperationDefinition(BaseModel):
+    """Detailed definition of a governed operation provided by a capability."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    description: str = Field(min_length=1, max_length=500)
+
+
+class CapabilityDefinition(BaseModel):
+    """Detailed registration of a capability and its available operations."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: ProjectCapability
+    description: str = Field(min_length=1, max_length=500)
+    input_contract: dict[str, Any] = Field(default_factory=dict)
+    output_contract: dict[str, Any] = Field(default_factory=dict)
+    protected_paths: tuple[str, ...] = ()
+    commit_roots: tuple[str, ...] = ()
+    verification_commands: tuple[VerificationCommand, ...] = ()
+    lifecycle_requirements: str | None = None
+    disposable_runtime: bool = False
+    operations: dict[str, OperationDefinition] = Field(default_factory=dict)
+
+
 class ProjectPolicy(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -309,6 +334,7 @@ class ProjectPolicy(BaseModel):
     enabled: bool = True
     require_git: bool = True
     capabilities: frozenset[ProjectCapability]
+    capability_definitions: dict[str, CapabilityDefinition] = Field(default_factory=dict)
     markdown_write_roots: tuple[str, ...] = ()
     commit_roots: tuple[str, ...] = ()
     verification_commands: tuple[VerificationCommand, ...] = ()
@@ -498,6 +524,8 @@ class ProjectPolicy(BaseModel):
             "allow_ultracode": self.allow_ultracode,
             "self_managed": self.self_managed,
         }
+
+ProjectPolicy.model_rebuild()
 
 
 class ProjectRegistryDocument(BaseModel):

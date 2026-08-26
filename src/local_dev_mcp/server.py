@@ -28,6 +28,7 @@ from .working_tree_capture import (
     WorkingTreeCaptureError,
     WorkingTreeCaptureManager,
 )
+from .open_hands_action import OpenHandsActionManager
 
 
 def create_server(
@@ -116,6 +117,11 @@ def create_server(
         active_settings,
         active_locks,
         active_jobs,
+        projects=active_registry.projects(),
+    )
+    active_open_hands = OpenHandsActionManager(
+        active_settings,
+        active_locks,
         projects=active_registry.projects(),
     )
 
@@ -1585,6 +1591,45 @@ def create_server(
                 effort=effort,
             )
         except WorkingTreeCaptureError as exc:
+            raise ValueError(str(exc)) from exc
+
+    @mcp.tool(
+        name="standalone_openhands_action",
+        description=(
+            "Execute a restricted OpenHands action in an isolated disposable runtime. "
+            "The process is governed: binds to a canonical baseline, restricts tools "
+            "to TerminalTool and FileEditorTool, and binds the final result to an "
+            "OH-001D ledger. Opt-in via the "
+            "governed_disposable_runtime_action_execution project capability."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=False,
+            openWorldHint=True,
+        ),
+    )
+    async def standalone_openhands_action(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        action_params: Annotated[
+            dict[str, Any],
+            Field(
+                description=(
+                    "Execution parameters including canonical_baseline_fingerprint, "
+                    "action_specification, and expected_outcome."
+                ),
+            ),
+        ],
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.GOVERNED_DISPOSABLE_RUNTIME_ACTION_EXECUTION
+        )
+        try:
+            return await active_open_hands.execute_action(project, action_params)
+        except OpenHandsActionError as exc:
             raise ValueError(str(exc)) from exc
 
     return mcp
