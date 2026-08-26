@@ -279,7 +279,7 @@ authoritative input to the implementation order in "Recommended next action".
 | M-CT-07 | Progress-intelligence enrichment | DONE | Compare consecutive checkpoints in `_record_checkpoint` for oscillating edits / scope growth / weakened tests; pause with distinct `pause_reason` per trigger; tests. |
 | M-EV-01 | Requirement traceability | PARTIAL | Wire `RequirementManager` into jobs/server (scan/parse on job create, persist links); surface `requirements_covered` in `get_development_job`/`get_project_status`; full matrix() covered/uncovered/contradictory + deferrals-with-authority; tests. |
 | M-EV-02 | Structured verification result schema + env fingerprint | DONE | — (verification.py:compute_environment_digest + _command_digest; VerificationRecord.environment_digest; verify() structured response fields candidate_fingerprint/base_commit/environment_digest/conclusion + per-command id/command_digest; store.verification_environment sidecar; tests/test_verification.py M-EV-02 cases) |
-| M-EV-03 | Evidence binding completeness | MISSING | Sidecar `verification_bindings`+`review_bindings` (toolchain_digest, reviewer_independence_class, expires_at, authority_ref); stamp independence class on review; reject expired bindings at commit gate; tests. |
+| M-EV-03 | Evidence binding completeness | DONE | — (store.verification_bindings+review_bindings sidecars with toolchain_digest/reviewer_independence_class/expires_at/authority_ref; verification.py VerificationRecord.expires_at/authority_ref + _is_expired commit-gate check; review.py ReviewRecord.reviewer_independence_class + ReviewManager stamps bridge_spawned/human/external + validate_for_commit expiry check; tests/test_verification.py + tests/test_review.py M-EV-03 cases) |
 | M-EV-04 | Review content-addressing + revision→finding links | MISSING | Sidecar `review_content` with `verdict_hash`; `revision_resolves_finding` table + follow-up revision job path; queryable finding→revision→closure chain; tests. |
 | M-EV-05 | Source classifications + authority-behind-instructions | DONE | — (source_classifications + authority_records tables, seeded vocabulary, _record_event stamps authority_ref; tests) |
 | M-EV-06 | Portable evidence bundle export | PARTIAL | Wire `RequirementManager` coverage section into `EvidenceBundleManager`; explicit `.env`/`.venv`/token exclude filter on changed_paths+diff; (optional) zip serialization; tests. |
@@ -522,19 +522,23 @@ capability are flagged **NEW SURFACE**.
   the structured object; `SCHEMA_VERSION` stays 1; no new tool.
 
 #### M-EV-03 Evidence binding completeness
-- **Status:** PARTIAL. **Evidence:** `verification.py:348-357` `VerificationRecord`
-  binds `project_id, base_head, diff_fingerprint, paths, commands`; `review.py:93`
-  `ReviewRecord` binds `review_id, base_head, diff_fingerprint, reviewer_id`.
-  Missing: toolchain/environment fingerprint (M-EV-02), reviewer identity +
-  **independence class**, timestamps + **expiry policy**.
-- **Build:** sidecar `verification_bindings` and `review_bindings` tables keyed
-  by the record id, adding `toolchain_digest`, `reviewer_independence_class`
-  (one of `bridge_spawned|human|external`), `expires_at`, `authority_ref`.
-  `review.py` stamps the independence class when `run_independent_review`
-  (`bridge_spawned`) vs `record_candidate_review` (`human`/`external`).
+- **Status:** DONE. **Evidence:** `store.py` `verification_bindings` +
+  `review_bindings` sidecar tables (FK with `ON DELETE CASCADE`, `CREATE TABLE
+  IF NOT EXISTS`, `SCHEMA_VERSION` stays 1) with `toolchain_digest`,
+  `reviewer_independence_class` (`bridge_spawned|human|external`),
+  `expires_at`, `authority_ref`. `verification.py:VerificationRecord` carries
+  `expires_at`/`authority_ref` and `_is_expired` drives the commit-gate expiry
+  check (NULL/absent → permissive). `review.py:ReviewRecord` carries the full
+  binding envelope; `run_independent_review` stamps `bridge_spawned`,
+  `record_candidate_review` stamps `human` (default) or `external`
+  (`external=True`). The existing `bridge-reviewer` `reviewer_id` sentinel is
+  preserved for back-compat.
 - **Tests:** `tests/test_verification.py`, `tests/test_review.py` — bindings
-  round-trip; an expired binding is rejected at the commit gate. **Acceptance:**
-  every verification + review carries the full binding set; no new tool.
+  round-trip (persist + reload); independence class stamped correctly for
+  bridge_spawned vs human vs external; an expired binding is rejected at the
+  commit gate; a non-expired/NULL-expiry binding is allowed; malformed expiry
+  fails closed. **Acceptance:** every verification + review carries the full
+  binding set; no new tool; `SCHEMA_VERSION` stays 1.
 
 #### M-EV-04 Review content-addressing + revision→finding links
 - **Status:** MISSING. **Evidence:** `review.py:92-103` `ReviewRecord` has no

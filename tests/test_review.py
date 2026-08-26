@@ -853,6 +853,255 @@ class ReviewManagerTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    # -- M-EV-03: evidence bindings -----------------------------------------
+
+    def test_record_candidate_review_stamps_human_independence_class(self) -> None:
+        """M-EV-03: record_candidate_review stamps ``human`` by default and
+        ``external`` when the caller signals it; the binding round-trips
+        through the sidecar."""
+        async def exercise() -> tuple[str, str, str | None, str | None]:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            _, jobs, _, review = self._managers(project, edit)
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+            recorded = await review.record_candidate_review(
+                project, job_id, {"summary": "ok"}, reviewer_id="alice"
+            )
+            review_id = recorded["review_id"]
+            self.assertEqual(recorded["reviewer_independence_class"], "human")
+
+            # An explicitly external review stamps ``external``.
+            recorded_ext = await review.record_candidate_review(
+                project,
+                job_id,
+                {"summary": "ok"},
+                reviewer_id="bob",
+                external=True,
+            )
+            self.assertEqual(recorded_ext["reviewer_independence_class"], "external")
+
+            # The binding round-trips through the sidecar on reload.
+            from local_dev_mcp import store as store_module
+            binding = store_module.load_review_binding_row(review._db, review_id)
+            independence = binding["reviewer_independence_class"] if binding else None
+            # The in-memory record also carries the class.
+            record = review._reviews[review_id]
+            return (
+                str(record.reviewer_independence_class),
+                str(record.reviewer_id),
+                independence,
+                record.reviewer_independence_class,
+            )
+
+        (
+            record_class,
+            reviewer_id,
+            sidecar_class,
+            record_class_again,
+        ) = asyncio.run(exercise())
+        self.assertEqual(record_class, "human")
+        self.assertEqual(reviewer_id, "alice")
+        self.assertEqual(sidecar_class, "human")
+        self.assertEqual(record_class_again, "human")
+
+    def test_run_independent_review_stamps_bridge_spawned_class(self) -> None:
+        """M-EV-03: run_independent_review stamps ``bridge_spawned`` and the
+        binding round-trips through the sidecar on restart."""
+        async def exercise() -> tuple[str, str, str | None]:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+            executor = ReviewExecutor()
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            locks = ProjectLockManager()
+            jobs = DevelopmentJobManager(
+                self.settings, locks, EditingExecutor(edit), projects=(project,)
+            )
+            review = ReviewManager(
+                self.settings, locks, jobs, executor, projects=(project,)
+            )
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+            result = await review.run_independent_review(project, job_id, "high")
+            self.assertEqual(result["reviewer_independence_class"], "bridge_spawned")
+            review_id = result["review_id"]
+
+            # Restart: fresh manager re-hydrates the binding.
+            locks_b = ProjectLockManager()
+            jobs_b = DevelopmentJobManager(
+                self.settings, locks_b, EditingExecutor(edit), projects=(project,)
+            )
+            review_b = ReviewManager(
+                self.settings, locks_b, jobs_b, ReviewExecutor(), projects=(project,)
+            )
+            reread = review_b._reviews.get(review_id)
+            reread_class = str(reread.reviewer_independence_class) if reread else "missing"
+
+            # The sidecar row is directly queryable too.
+            from local_dev_mcp import store as store_module
+            binding = store_module.load_review_binding_row(review_b._db, review_id)
+            sidecar_class = binding["reviewer_independence_class"] if binding else None
+            return result["reviewer_independence_class"], reread_class, sidecar_class
+
+        result_class, reread_class, sidecar_class = asyncio.run(exercise())
+        self.assertEqual(result_class, "bridge_spawned")
+        self.assertEqual(reread_class, "bridge_spawned")
+        self.assertEqual(sidecar_class, "bridge_spawned")
+
+    def test_review_binding_expired_rejected_at_commit_gate(self) -> None:
+        """M-EV-03: a review binding whose expires_at is in the past is
+        rejected at the commit gate (validate_for_commit)."""
+        async def exercise() -> str:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            _, jobs, verification, review = self._managers(project, edit)
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+            verified = await verification.verify(project, job_id, completed["base_head"])
+            from datetime import UTC, datetime, timedelta
+            recorded = await review.record_candidate_review(
+                project,
+                job_id,
+                {"summary": "approve"},
+                reviewer_id="human-reviewer",
+                expires_at=(datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+            )
+            review_id = recorded["review_id"]
+            try:
+                await review.validate_for_commit(
+                    project,
+                    job_id,
+                    review_id,
+                    verified["base_head"],
+                    verified["diff_fingerprint"],
+                    list(verified["paths"]),
+                )
+            except ReviewError as exc:
+                return str(exc)
+            return "allowed-unexpectedly"
+
+        message = asyncio.run(exercise())
+        self.assertIn("expired", message)
+
+    def test_review_binding_non_expired_allowed_at_commit_gate(self) -> None:
+        """M-EV-03: a review binding whose expires_at is in the future is
+        allowed at the commit gate."""
+        async def exercise() -> str:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            _, jobs, verification, review = self._managers(project, edit)
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+            verified = await verification.verify(project, job_id, completed["base_head"])
+            from datetime import UTC, datetime, timedelta
+            recorded = await review.record_candidate_review(
+                project,
+                job_id,
+                {"summary": "approve"},
+                reviewer_id="human-reviewer",
+                expires_at=(datetime.now(UTC) + timedelta(days=1)).isoformat(),
+            )
+            review_id = recorded["review_id"]
+            await review.validate_for_commit(
+                project,
+                job_id,
+                review_id,
+                verified["base_head"],
+                verified["diff_fingerprint"],
+                list(verified["paths"]),
+            )
+            # Commit consumes the review (single-use).
+            committed = await verification.commit(
+                project,
+                job_id,
+                str(verified["verification_id"]),
+                verified["base_head"],
+                verified["diff_fingerprint"],
+                list(verified["paths"]),
+                "M-EV-03 future-expiry commit",
+            )
+            return str(committed["status"])
+
+        status = asyncio.run(exercise())
+        self.assertEqual(status, "committed")
+
+    def test_review_binding_null_expiry_allowed_at_commit_gate(self) -> None:
+        """M-EV-03: a review binding with no expires_at (the default for
+        record_candidate_review) is allowed at the commit gate."""
+        async def exercise() -> str:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            _, jobs, verification, review = self._managers(project, edit)
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+            verified = await verification.verify(project, job_id, completed["base_head"])
+            # No expires_at passed → NULL → no expiry → allowed.
+            recorded = await review.record_candidate_review(
+                project, job_id, {"summary": "approve"}, reviewer_id="human-reviewer"
+            )
+            review_id = recorded["review_id"]
+            await review.validate_for_commit(
+                project,
+                job_id,
+                review_id,
+                verified["base_head"],
+                verified["diff_fingerprint"],
+                list(verified["paths"]),
+            )
+            committed = await verification.commit(
+                project,
+                job_id,
+                str(verified["verification_id"]),
+                verified["base_head"],
+                verified["diff_fingerprint"],
+                list(verified["paths"]),
+                "M-EV-03 null-expiry commit",
+            )
+            return str(committed["status"])
+
+        status = asyncio.run(exercise())
+        self.assertEqual(status, "committed")
+
+    def test_record_candidate_review_rejects_malformed_expiry(self) -> None:
+        """M-EV-03: a malformed expires_at is rejected at record time."""
+        async def exercise() -> str:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            _, jobs, _, review = self._managers(project, edit)
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+            try:
+                await review.record_candidate_review(
+                    project,
+                    job_id,
+                    {"summary": "ok"},
+                    reviewer_id="alice",
+                    expires_at="not-a-timestamp",
+                )
+            except ReviewError as exc:
+                return str(exc)
+            return "recorded-unexpectedly"
+
+        message = asyncio.run(exercise())
+        self.assertIn("expires_at", message)
+
     # -- capability gate -----------------------------------------------------
 
     def test_candidate_review_capability_gate(self) -> None:

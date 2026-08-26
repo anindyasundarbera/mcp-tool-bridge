@@ -56,6 +56,7 @@ from .verification import (
     VerificationError,
     _bound_redacted_output,
     _candidate_state,
+    _is_expired,
     _open_candidate_read,
     _redact,
     _safe_path,
@@ -101,6 +102,19 @@ class ReviewRecord:
     reviewer_id: str | None
     verdict: dict[str, Any]
     used: bool = False
+    # M-EV-03: evidence-binding fields, persisted in the ``review_bindings``
+    # sidecar (not on ``reviews``) so the schema stays additive.
+    # ``reviewer_independence_class`` is one of ``bridge_spawned|human|external``
+    # — stamped by this module: ``bridge_spawned`` for ``run_independent_review``,
+    # ``human`` (default) or ``external`` (caller-signaled) for
+    # ``record_candidate_review``. ``toolchain_digest`` optionally carries the
+    # M-EV-02 environment/toolchain digest. ``expires_at`` is an ISO-8601
+    # timestamp (NULL means no expiry → always allowed at the commit gate).
+    # ``authority_ref`` links to the ``authority_records`` from M-EV-05.
+    reviewer_independence_class: str | None = None
+    toolchain_digest: str | None = None
+    expires_at: str | None = None
+    authority_ref: str | None = None
 
 
 def review_to_row(record: ReviewRecord) -> dict[str, Any]:
@@ -119,8 +133,20 @@ def review_to_row(record: ReviewRecord) -> dict[str, Any]:
     }
 
 
-def review_from_row(row: dict[str, Any]) -> ReviewRecord | None:
-    """Rebuild a review record from a dict row, or None if unparseable."""
+def review_from_row(
+    row: dict[str, Any],
+    *,
+    reviewer_independence_class: str | None = None,
+    toolchain_digest: str | None = None,
+    expires_at: str | None = None,
+    authority_ref: str | None = None,
+) -> ReviewRecord | None:
+    """Rebuild a review record from a dict row, or None if unparseable.
+
+    M-EV-03: the optional binding fields come from the ``review_bindings``
+    sidecar (loaded separately by the caller) so the record carries its
+    evidence-binding envelope without the ``reviews`` table being altered.
+    """
     paths = _record_json_loads(row.get("paths_json"))
     verdict = _record_json_loads(row.get("verdict_json"))
     if not isinstance(paths, list) or not isinstance(verdict, dict):
@@ -137,6 +163,10 @@ def review_from_row(row: dict[str, Any]) -> ReviewRecord | None:
             reviewer_id=row.get("reviewer_id"),
             verdict=verdict,
             used=bool(row.get("used", 0)),
+            reviewer_independence_class=reviewer_independence_class,
+            toolchain_digest=toolchain_digest,
+            expires_at=expires_at,
+            authority_ref=authority_ref,
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -170,6 +200,22 @@ def _normalize_review_path(value: str) -> str:
 #: operator inspecting ``reviewer_id == "bridge-reviewer"`` can trust it was set
 #: by the bridge, not by the caller.
 _BRIDGE_REVIEWER_ID = "bridge-reviewer"
+
+# M-EV-03: the structured independence class that replaces/supplements the
+# implicit ``_BRIDGE_REVIEWER_ID`` sentinel. ``run_independent_review`` stamps
+# ``bridge_spawned``; ``record_candidate_review`` stamps ``human`` (default) or
+# ``external`` when the caller signals it. The existing ``reviewer_id``
+# sentinel keeps working for back-compat (additive — not removed).
+REVIEWER_INDEPENDENCE_BRIDGE_SPAWNED = "bridge_spawned"
+REVIEWER_INDEPENDENCE_HUMAN = "human"
+REVIEWER_INDEPENDENCE_EXTERNAL = "external"
+_REVIEWER_INDEPENDENCE_CLASSES = frozenset(
+    {
+        REVIEWER_INDEPENDENCE_BRIDGE_SPAWNED,
+        REVIEWER_INDEPENDENCE_HUMAN,
+        REVIEWER_INDEPENDENCE_EXTERNAL,
+    }
+)
 
 
 def _validate_reviewer_id(reviewer_id: str | None) -> str | None:
@@ -330,9 +376,27 @@ class ReviewManager:
         self._reload_reviews()
 
     def _reload_reviews(self) -> None:
-        """Load persisted review records, skipping unparseable rows."""
+        """Load persisted review records, skipping unparseable rows.
+
+        M-EV-03: also loads the ``review_bindings`` sidecar so each
+        re-hydrated record carries its ``reviewer_independence_class``,
+        ``toolchain_digest``, ``expires_at``, and ``authority_ref`` envelope.
+        """
+        bindings = {
+            row["review_id"]: row for row in store.load_review_binding_rows(self._db)
+        }
         for row in store.load_review_rows(self._db):
-            record = review_from_row(row)
+            review_id = row["review_id"]
+            binding = bindings.get(review_id)
+            record = review_from_row(
+                row,
+                reviewer_independence_class=(
+                    binding.get("reviewer_independence_class") if binding else None
+                ),
+                toolchain_digest=binding.get("toolchain_digest") if binding else None,
+                expires_at=binding.get("expires_at") if binding else None,
+                authority_ref=binding.get("authority_ref") if binding else None,
+            )
             if record is not None:
                 self._reviews[record.review_id] = record
 
@@ -341,8 +405,25 @@ class ReviewManager:
 
         Call this inside ``async with self._reviews_lock`` after mutating a
         record so the durable store mirrors the in-memory state.
+
+        M-EV-03: also upserts the ``review_bindings`` sidecar row so the
+        record's evidence-binding envelope (``reviewer_independence_class``,
+        ``toolchain_digest``, ``expires_at``, ``authority_ref``) is durable.
+        The binding is always written (even when the fields are NULL) so a
+        reload sees the binding envelope exists; the commit-gate expiry check
+        reads it back.
         """
         store.upsert_review_row(self._db, review_to_row(record))
+        store.upsert_review_binding_row(
+            self._db,
+            {
+                "review_id": record.review_id,
+                "toolchain_digest": record.toolchain_digest,
+                "reviewer_independence_class": record.reviewer_independence_class,
+                "expires_at": record.expires_at,
+                "authority_ref": record.authority_ref,
+            },
+        )
 
     def _new_review_id(self) -> str:
         for _ in range(10):
@@ -523,6 +604,10 @@ class ReviewManager:
         job_id: str,
         verdict: Any,
         reviewer_id: str | None = None,
+        *,
+        external: bool = False,
+        expires_at: str | None = None,
+        authority_ref: str | None = None,
     ) -> dict[str, Any]:
         """Bind a caller-supplied verdict to the exact current candidate state.
 
@@ -539,9 +624,26 @@ class ReviewManager:
         (human or out-of-band) reviewer to lodge a verdict through the bridge;
         the strong, attested guarantee of an independent reviewer is
         ``run_independent_review``, which the bridge spawns itself.
+
+        M-EV-03: stamps ``reviewer_independence_class`` on the review binding —
+        ``human`` by default, or ``external`` when the caller signals it via
+        ``external=True``. The existing ``reviewer_id`` sentinel keeps working
+        for back-compat. ``expires_at`` (ISO-8601) and ``authority_ref`` are
+        optional evidence-binding envelope fields, persisted in the
+        ``review_bindings`` sidecar.
         """
         coerced = _coerce_verdict(verdict)
         reviewer = _validate_reviewer_id(reviewer_id)
+        independence_class = (
+            REVIEWER_INDEPENDENCE_EXTERNAL
+            if external
+            else REVIEWER_INDEPENDENCE_HUMAN
+        )
+        if expires_at is not None:
+            try:
+                datetime.fromisoformat(expires_at)
+            except ValueError as exc:
+                raise ReviewError("expires_at must be an ISO-8601 timestamp") from exc
         lock = await self._locks.for_project(project.id)
         async with lock:
             worktree = await self._reviewable_worktree_locked(project, job_id)
@@ -560,6 +662,9 @@ class ReviewManager:
                     reviewed_at=_timestamp(),
                     reviewer_id=reviewer,
                     verdict=coerced,
+                    reviewer_independence_class=independence_class,
+                    expires_at=expires_at,
+                    authority_ref=authority_ref,
                 )
                 self._reviews[record.review_id] = record
                 self._persist_review(record)
@@ -574,6 +679,7 @@ class ReviewManager:
                     "paths": list(record.paths),
                     "reviewed_at": record.reviewed_at,
                     "reviewer_id": record.reviewer_id,
+                    "reviewer_independence_class": record.reviewer_independence_class,
                 },
                 self._redact_paths(project, worktree),
             )
@@ -634,6 +740,13 @@ class ReviewManager:
                     reviewed_at=_timestamp(),
                     reviewer_id=_BRIDGE_REVIEWER_ID,
                     verdict=verdict,
+                    # M-EV-03: the bridge stamps the structured independence
+                    # class for a bridge-spawned review. The existing
+                    # ``_BRIDGE_REVIEWER_ID`` sentinel keeps working for
+                    # back-compat (additive — not removed).
+                    reviewer_independence_class=(
+                        REVIEWER_INDEPENDENCE_BRIDGE_SPAWNED
+                    ),
                 )
                 self._reviews[record.review_id] = record
                 self._persist_review(record)
@@ -651,6 +764,7 @@ class ReviewManager:
                 "paths": list(record.paths),
                 "reviewed_at": record.reviewed_at,
                 "reviewer_id": record.reviewer_id,
+                "reviewer_independence_class": record.reviewer_independence_class,
                 "review": redacted_result,
             }
 
@@ -766,6 +880,10 @@ class ReviewManager:
                 raise ReviewError(
                     "paths must exactly match the reviewed ordered path list"
                 )
+            # M-EV-03: reject a review binding whose expiry has passed. A
+            # NULL/absent ``expires_at`` means no expiry → allowed.
+            if _is_expired(record.expires_at):
+                raise ReviewError("review evidence binding has expired")
             return record
 
     @staticmethod

@@ -779,6 +779,187 @@ class VerificationCommitTests(unittest.TestCase):
         self.assertIn("id", result["commands"][0])
         self.assertIn("command_digest", result["commands"][0])
 
+    # -- M-EV-03: evidence bindings -----------------------------------------
+
+    def test_verification_binding_round_trips(self) -> None:
+        """M-EV-03: a verification binding persists and reloads with its
+        envelope fields (expires_at, authority_ref), and the sidecar's
+        toolchain_digest reuses the M-EV-02 environment digest."""
+        async def exercise() -> tuple[str | None, str | None, str | None, str | None, str | None]:
+            policy = project(self.root, ["{python}", "-c", "pass"])
+            locks = ProjectLockManager()
+            jobs = DevelopmentJobManager(
+                self.settings,
+                locks,
+                EditingExecutor(
+                    lambda root: (root / "candidate.txt").write_text(
+                        "candidate", encoding="utf-8"
+                    )
+                ),  # type: ignore[arg-type]
+                projects=(policy,),
+            )
+            manager = VerificationCommitManager(
+                self.settings, locks, jobs, projects=(policy,)
+            )
+            started = await jobs.start(policy, "candidate", "high")
+            completed = await wait_completed(jobs, policy, str(started["job_id"]))
+            verified = await manager.verify(
+                policy, str(completed["job_id"]), str(completed["base_head"])
+            )
+            assert verified["status"] == "passed"
+            verification_id = str(verified["verification_id"])
+            digest = str(verified["environment_digest"])
+
+            # Stamp a binding envelope (expiry + authority) on the record and
+            # persist it, simulating a caller that attaches an expiry.
+            from datetime import UTC, datetime, timedelta
+            record = manager._records[verification_id]
+            record.expires_at = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+            record.authority_ref = "auth-123"
+            manager._persist_record(record)
+
+            # A fresh manager re-hydrates the record with its binding envelope.
+            reloaded = VerificationCommitManager(
+                self.settings, locks, jobs, projects=(policy,)
+            )
+            reread = reloaded._records.get(verification_id)
+            reloaded_expires = reread.expires_at if reread else None
+            reloaded_auth = reread.authority_ref if reread else None
+            reloaded_digest = reread.environment_digest if reread else None
+
+            # The sidecar row is directly queryable too.
+            from local_dev_mcp import store as store_module
+            binding = store_module.load_verification_binding_row(
+                reloaded._db, verification_id
+            )
+            sidechain_digest = binding["toolchain_digest"] if binding else None
+            sidecar_independence = (
+                binding["reviewer_independence_class"] if binding else "missing"
+            )
+            return (
+                reloaded_expires,
+                reloaded_auth,
+                reloaded_digest,
+                sidechain_digest,
+                sidecar_independence,
+            )
+
+        (
+            reloaded_expires,
+            reloaded_auth,
+            reloaded_digest,
+            sidechain_digest,
+            sidecar_independence,
+        ) = asyncio.run(exercise())
+        self.assertIsNotNone(reloaded_expires)
+        self.assertEqual(reloaded_auth, "auth-123")
+        self.assertRegex(str(reloaded_digest), r"^[0-9a-f]{64}$")
+        # The sidecar's toolchain_digest reuses the environment digest.
+        self.assertEqual(sidechain_digest, reloaded_digest)
+        # Verification bindings never carry an independence class.
+        self.assertIsNone(sidecar_independence)
+
+    def test_verification_binding_default_no_expiry_allowed_at_gate(self) -> None:
+        """M-EV-03: a verification record created by verify() has no expiry
+        (NULL expires_at), so the commit gate permits it (default permissive)."""
+        async def exercise() -> str:
+            policy = project(self.root, ["{python}", "-c", "pass"])
+            _, manager, completed = await self.prepare(
+                policy,
+                lambda root: (root / "candidate.txt").write_text(
+                    "candidate", encoding="utf-8"
+                ),
+            )
+            verified = await manager.verify(
+                policy, str(completed["job_id"]), str(completed["base_head"])
+            )
+            assert verified["status"] == "passed"
+            # No expiry stamped → the commit path's expiry check passes.
+            committed = await manager.commit(
+                policy,
+                str(completed["job_id"]),
+                str(verified["verification_id"]),
+                str(verified["base_head"]),
+                str(verified["diff_fingerprint"]),
+                list(verified["paths"]),
+                "M-EV-03 no-expiry commit",
+            )
+            return str(committed["status"])
+
+        status = asyncio.run(exercise())
+        self.assertEqual(status, "committed")
+
+    def test_verification_binding_expired_rejected_at_gate(self) -> None:
+        """M-EV-03: a verification binding whose expires_at is in the past is
+        rejected at the commit gate with a clear error."""
+        async def exercise() -> str:
+            policy = project(self.root, ["{python}", "-c", "pass"])
+            _, manager, completed = await self.prepare(
+                policy,
+                lambda root: (root / "candidate.txt").write_text(
+                    "candidate", encoding="utf-8"
+                ),
+            )
+            verified = await manager.verify(
+                policy, str(completed["job_id"]), str(completed["base_head"])
+            )
+            assert verified["status"] == "passed"
+            # Stamp an expiry in the past and persist.
+            from datetime import UTC, datetime, timedelta
+            record = manager._records[str(verified["verification_id"])]
+            record.expires_at = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+            manager._persist_record(record)
+            try:
+                await manager.commit(
+                    policy,
+                    str(completed["job_id"]),
+                    str(verified["verification_id"]),
+                    str(verified["base_head"]),
+                    str(verified["diff_fingerprint"]),
+                    list(verified["paths"]),
+                    "should be rejected",
+                )
+            except VerificationError as exc:
+                return str(exc)
+            return "committed-unexpectedly"
+
+        message = asyncio.run(exercise())
+        self.assertIn("expired", message)
+
+    def test_verification_binding_malformed_expiry_rejected(self) -> None:
+        """M-EV-03: a malformed expires_at fails closed (treated as expired)."""
+        async def exercise() -> str:
+            policy = project(self.root, ["{python}", "-c", "pass"])
+            _, manager, completed = await self.prepare(
+                policy,
+                lambda root: (root / "candidate.txt").write_text(
+                    "candidate", encoding="utf-8"
+                ),
+            )
+            verified = await manager.verify(
+                policy, str(completed["job_id"]), str(completed["base_head"])
+            )
+            assert verified["status"] == "passed"
+            record = manager._records[str(verified["verification_id"])]
+            record.expires_at = "not-a-timestamp"
+            manager._persist_record(record)
+            try:
+                await manager.commit(
+                    policy,
+                    str(completed["job_id"]),
+                    str(verified["verification_id"]),
+                    str(verified["base_head"]),
+                    str(verified["diff_fingerprint"]),
+                    list(verified["paths"]),
+                    "should be rejected",
+                )
+            except VerificationError as exc:
+                return str(exc)
+            return "committed-unexpectedly"
+
+        message = asyncio.run(exercise())
+        self.assertIn("expired", message)
+
 
 if __name__ == "__main__":
     unittest.main()

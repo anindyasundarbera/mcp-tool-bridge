@@ -260,6 +260,24 @@ CREATE TABLE IF NOT EXISTS verification_environment (
     FOREIGN KEY (verification_id) REFERENCES verifications(verification_id)
       ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS verification_bindings (
+    verification_id TEXT PRIMARY KEY,
+    toolchain_digest TEXT,
+    reviewer_independence_class TEXT,
+    expires_at TEXT,
+    authority_ref TEXT,
+    FOREIGN KEY (verification_id) REFERENCES verifications(verification_id)
+      ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS review_bindings (
+    review_id TEXT PRIMARY KEY,
+    toolchain_digest TEXT,
+    reviewer_independence_class TEXT,
+    expires_at TEXT,
+    authority_ref TEXT,
+    FOREIGN KEY (review_id) REFERENCES reviews(review_id)
+      ON DELETE CASCADE
+);
 """
 
 _UPSERT_JOB = """
@@ -658,6 +676,122 @@ def load_verification_environment_row(
     row = connection.execute(
         "SELECT * FROM verification_environment WHERE verification_id = ?",
         (verification_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+_UPSERT_VERIFICATION_BINDING = """
+INSERT INTO verification_bindings (
+    verification_id, toolchain_digest, reviewer_independence_class,
+    expires_at, authority_ref
+) VALUES (
+    :verification_id, :toolchain_digest, :reviewer_independence_class,
+    :expires_at, :authority_ref
+)
+ON CONFLICT(verification_id) DO UPDATE SET
+    toolchain_digest = excluded.toolchain_digest,
+    reviewer_independence_class = excluded.reviewer_independence_class,
+    expires_at = excluded.expires_at,
+    authority_ref = excluded.authority_ref
+"""
+
+
+def upsert_verification_binding_row(
+    connection: sqlite3.Connection, row: dict[str, Any]
+) -> None:
+    """Persist one verification-binding sidecar row (M-EV-03).
+
+    A 1:1 sidecar to ``verifications`` keyed by ``verification_id`` (FK with
+    ``ON DELETE CASCADE``). Holds the binding fields that complete the evidence
+    set: ``toolchain_digest`` (the M-EV-02 environment/toolchain digest, copied
+    here so the binding is self-contained), ``reviewer_independence_class``
+    (NULL for verification bindings — only reviews carry one),
+    ``expires_at`` (ISO-8601; NULL means no expiry), and ``authority_ref``
+    (links to the ``authority_records`` from M-EV-05). Additive: ``CREATE TABLE
+    IF NOT EXISTS``, never alters ``verifications``, ``SCHEMA_VERSION`` stays 1.
+    """
+    with connection:
+        connection.execute(_UPSERT_VERIFICATION_BINDING, row)
+
+
+def load_verification_binding_rows(
+    connection: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Return every persisted verification-binding sidecar row as a dict."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM verification_bindings"
+        ).fetchall()
+    ]
+
+
+def load_verification_binding_row(
+    connection: sqlite3.Connection, verification_id: str
+) -> dict[str, Any] | None:
+    """Return one verification-binding sidecar row, or None."""
+    row = connection.execute(
+        "SELECT * FROM verification_bindings WHERE verification_id = ?",
+        (verification_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+_UPSERT_REVIEW_BINDING = """
+INSERT INTO review_bindings (
+    review_id, toolchain_digest, reviewer_independence_class,
+    expires_at, authority_ref
+) VALUES (
+    :review_id, :toolchain_digest, :reviewer_independence_class,
+    :expires_at, :authority_ref
+)
+ON CONFLICT(review_id) DO UPDATE SET
+    toolchain_digest = excluded.toolchain_digest,
+    reviewer_independence_class = excluded.reviewer_independence_class,
+    expires_at = excluded.expires_at,
+    authority_ref = excluded.authority_ref
+"""
+
+
+def upsert_review_binding_row(
+    connection: sqlite3.Connection, row: dict[str, Any]
+) -> None:
+    """Persist one review-binding sidecar row (M-EV-03).
+
+    A 1:1 sidecar to ``reviews`` keyed by ``review_id`` (FK with
+    ``ON DELETE CASCADE``). Holds the binding fields that complete the review
+    evidence set: ``toolchain_digest`` (optional environment/toolchain digest),
+    ``reviewer_independence_class`` (one of ``bridge_spawned|human|external`` —
+    stamped by ``review.py``: ``bridge_spawned`` for
+    ``run_independent_review``, ``human``/``external`` for
+    ``record_candidate_review``), ``expires_at`` (ISO-8601; NULL means no
+    expiry), and ``authority_ref`` (links to the ``authority_records`` from
+    M-EV-05). Additive: ``CREATE TABLE IF NOT EXISTS``, never alters ``reviews``,
+    ``SCHEMA_VERSION`` stays 1.
+    """
+    with connection:
+        connection.execute(_UPSERT_REVIEW_BINDING, row)
+
+
+def load_review_binding_rows(
+    connection: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Return every persisted review-binding sidecar row as a dict."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM review_bindings"
+        ).fetchall()
+    ]
+
+
+def load_review_binding_row(
+    connection: sqlite3.Connection, review_id: str
+) -> dict[str, Any] | None:
+    """Return one review-binding sidecar row, or None."""
+    row = connection.execute(
+        "SELECT * FROM review_bindings WHERE review_id = ?",
+        (review_id,),
     ).fetchone()
     return dict(row) if row is not None else None
 

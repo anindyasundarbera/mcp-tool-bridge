@@ -116,6 +116,27 @@ def _timestamp() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _is_expired(expires_at: str | None, *, now: datetime | None = None) -> bool:
+    """True when an ISO-8601 ``expires_at`` has passed (M-EV-03).
+
+    A NULL/absent ``expires_at`` means no expiry → never expired (the gate
+    defaults to permissive when expiry is absent). The comparison is against
+    the current UTC time. A malformed timestamp is treated as expired so a
+    corrupt binding fails closed rather than silently passing the gate.
+    """
+    if expires_at is None:
+        return False
+    try:
+        parsed = datetime.fromisoformat(expires_at)
+    except ValueError:
+        return True
+    if parsed.tzinfo is None:
+        # A naive timestamp is interpreted as UTC.
+        parsed = parsed.replace(tzinfo=UTC)
+    current = now if now is not None else datetime.now(UTC)
+    return parsed < current
+
+
 def _json_dumps(value: Any) -> str | None:
     if value is None:
         return None
@@ -448,6 +469,16 @@ class VerificationRecord:
     # toolchain-pin digest. Persisted in the ``verification_environment``
     # sidecar (not on ``verifications``) so the schema stays additive.
     environment_digest: str | None = None
+    # M-EV-03: evidence-binding fields, persisted in the
+    # ``verification_bindings`` sidecar (not on ``verifications``) so the
+    # schema stays additive. ``toolchain_digest`` in the sidecar reuses this
+    # record's ``environment_digest``; ``reviewer_independence_class`` is always
+    # NULL for a verification binding (only reviews carry one). ``expires_at``
+    # is an ISO-8601 timestamp (NULL means no expiry → always allowed at the
+    # commit gate). ``authority_ref`` links to the ``authority_records`` from
+    # M-EV-05.
+    expires_at: str | None = None
+    authority_ref: str | None = None
 
 
 def _record_json_loads(value: str | None) -> Any:
@@ -478,6 +509,8 @@ def record_from_row(
     row: dict[str, Any],
     *,
     environment_digest: str | None = None,
+    expires_at: str | None = None,
+    authority_ref: str | None = None,
 ) -> VerificationRecord | None:
     """Rebuild a verification record from a dict row, or None if unparseable.
 
@@ -485,6 +518,12 @@ def record_from_row(
     ``verification_environment`` sidecar (loaded separately by the caller) so
     the record carries the environment/toolchain fingerprint without the
     ``verifications`` table being altered.
+
+    M-EV-03: ``expires_at`` and ``authority_ref`` come from the
+    ``verification_bindings`` sidecar (loaded separately by the caller) so the
+    record carries its evidence-binding envelope without ``verifications``
+    being altered. The sidecar's ``toolchain_digest`` reuses the
+    ``environment_digest`` and is not carried separately on the record.
     """
     paths = _record_json_loads(row.get("paths_json"))
     commands = _record_json_loads(row.get("commands_json"))
@@ -502,6 +541,8 @@ def record_from_row(
             commands=tuple(commands),
             used=bool(row.get("used", 0)),
             environment_digest=environment_digest,
+            expires_at=expires_at,
+            authority_ref=authority_ref,
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -1149,15 +1190,27 @@ class VerificationCommitManager:
 
         M-EV-02: also loads the ``verification_environment`` sidecar so each
         re-hydrated record carries its ``environment_digest``.
+
+        M-EV-03: also loads the ``verification_bindings`` sidecar so each
+        re-hydrated record carries its ``expires_at``/``authority_ref``
+        evidence-binding envelope.
         """
         env_digests = {
             row["verification_id"]: row["environment_digest"]
             for row in store.load_verification_environment_rows(self._db)
         }
+        bindings = {
+            row["verification_id"]: row
+            for row in store.load_verification_binding_rows(self._db)
+        }
         for row in store.load_record_rows(self._db):
+            verification_id = row["verification_id"]
+            binding = bindings.get(verification_id)
             record = record_from_row(
                 row,
-                environment_digest=env_digests.get(row["verification_id"]),
+                environment_digest=env_digests.get(verification_id),
+                expires_at=binding.get("expires_at") if binding else None,
+                authority_ref=binding.get("authority_ref") if binding else None,
             )
             if record is not None:
                 self._records[record.verification_id] = record
@@ -1169,6 +1222,14 @@ class VerificationCommitManager:
         record so the durable store mirrors the in-memory state. M-EV-02: also
         upserts the ``verification_environment`` sidecar row when the record
         carries an ``environment_digest``.
+
+        M-EV-03: also upserts the ``verification_bindings`` sidecar row so the
+        record's evidence-binding envelope (``toolchain_digest`` reusing the
+        environment digest, ``reviewer_independence_class`` always NULL for a
+        verification binding, ``expires_at``, ``authority_ref``) is durable. The
+        binding is always written (even when the fields are NULL) so a reload
+        sees the binding envelope exists; the commit-gate expiry check reads
+        it back.
         """
         store.upsert_record_row(self._db, record_to_row(record))
         if record.environment_digest is not None:
@@ -1179,6 +1240,19 @@ class VerificationCommitManager:
                     "environment_digest": record.environment_digest,
                 },
             )
+        store.upsert_verification_binding_row(
+            self._db,
+            {
+                "verification_id": record.verification_id,
+                # Reuse the M-EV-02 environment/toolchain digest concept.
+                "toolchain_digest": record.environment_digest,
+                # Verification bindings never carry an independence class —
+                # only reviews do. Kept in the shared schema for uniformity.
+                "reviewer_independence_class": None,
+                "expires_at": record.expires_at,
+                "authority_ref": record.authority_ref,
+            },
+        )
 
     def _new_verification_id(self) -> str:
         for _ in range(10):
@@ -1363,6 +1437,12 @@ class VerificationCommitManager:
         lock = await self._locks.for_project(project.id)
         async with lock:
             record = await self._record(project, job_id, verification_id)
+            # M-EV-03: reject a verification binding whose expiry has passed.
+            # A NULL/absent ``expires_at`` means no expiry → allowed.
+            if _is_expired(record.expires_at):
+                raise VerificationError(
+                    "verification evidence binding has expired"
+                )
             if expected_head != record.base_head:
                 raise VerificationError("expected_head does not match verified base HEAD")
             if expected_diff_fingerprint != record.diff_fingerprint:
