@@ -282,7 +282,7 @@ authoritative input to the implementation order in "Recommended next action".
 | M-EV-03 | Evidence binding completeness | DONE | — (store.verification_bindings+review_bindings sidecars with toolchain_digest/reviewer_independence_class/expires_at/authority_ref; verification.py VerificationRecord.expires_at/authority_ref + _is_expired commit-gate check; review.py ReviewRecord.reviewer_independence_class + ReviewManager stamps bridge_spawned/human/external + validate_for_commit expiry check; tests/test_verification.py + tests/test_review.py M-EV-03 cases) |
 | M-EV-04 | Review content-addressing + revision→finding links | DONE | — (store.review_content sidecar with verdict_hash = SHA-256 over verdict + base_head + diff_fingerprint + sorted paths; store.revision_resolves_finding table; review.py compute_verdict_hash + ReviewRecord.verdict_hash + _persist_review/_reload_reviews wire the sidecar; jobs.py record_revision_resolves_findings records non-fatal revision→finding links; ReviewManager.get_review_closure_chain queryable chain; tests/test_review.py M-EV-04 cases) |
 | M-EV-05 | Source classifications + authority-behind-instructions | DONE | — (source_classifications + authority_records tables, seeded vocabulary, _record_event stamps authority_ref; tests) |
-| M-EV-06 | Portable evidence bundle export | PARTIAL | Wire `RequirementManager` coverage section into `EvidenceBundleManager`; explicit `.env`/`.venv`/token exclude filter on changed_paths+diff; (optional) zip serialization; tests. |
+| M-EV-06 | Portable evidence bundle export | DONE | — (NEW SURFACE shipped earlier: `ProjectCapability.EXPORT_EVIDENCE_BUNDLE` + `export_evidence_bundle` tool; this commit closes the audit gap: `RequirementManager` coverage section wired into `EvidenceBundleManager.export_bundle` via lazy `jobs._requirements_manager()`; explicit `.env`/`.venv`/token/cert/`.pem`/`.key`/secrets/`.aws`/`.ssh` exclude filter on changed_paths + diff detail with `sensitive_excluded_count`; non-fatal requirement section; tests/test_evidence_bundle.py SensitivePathFilterTests + coverage cases; zip serialization deferred as optional) |
 | M-EV-07 | Nondeterminism detection + deterministic replay | PARTIAL | Compute+persist env digest into `verifications` row (additive `env_digest` column + VerificationRecord field); (optional) per-command digests; replay tool deferred. |
 | M-EV-08 | Artifact retention + GC policy | PARTIAL | Add `EVIDENCE_RETENTION_DAYS`/`CHECKPOINT_RETENTION` settings; `store.gc_artifacts` deletes non-promoted checkpoint+detail rows older than retention, never verifications/reviews/publications/syncs; tests. |
 | M-GV-01 | Durable authorization objects | PARTIAL | Wire `AuthorizationManager` into commit/push/review/export handlers (require unused unexpired project+capability+target authz, mark used in SAME ACID txn); opt-in Settings flag; handler-integration tests; confirm runtime instantiation. |
@@ -569,7 +569,11 @@ capability are flagged **NEW SURFACE**.
   attributable; no new tool.
 
 #### M-EV-06 Portable evidence bundle export — **NEW SURFACE**
-- **Status:** MISSING. **Evidence:** no `export_evidence`/`bundle` code.
+- **Status:** DONE. **Evidence:** `models.py:EXPORT_EVIDENCE_BUNDLE` capability
+  + `server.py:export_evidence_bundle` tool shipped earlier (dormant by
+  default, tool-count canary at 32). This commit closes the 2026-08-26 audit
+  gap: requirement coverage section + sensitive-path exclude filter are wired
+  into `evidence.py:export_bundle`.
 - **Build:** **NEW** `ProjectCapability.EXPORT_EVIDENCE_BUNDLE` (requires
   `repository_read`); **NEW** tool `export_evidence_bundle(project_id, job_id,
   expected_candidate_fingerprint)` that assembles, into a single redacted
@@ -578,11 +582,22 @@ capability are flagged **NEW SURFACE**.
   summary, and requirement coverage — and returns it (or writes to a path
   inside an allowlisted export root). Sensitive paths redacted; `.env`/tokens/
   certs/`.venv` excluded; **sensitivity classification (M-CC-11) gates
-  inclusion**. Dormant by default.
+  inclusion**. Dormant by default. Requirement coverage is wired via the lazy
+  `jobs._requirements_manager()` helper (no new constructor coupling) and is
+  non-fatal (`{"requirements_covered": None}` when unavailable or empty). The
+  sensitive-path exclude filter (`_SENSITIVE_PATH_PATTERNS`) drops matching
+  `changed_paths` and scrubs diff-stat detail lines, reporting
+  `sensitive_excluded_count`. (Optional) zip serialization is deferred — the
+  audit gap marked it optional and the JSON bundle is the contract.
 - **Tests:** `tests/test_evidence_bundle.py` — bundle contents match a
   verified job; secrets/paths redacted; a project without the capability cannot
-  call it; tool-count assertion bumps 22 → 23. **Acceptance:** `list_tools()`
-  includes `export_evidence_bundle` only when opted in.
+  call it; tool-count assertion bumps 22 → 23; requirement coverage section is
+  `None` without parsed requirements and populated when seeded; sensitive
+  changed_paths are excluded with a correct `sensitive_excluded_count` and
+  never leak into the bundle; `bundle_sha256` remains recomputable;
+  `SensitivePathFilterTests` cover the helper patterns and false-positive
+  guards. **Acceptance:** `list_tools()` includes `export_evidence_bundle`
+  only when opted in.
 
 #### M-EV-07 Nondeterminism detection + deterministic replay
 - **Status:** PARTIAL. **Evidence:** fingerprints are deterministic

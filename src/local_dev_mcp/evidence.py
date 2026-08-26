@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +37,77 @@ class EvidenceBundleError(RuntimeError):
 
 def _timestamp() -> str:
     return datetime.now(UTC).isoformat()
+
+
+# Sensitive-path exclude filter (M-EV-06). Path entries (changed_paths or diff
+# detail lines) matching any of these patterns are withheld from the bundle so
+# ``.env``/tokens/certs/``.venv``/secrets never enter an evidence archive. The
+# patterns are anchored to path segments to avoid false positives like
+# ``environment.py``. A matching entry is dropped and counted in
+# ``sensitive_excluded_count``; the detail line is replaced with a marker so
+# the recipient knows something was withheld without seeing the content.
+_SENSITIVE_PATH_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(^|/)\.env($|[./])"),
+    re.compile(r"(^|/)\.env\.[-\w]+$"),
+    re.compile(r"(^|/)\.venv(/|$)"),
+    re.compile(r"(^|/)tokens?(\.|$|/)"),
+    re.compile(r"(^|/)credentials?(\.|$|/)"),
+    re.compile(r"(^|/)certs?(\.|$|/)"),
+    re.compile(r"\.pem$"),
+    re.compile(r"\.key$"),
+    re.compile(r"(^|/)secrets?(\.|$|/)"),
+    re.compile(r"(^|/)\.aws(/|$)"),
+    re.compile(r"(^|/)\.ssh(/|$)"),
+)
+
+
+def _is_sensitive_path(path: str) -> bool:
+    return any(pattern.search(path) for pattern in _SENSITIVE_PATH_PATTERNS)
+
+
+def _exclude_sensitive_paths(
+    paths: list[Any] | None,
+) -> tuple[list[Any], int]:
+    """Drop sensitive entries from a changed-paths list.
+
+    Returns the kept entries and the count of dropped entries. Non-string
+    entries are always kept (they cannot match a path pattern). ``None`` input
+    is preserved as ``None`` with zero exclusions.
+    """
+    if paths is None:
+        return None, 0
+    kept: list[Any] = []
+    excluded = 0
+    for item in paths:
+        if isinstance(item, str) and _is_sensitive_path(item):
+            excluded += 1
+        else:
+            kept.append(item)
+    return kept, excluded
+
+
+def _scrub_sensitive_diff_detail(detail: Any) -> Any:
+    """Replace diff-stat detail lines that mention a sensitive path.
+
+    A ``git diff --stat`` line looks like ``" <path> | <changes>"``. The path is
+    extracted (everything before the first ``" | "`` separator, leading
+    whitespace stripped) and checked against the sensitive patterns. Matching
+    lines become ``<excluded-sensitive>`` so the recipient can see that a line
+    was withheld without exposing the path or content. Non-string detail is
+    returned unchanged.
+    """
+    if not isinstance(detail, str):
+        return detail
+    lines: list[str] = []
+    for line in detail.splitlines():
+        stripped = line.lstrip()
+        if stripped and " | " in stripped:
+            path = stripped.split(" | ", 1)[0].strip()
+            if _is_sensitive_path(path):
+                lines.append("<excluded-sensitive>")
+                continue
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _redact(value: Any, paths: tuple[Path, ...]) -> Any:
@@ -148,6 +220,46 @@ class EvidenceBundleManager:
             "detail": _redact(stat, self._redaction_paths(project, job_id)),
         }
 
+    def _requirements_manager(self) -> Any:
+        """Return the shared ``RequirementManager``, or ``None`` if unavailable.
+
+        M-EV-06: lazily derive the requirement manager from the job manager
+        (which already owns the shared DB connection) so the evidence bundle
+        can surface requirement coverage without a new constructor coupling.
+        Never raises: if the job manager does not expose the lazy helper, the
+        bundle simply omits the coverage section.
+        """
+        helper = getattr(self._jobs, "_requirements_manager", None)
+        if not callable(helper):
+            return None
+        try:
+            return helper()
+        except Exception:
+            return None
+
+    def _requirements_section(
+        self, project: ProjectPolicy, job_id: str
+    ) -> dict[str, Any]:
+        """Build the non-fatal requirement-coverage section for the bundle.
+
+        Returns ``{"requirements_covered": <summary>}`` when a requirement
+        manager is available and the project has parsed requirements, else
+        ``{"requirements_covered": None}``. Never raises: any error is swallowed
+        so a requirement-layer failure cannot break bundle export.
+        """
+        try:
+            req_manager = self._requirements_manager()
+            if req_manager is None:
+                return {"requirements_covered": None}
+            summary = req_manager.requirements_covered_summary_sync(
+                project.id, job_id=job_id
+            )
+            if not summary or summary.get("total", 0) == 0:
+                return {"requirements_covered": None}
+            return {"requirements_covered": summary}
+        except Exception:
+            return {"requirements_covered": None}
+
     async def export_bundle(
         self,
         project: ProjectPolicy,
@@ -161,6 +273,11 @@ class EvidenceBundleManager:
         contents. ``expected_candidate_fingerprint`` binds the bundle to the
         caller's claimed candidate so a stale or forged job cannot produce a
         valid-looking bundle.
+
+        M-EV-06: the bundle also carries a non-fatal requirement-coverage
+        section (when a requirement manager is wired) and applies an explicit
+        sensitive-path exclude filter to ``changed_paths`` and diff detail so
+        ``.env``/tokens/certs/``.venv``/secrets never enter an archive.
         """
         expected = expected_candidate_fingerprint.lower()
         if len(expected) != 64 or not all(c in "0123456789abcdef" for c in expected):
@@ -184,6 +301,23 @@ class EvidenceBundleManager:
 
             diff_summary = await self._diff_summary(project, job_id)
 
+            # Sensitive-path exclude filter: drop matching changed_paths and
+            # scrub the diff detail BEFORE the bundle-wide redact so secrets
+            # never enter the archive. ``sensitive_excluded_count`` tells the
+            # recipient something was withheld.
+            changed_paths_raw = (
+                _json_loads(latest_checkpoint.get("changed_paths_json"))
+                if latest_checkpoint is not None
+                else None
+            )
+            kept_paths, sensitive_excluded_count = _exclude_sensitive_paths(
+                changed_paths_raw
+            )
+            scrubbed_detail = _scrub_sensitive_diff_detail(
+                diff_summary.get("detail")
+            )
+            diff_summary = {**diff_summary, "detail": scrubbed_detail}
+
             bundle: dict[str, Any] = {
                 "bundle_version": 1,
                 "exported_at": _timestamp(),
@@ -195,16 +329,14 @@ class EvidenceBundleManager:
                     "fingerprint": latest_checkpoint.get("partial_fingerprint")
                     if latest_checkpoint is not None
                     else None,
-                    "changed_paths": _json_loads(
-                        latest_checkpoint.get("changed_paths_json")
-                    )
-                    if latest_checkpoint is not None
-                    else None,
+                    "changed_paths": kept_paths,
                     "diff_summary": diff_summary,
+                    "sensitive_excluded_count": sensitive_excluded_count,
                 },
                 "verifications": verifications,
                 "reviews": reviews,
                 "checkpoint_count": checkpoint_count,
+                "requirements": self._requirements_section(project, job_id),
             }
 
             # Redact sensitive paths BEFORE computing the bundle-wide content
