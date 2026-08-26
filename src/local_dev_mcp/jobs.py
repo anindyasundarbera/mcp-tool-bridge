@@ -345,6 +345,7 @@ class DevelopmentJobManager:
         worktrees: GitWorktreeManager | None = None,
         candidate_checker: CandidateHealthChecker | None = None,
         projects: tuple[ProjectPolicy, ...] = (),
+        requirements: Any = None,
     ) -> None:
         self.settings = settings
         self._locks = locks
@@ -355,6 +356,7 @@ class DevelopmentJobManager:
         )
         self._candidate_checker = candidate_checker or CandidateHealthChecker(settings)
         self._project_roots = tuple(project.root for project in projects)
+        self._projects = projects
         self._jobs: dict[str, DevelopmentJob] = {}
         self._state_lock = asyncio.Lock()
         # Per-run (in-memory only) last observed changed-path set, used to
@@ -366,6 +368,10 @@ class DevelopmentJobManager:
         # __init__ (only filesystem/DB work, no await) so it works before the
         # event loop starts.
         self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+        # M-EV-01: requirement traceability manager. Shares this manager's DB
+        # connection so there is a single write path. Lazily constructed if
+        # not provided (lazy import to avoid a module-load-time dependency).
+        self._requirements: Any = requirements
         self._reload_jobs()
 
     def _reload_jobs(self) -> None:
@@ -417,6 +423,30 @@ class DevelopmentJobManager:
         so the durable store mirrors the in-memory state.
         """
         store.upsert_job_row(self._db, job_to_row(job))
+
+    def _requirements_manager(self) -> Any:
+        """Return the RequirementManager, lazily constructing it if needed.
+
+        M-EV-01: the manager shares this job manager's DB connection so there
+        is a single write path and no second WAL-lock competitor. Uses a lazy
+        import to avoid a module-load-time dependency on ``requirement``.
+        """
+        if self._requirements is not None:
+            return self._requirements
+        from .reader import RepositoryReader
+        from .requirement import RequirementManager
+
+        self._requirements = RequirementManager(
+            self.settings,
+            store,
+            RepositoryReader(self.settings),
+            db=self._db,
+        )
+        return self._requirements
+
+    def _project_policies(self) -> tuple[ProjectPolicy, ...]:
+        """Return the project policies this manager was constructed with."""
+        return self._projects
 
     def _progress_to_row(self, job: DevelopmentJob) -> dict[str, Any]:
         return {
@@ -954,6 +984,20 @@ class DevelopmentJobManager:
                 }
                 for row in authority_records
             ]
+        # M-EV-01: surface a bounded requirements_covered summary so an
+        # orchestrator can see covered/uncovered/deferred/contradictory counts
+        # and the list of uncovered normative IDs. Non-fatal: a project with
+        # no parsed requirements yields an empty summary. Uses the sync
+        # variant because ``_snapshot`` is a sync method.
+        try:
+            req_manager = self._requirements_manager()
+            summary = req_manager.requirements_covered_summary_sync(
+                job.project_id, job_id=job.job_id
+            )
+            if summary.get("normative", 0) > 0:
+                snapshot["requirements_covered"] = summary
+        except Exception:
+            pass
         return snapshot
 
     def _require_job(
@@ -1049,6 +1093,15 @@ class DevelopmentJobManager:
     ) -> dict[str, Any]:
         effort = resolve_effort(project, effort, self.settings)
         specification = self._validate_input(project, text, effort)
+        # M-EV-01: scan the project's canonical spec for normative requirement
+        # IDs and persist them (idempotent) so the coverage matrix is available
+        # before any edit. Failures are non-fatal: a project with no parseable
+        # requirements simply has an empty coverage set.
+        try:
+            req_manager = self._requirements_manager()
+            await req_manager.scan(project)
+        except Exception:
+            pass
         async with self._state_lock:
             job = DevelopmentJob(
                 job_id=self._new_job_id(),
@@ -1829,6 +1882,17 @@ class DevelopmentJobManager:
                                 self._persist_progress(job)
                         else:
                             await self._set_status(job, JobStatus.COMPLETED)
+                        # M-EV-01: persist requirement_links for the candidate's
+                        # changed paths so the coverage matrix reflects this
+                        # job's contribution. Non-fatal: a project with no
+                        # parsed requirements simply has no links to persist.
+                        try:
+                            req_manager = self._requirements_manager()
+                            req_manager.persist_links_for_candidate(
+                                project, job.job_id, boundary_paths
+                            )
+                        except Exception:
+                            pass
                         terminal = job.status
                         applied = True
                         break

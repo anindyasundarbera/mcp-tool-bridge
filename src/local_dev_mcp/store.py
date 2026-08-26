@@ -378,23 +378,31 @@ ON CONFLICT(job_id) DO UPDATE SET
 
 _UPSERT_REQUIREMENT = """
 INSERT INTO requirements (
-    requirement_id, project_id, text, source_path, source_line, normative
+    requirement_id, project_id, text, source_path, source_line, normative,
+    kind, status, deferred_authority, updated_at
 ) VALUES (
-    :requirement_id, :project_id, :text, :source_path, :source_line, :normative
+    :requirement_id, :project_id, :text, :source_path, :source_line, :normative,
+    :kind, :status, :deferred_authority, :updated_at
 )
 ON CONFLICT(requirement_id) DO UPDATE SET
     project_id = excluded.project_id,
     text = excluded.text,
     source_path = excluded.source_path,
     source_line = excluded.source_line,
-    normative = excluded.normative
+    normative = excluded.normative,
+    kind = COALESCE(excluded.kind, requirements.kind),
+    status = COALESCE(excluded.status, requirements.status),
+    deferred_authority = COALESCE(excluded.deferred_authority, requirements.deferred_authority),
+    updated_at = COALESCE(excluded.updated_at, requirements.updated_at)
 """
 
 _UPSERT_REQUIREMENT_LINK = """
 INSERT INTO requirement_links (
-    requirement_id, job_id, link_type, link_value
+    requirement_id, job_id, link_type, link_value,
+    artifact_kind, artifact_path, evidence_json, linked_at
 ) VALUES (
-    :requirement_id, :job_id, :link_type, :link_value
+    :requirement_id, :job_id, :link_type, :link_value,
+    :artifact_kind, :artifact_path, :evidence_json, :linked_at
 )
 """
 
@@ -424,6 +432,22 @@ _ADDITIVE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("tool_failures", "INTEGER NOT NULL DEFAULT 0"),
         ("parent_job_id", "TEXT"),
         ("delegation_mandate_json", "TEXT"),
+    ),
+    # M-EV-01: additive columns on the requirements + requirement_links tables
+    # so the full matrix semantics (kind, status, deferred_authority,
+    # artifact_kind, artifact_path, evidence_json, linked_at) are persisted
+    # without altering the existing column set or bumping SCHEMA_VERSION.
+    "requirements": (
+        ("kind", "TEXT"),  # normative|example|commentary
+        ("status", "TEXT"),  # implemented|unimplemented|deferred
+        ("deferred_authority", "TEXT"),
+        ("updated_at", "TEXT"),
+    ),
+    "requirement_links": (
+        ("artifact_kind", "TEXT"),  # code|test|spec
+        ("artifact_path", "TEXT"),
+        ("evidence_json", "TEXT"),
+        ("linked_at", "TEXT"),
     ),
 }
 
@@ -1002,6 +1026,53 @@ def load_requirement_links_for_requirement(connection: sqlite3.Connection, requi
             "SELECT * FROM requirement_links WHERE requirement_id = ?", (requirement_id,)
         ).fetchall()
     ]
+
+
+def load_requirements_for_project(
+    connection: sqlite3.Connection, project_id: str
+) -> list[dict[str, Any]]:
+    """Return all requirement rows for a given project (M-EV-01)."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM requirements WHERE project_id = ? "
+            "ORDER BY source_path ASC, source_line ASC",
+            (project_id,),
+        ).fetchall()
+    ]
+
+
+def update_requirement_status(
+    connection: sqlite3.Connection,
+    requirement_id: str,
+    status: str,
+    deferred_authority: str | None = None,
+) -> None:
+    """Update a requirement's status (and optionally deferred_authority) in place.
+
+    M-EV-01: used to record a deferral (status='deferred' + authority) or to
+    mark a requirement implemented/unimplemented. Additive: only touches the
+    new status/deferred_authority columns.
+    """
+    with connection:
+        if deferred_authority is not None:
+            connection.execute(
+                "UPDATE requirements SET status = ?, deferred_authority = ?, "
+                "updated_at = ? WHERE requirement_id = ?",
+                (status, deferred_authority, _timestamp_iso(), requirement_id),
+            )
+        else:
+            connection.execute(
+                "UPDATE requirements SET status = ?, updated_at = ? "
+                "WHERE requirement_id = ?",
+                (status, _timestamp_iso(), requirement_id),
+            )
+
+
+def _timestamp_iso() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).isoformat()
 
 
 _INSERT_AUTHORIZATION = """

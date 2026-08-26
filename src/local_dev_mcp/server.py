@@ -48,6 +48,7 @@ def create_server(
     canonicalization: CanonicalizationResolver | None = None,
     runtime: RuntimeVerificationManager | None = None,
     capture: WorkingTreeCaptureManager | None = None,
+    requirements: Any = None,
 ) -> FastMCP:
     active_settings = settings or Settings.from_env()
     active_registry = registry or ProjectRegistry.load(
@@ -57,11 +58,15 @@ def create_server(
     active_executor = executor or ClaudeExecutor(active_settings)
     active_reader = reader or RepositoryReader(active_settings)
     active_writer = writer or RepositoryWriter(active_settings)
+    # M-EV-01: construct the RequirementManager so it shares the job manager's
+    # DB connection (wired inside DevelopmentJobManager). When the caller
+    # passes a pre-built ``jobs`` manager, its own RequirementManager is kept.
     active_jobs = jobs or DevelopmentJobManager(
         active_settings,
         active_locks,
         active_executor,
         projects=active_registry.projects(),
+        requirements=requirements,
     )
     active_verification = verification or VerificationCommitManager(
         active_settings,
@@ -185,11 +190,22 @@ def create_server(
         project = active_registry.resolve(
             project_id, ProjectCapability.REPOSITORY_READ
         )
-        return {
+        result: dict[str, object] = {
             "project_id": project.id,
             "project_name": project.display_name,
             "repository": await project_status(project.root),
         }
+        # M-EV-01: surface a bounded requirements_covered summary so an
+        # orchestrator can see coverage before planning work. Non-fatal: a
+        # project with no parsed requirements yields no summary.
+        try:
+            req_manager = active_jobs._requirements_manager()
+            summary = await req_manager.requirements_covered_summary(project)
+            if summary.get("normative", 0) > 0:
+                result["requirements_covered"] = summary
+        except Exception:
+            pass
+        return result
 
     read_only_annotations = ToolAnnotations(
         readOnlyHint=True,
