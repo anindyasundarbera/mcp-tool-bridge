@@ -146,6 +146,70 @@ class UsageExecutor:
         }
 
 
+class StreamJsonInputRequiredExecutor:
+    """M-CT-05: returns a non-completed slice carrying a stream-json
+    ``input_required`` event, so the job transitions to
+    BLOCKED_INPUT_REQUIRED (resumable) via the real ``_run`` loop."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def execute(
+        self,
+        project: ProjectPolicy,
+        specification: str,
+        effort: str,
+        *,
+        root: Path | None = None,
+        resume_session_id: str | None = None,
+        max_turns: int | None = None,
+    ) -> dict[str, Any]:
+        assert root is not None
+        self.calls.append({"root": root, "resume_session_id": resume_session_id})
+        return {
+            "status": "failed",
+            "terminal_reason": "input_required",
+            "num_turns": 2,
+            "session_id": "bridge-session-input",
+            "result": "waiting for input",
+            "stream_events": [
+                {"type": "input_required", "message": "need operator confirmation"},
+            ],
+        }
+
+
+class ToolUseInputRequiredExecutor:
+    """M-CT-05: returns a non-completed slice carrying a tool-use of an
+    input-asking shape (``ask_question``), so the job transitions to
+    BLOCKED_INPUT_REQUIRED (resumable) via the real ``_run`` loop."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def execute(
+        self,
+        project: ProjectPolicy,
+        specification: str,
+        effort: str,
+        *,
+        root: Path | None = None,
+        resume_session_id: str | None = None,
+        max_turns: int | None = None,
+    ) -> dict[str, Any]:
+        assert root is not None
+        self.calls.append({"root": root, "resume_session_id": resume_session_id})
+        return {
+            "status": "failed",
+            "terminal_reason": "input_required",
+            "num_turns": 1,
+            "session_id": "bridge-session-tool-input",
+            "result": "asking a question",
+            "tool_uses": [
+                {"name": "ask_question", "message": "confirm the approach"},
+            ],
+        }
+
+
 class CheckpointTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -350,6 +414,55 @@ class CheckpointTests(unittest.TestCase):
             self.assertFalse(quarantined["resume_available"])
             with self.assertRaises(Exception):
                 await b.resume(self.project, job_id, "again", "high")
+
+        asyncio.run(exercise())
+
+    def test_blocked_input_required_via_stream_json_signal(self) -> None:
+        """M-CT-05: a stream-json ``input_required`` event drives the job into
+        BLOCKED_INPUT_REQUIRED (resumable) via the real ``_run`` loop — not via
+        manual ``_flip_status`` injection.
+
+        The fake executor returns a non-completed slice carrying a
+        ``stream_events`` list with an ``input_required`` event. The job
+        manager's ``_blocked_input_signal`` detects the structured signal and
+        ``_run`` transitions the job to BLOCKED_INPUT_REQUIRED with
+        ``resume_available == True``.
+        """
+
+        async def exercise() -> None:
+            executor = StreamJsonInputRequiredExecutor()
+            manager = DevelopmentJobManager(
+                self.settings, ProjectLockManager(), executor  # type: ignore[arg-type]
+            )
+            started = await manager.start(self.project, "work", "high")
+            job_id = str(started["job_id"])
+            blocked = await wait_for_status(
+                manager, self.project, job_id, {"blocked_input_required"}
+            )
+            self.assertEqual(blocked["status"], "blocked_input_required")
+            self.assertTrue(blocked["resume_available"])
+            self.assertIn("need operator confirmation", str(blocked["pause_reason"]))
+
+        asyncio.run(exercise())
+
+    def test_blocked_input_required_via_tool_use_signal(self) -> None:
+        """M-CT-05: a tool-use of an input-asking shape (``ask_question``) also
+        drives the job into BLOCKED_INPUT_REQUIRED via the real ``_run`` loop.
+        """
+
+        async def exercise() -> None:
+            executor = ToolUseInputRequiredExecutor()
+            manager = DevelopmentJobManager(
+                self.settings, ProjectLockManager(), executor  # type: ignore[arg-type]
+            )
+            started = await manager.start(self.project, "work", "high")
+            job_id = str(started["job_id"])
+            blocked = await wait_for_status(
+                manager, self.project, job_id, {"blocked_input_required"}
+            )
+            self.assertEqual(blocked["status"], "blocked_input_required")
+            self.assertTrue(blocked["resume_available"])
+            self.assertIn("confirm the approach", str(blocked["pause_reason"]))
 
         asyncio.run(exercise())
 

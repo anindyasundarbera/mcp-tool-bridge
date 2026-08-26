@@ -101,6 +101,20 @@ NON_RESUMABLE_STATUSES = frozenset(
     }
 )
 
+# M-CT-05: tool-use names that signal the drafter is waiting for human input.
+# When the executor result carries a ``tool_uses`` list with one of these
+# names, the job transitions to BLOCKED_INPUT_REQUIRED (resumable) rather than
+# being discarded as a candidate failure.
+_INPUT_ASKING_TOOL_NAMES = frozenset(
+    {
+        "ask_question",
+        "request_input",
+        "ask_followup_question",
+        "ask_user",
+        "request_human_input",
+    }
+)
+
 # Actions the bridge never authorizes from a development job, surfaced in every
 # terminal report so an orchestrator can never mistake a completed candidate for
 # authority to publish beyond the opt-in push surface.
@@ -590,9 +604,19 @@ class DevelopmentJobManager:
         """M-CT-05: detect a structured 'input required' signal from the drafter.
 
         Returns the human-readable blocker message when the executor result
-        carries a fenced ``<!-- bridge: blocked-input ... -->`` block in its
-        ``result`` text, or a ``blocked_input`` field. Returns ``None`` when no
-        such signal is present, so a normal candidate failure stays ``failed``.
+        carries one of the recognized blocked-input signals:
+
+        - a fenced ``<!-- bridge: blocked-input ... -->`` block in its
+          ``result`` text;
+        - a ``blocked_input`` string field;
+        - a stream-json structured ``input_required`` event (a top-level
+          ``input_required`` dict, or an entry in ``stream_events`` with
+          ``type == "input_required"``, or a tool-use in ``tool_uses`` whose
+          name is a recognized input-asking tool).
+
+        Returns ``None`` when no such signal is present, so a normal candidate
+        failure stays ``failed``. All detection is additive: the existing
+        markers keep working unchanged.
         """
         marker = "<!-- bridge: blocked-input"
         text = result.get("result")
@@ -604,6 +628,35 @@ class DevelopmentJobManager:
         blocked = result.get("blocked_input")
         if isinstance(blocked, str) and blocked.strip():
             return blocked.strip()
+        # M-CT-05: stream-json structured "input required" signal. A direct
+        # ``input_required`` dict carrying a human-readable message.
+        direct = result.get("input_required")
+        if isinstance(direct, dict):
+            message = direct.get("message") or direct.get("reason")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+        # A stream-json event list carrying an ``input_required`` event.
+        events = result.get("stream_events")
+        if isinstance(events, list):
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                if event.get("type") == "input_required":
+                    message = event.get("message") or event.get("reason")
+                    if isinstance(message, str) and message.strip():
+                        return message.strip()
+        # A tool-use of an input-asking shape (e.g. ask_question /
+        # request_input) — the drafter is waiting on the operator, not
+        # exhausting its budget.
+        tool_uses = result.get("tool_uses")
+        if isinstance(tool_uses, list):
+            for use in tool_uses:
+                if not isinstance(use, dict):
+                    continue
+                if use.get("name") in _INPUT_ASKING_TOOL_NAMES:
+                    message = use.get("message") or use.get("question") or use.get("input")
+                    if isinstance(message, str) and message.strip():
+                        return message.strip()
         return None
 
     async def _close_milestones(
@@ -1492,6 +1545,52 @@ class DevelopmentJobManager:
                 job.status = status
             job.updated_at = _timestamp()
             self._persist_job(job)
+
+    async def quarantine_provenance(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        reason: str,
+    ) -> None:
+        """M-CT-05: transition a job to QUARANTINED_PROVENANCE (terminal, non-resumable).
+
+        Called when verification/publication detects provenance corruption: a
+        fingerprint mismatch on an already-verified candidate, or a committed
+        state that no longer re-derives. The status is persisted durably (job
+        row + progress sidecar) and an audit event is recorded with the
+        quarantine reason. The job is terminal and must never be resumed.
+
+        The existing exception path is preserved: the caller still raises
+        ``VerificationError`` / ``PublicationError`` so the orchestrator is
+        informed; this method durably records the quarantine so the corruption
+        is not silent. Genuine infrastructure errors (GitCommandError,
+        WorktreeError, etc.) do NOT call this — only provenance corruption
+        quarantines.
+        """
+        async with self._state_lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.project_id != project.id:
+                return
+            job.status = JobStatus.QUARANTINED_PROVENANCE
+            job.error = reason[-2000:]
+            job.pause_reason = reason[-2000:]
+            job.updated_at = _timestamp()
+            self._persist_job(job)
+            self._persist_progress(job)
+            self._record_event(
+                job,
+                "terminal",
+                {
+                    "status": "quarantined_provenance",
+                    "reason": reason[-1000:],
+                },
+                authority={
+                    "actor": "bridge",
+                    "authority_source": "bridge_internal",
+                    "scope": "provenance_quarantine",
+                    "classification": "observed",
+                },
+            )
 
     def _maybe_compact(self, job: DevelopmentJob) -> None:
         if store.checkpoint_count(self._db, job.job_id) > self.settings.claude_checkpoint_max:

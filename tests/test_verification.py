@@ -382,6 +382,58 @@ class VerificationCommitTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_provenance_corruption_quarantines_job(self) -> None:
+        """M-CT-05: a real fingerprint mismatch in the commit path transitions
+        the job to QUARANTINED_PROVENANCE (terminal, non-resumable), not just
+        raising.
+
+        Drives the job through the real verification + commit pipeline, then
+        corrupts the candidate after verification so the commit's candidate-state
+        re-derivation detects the fingerprint mismatch. The job is durably
+        quarantined — not silently failed — and is not resumable. This replaces
+        the manual ``_flip_status`` injection of the earlier reachability test
+        with a real path through the verification code.
+        """
+
+        async def exercise() -> None:
+            from local_dev_mcp.jobs import JobStatus
+
+            policy_obj = project(self.root, ["{python}", "-c", "pass"])
+            jobs, manager, completed = await self.prepare(
+                policy_obj,
+                lambda root: (root / "candidate.txt").write_text(
+                    "one", encoding="utf-8"
+                ),
+            )
+            verified = await manager.verify(
+                policy_obj, str(completed["job_id"]), str(completed["base_head"])
+            )
+            self.assertEqual(verified["status"], "passed")
+            worktree = await jobs.verification_worktree(
+                policy_obj, str(completed["job_id"])
+            )
+            # Corrupt the candidate after verification: the commit's
+            # candidate-state re-derivation will detect the fingerprint
+            # mismatch and quarantine the job.
+            (worktree.path / "candidate.txt").write_text("corrupted", encoding="utf-8")
+            with self.assertRaisesRegex(VerificationError, "changed after verification"):
+                await manager.commit(
+                    policy_obj,
+                    str(completed["job_id"]),
+                    str(verified["verification_id"]),
+                    str(verified["base_head"]),
+                    str(verified["diff_fingerprint"]),
+                    list(verified["paths"]),
+                    "Quarantine test",
+                )
+            quarantined = await jobs.get(policy_obj, str(completed["job_id"]))
+            self.assertEqual(
+                quarantined["status"], JobStatus.QUARANTINED_PROVENANCE.value
+            )
+            self.assertFalse(quarantined["resume_available"])
+
+        asyncio.run(exercise())
+
     def test_commit_failure_restores_empty_index_and_preserves_candidate(self) -> None:
         async def exercise() -> None:
             policy = project(self.root, ["{python}", "-c", "pass"])

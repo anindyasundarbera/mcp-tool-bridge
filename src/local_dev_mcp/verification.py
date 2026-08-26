@@ -1250,6 +1250,13 @@ class VerificationCommitManager:
             if current != CandidateState(
                 record.base_head, record.diff_fingerprint, record.paths
             ):
+                # M-CT-05: provenance corruption — the candidate fingerprint no
+                # longer matches the verified state. Quarantine the job (terminal,
+                # non-resumable) before raising so the corruption is durably
+                # recorded, not silently lost in an exception.
+                await self._jobs.quarantine_provenance(
+                    project, job_id, "candidate state changed after verification"
+                )
                 raise VerificationError("candidate state changed after verification")
 
             # M-CC-11: severity-gated supply-chain gate. If the project opts in
@@ -1360,6 +1367,14 @@ class VerificationCommitManager:
                 if staged_state != CandidateState(
                     record.base_head, record.diff_fingerprint, record.paths
                 ):
+                    # M-CT-05: provenance corruption — the staged content does not
+                    # re-derive the verified candidate state. Quarantine the job
+                    # (terminal, non-resumable) before raising.
+                    await self._jobs.quarantine_provenance(
+                        project,
+                        job_id,
+                        "staged content does not match the verified candidate state",
+                    )
                     raise VerificationError(
                         "staged content does not match the verified candidate state"
                     )
@@ -1785,6 +1800,14 @@ class PublicationManager:
                     )
                 )
                 if committed_paths != paths:
+                    # M-CT-05: provenance corruption — the committed path set
+                    # differs from the verification record. Quarantine the job
+                    # (terminal, non-resumable) before raising.
+                    await self._jobs.quarantine_provenance(
+                        project,
+                        job_id,
+                        "commit changes a different path set than the verification record",
+                    )
                     raise PublicationError(
                         "commit changes a different path set than the verification record"
                     )
@@ -1797,6 +1820,14 @@ class PublicationManager:
                     paths,
                 )
                 if rederived.fingerprint != expected_diff_fingerprint:
+                    # M-CT-05: provenance corruption — the committed state does
+                    # not re-derive the verified candidate fingerprint. Quarantine
+                    # the job (terminal, non-resumable) before raising.
+                    await self._jobs.quarantine_provenance(
+                        project,
+                        job_id,
+                        "commit_sha does not realize the verified candidate fingerprint",
+                    )
                     raise PublicationError(
                         "commit_sha does not realize the verified candidate fingerprint"
                     )
