@@ -1,0 +1,35 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["@playwright/mcp@latest"]
+    },
+    "codebase-memory-mcp": {
+      "type": "stdio",
+      "command": "/home/anindyasundar-bera/.local/bin/codebase-memory-mcp"
+    },
+    "searxng": {
+      "type": "http",
+      "url": "http://localhost:8900/mcp"
+    },
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/"
+    },
+    "context7": {
+      "type": "http",
+      "url": "https://mcp.context7.com/mcp"
+    },
+    "headroom": {
+      "type": "stdio",
+      "command": "/home/anindyasundar-bera/.local/bin/headroom",
+      "args": ["mcp", "serve"]
+    },
+    "codegraph": {
+      "type": "stdio",
+      "command": "/home/anindyasundar-bera/.nvm/versions/node/v24.16.0/bin/codegraph",
+      "args": ["serve", "--mcp"]
+    }
+  }
+}
