@@ -189,6 +189,93 @@ def _milestone_summary(milestone: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
+def _extract_detail_field(
+    result: dict[str, Any] | None,
+    event: dict[str, Any] | None,
+    field: str,
+    stream_event_type: str,
+) -> Any:
+    """Best-effort extraction of one checkpoint detail field (M-CT-03).
+
+    Priority: a top-level field on the executor result → stream events of the
+    matching ``type`` (their ``data`` payload, or the event minus ``type``) →
+    a top-level field on the checkpoint event dict. Returns ``None`` when no
+    source yields a value. Never raises — a malformed source yields ``None``.
+    """
+    if result is not None:
+        value = result.get(field)
+        if value is not None:
+            return value
+        events = result.get("stream_events")
+        if isinstance(events, list):
+            collected: list[Any] = []
+            for item in events:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") != stream_event_type:
+                    continue
+                data = item.get("data")
+                if data is None:
+                    data = {k: v for k, v in item.items() if k != "type"}
+                collected.append(data)
+            if collected:
+                return collected
+    if event is not None:
+        value = event.get(field)
+        if value is not None:
+            return value
+    return None
+
+
+def _parse_checkpoint_detail(
+    event: dict[str, Any] | None,
+    result: dict[str, Any] | None,
+) -> dict[str, str | None]:
+    """Parse the rich checkpoint detail fields from executor events (M-CT-03).
+
+    Returns a dict with the five nullable JSON columns
+    (``completed_steps_json`` / ``remaining_steps_json`` / ``tests_json`` /
+    ``decisions_json`` / ``tool_history_json``). Non-fatal: any parse failure
+    yields all-NULL fields so the checkpoint is still recorded — the detail
+    row is additive enrichment that must never block checkpointing.
+    """
+    try:
+        completed = _extract_detail_field(
+            result, event, "completed_steps", "step_completed"
+        )
+        remaining = _extract_detail_field(
+            result, event, "remaining_steps", "step_remaining"
+        )
+        tests = _extract_detail_field(result, event, "tests", "test_result")
+        decisions = _extract_detail_field(result, event, "decisions", "decision")
+        # Tool history: prefer the executor's ``tool_uses`` list, then a
+        # top-level ``tool_history`` field, then the checkpoint event.
+        tool_history: Any = None
+        if result is not None:
+            tool_uses = result.get("tool_uses")
+            if isinstance(tool_uses, list):
+                tool_history = tool_uses
+            elif result.get("tool_history") is not None:
+                tool_history = result.get("tool_history")
+        if tool_history is None and event is not None:
+            tool_history = event.get("tool_history")
+        return {
+            "completed_steps_json": _json_dumps(completed),
+            "remaining_steps_json": _json_dumps(remaining),
+            "tests_json": _json_dumps(tests),
+            "decisions_json": _json_dumps(decisions),
+            "tool_history_json": _json_dumps(tool_history),
+        }
+    except Exception:
+        return {
+            "completed_steps_json": None,
+            "remaining_steps_json": None,
+            "tests_json": None,
+            "decisions_json": None,
+            "tool_history_json": None,
+        }
+
+
 @dataclass(slots=True)
 class DevelopmentJob:
     job_id: str
@@ -583,6 +670,7 @@ class DevelopmentJobManager:
         *,
         milestone: str | None = None,
         event: dict[str, Any] | None = None,
+        result: dict[str, Any] | None = None,
     ) -> tuple[str, ...]:
         """Append one checkpoint row and update no-progress tracking.
 
@@ -591,6 +679,14 @@ class DevelopmentJobManager:
         checkpoint, and advances the no-progress counter: it resets to 0 when
         the changed set changes and increments when it is unchanged from the
         last recorded checkpoint. Returns the current changed-path set.
+
+        M-CT-03: when the executor ``result`` is available (boundary /
+        extension checkpoints), a sidecar ``job_checkpoint_detail`` row is
+        attached carrying the rich fields (completed/remaining steps, tests,
+        decisions, tool history) parsed from the result's structured stream
+        events. Non-fatal: a parse failure or missing events never prevent the
+        checkpoint from being recorded — the detail row simply has NULL
+        fields.
         """
         paths = await self._current_changed_paths(job)
         previous = self._last_changed_paths.get(job.job_id)
@@ -615,7 +711,7 @@ class DevelopmentJobManager:
                 fingerprint = None
 
         seq = store.checkpoint_count(self._db, job.job_id)
-        store.insert_checkpoint_row(
+        checkpoint_id = store.insert_checkpoint_row(
             self._db,
             {
                 "job_id": job.job_id,
@@ -630,6 +726,14 @@ class DevelopmentJobManager:
                 "milestone": milestone,
             },
         )
+        # M-CT-03: attach the rich-field detail sidecar row. Non-fatal: a parse
+        # failure or a missing checkpoint_id never blocks checkpointing.
+        try:
+            detail = _parse_checkpoint_detail(event, result)
+            detail["checkpoint_id"] = checkpoint_id
+            store.insert_checkpoint_detail_row(self._db, detail)
+        except Exception:
+            pass
         return paths
 
     def _progressed(self, job: DevelopmentJob) -> bool:
@@ -1011,6 +1115,34 @@ class DevelopmentJobManager:
             if isinstance(changed, list):
                 snapshot["changed_path_count"] = len(changed)
                 snapshot["changed_paths"] = changed
+            # M-CT-03: surface the rich detail fields (completed/remaining
+            # steps, tests, decisions, tool history) from the latest
+            # checkpoint's sidecar row so an orchestrator can replay the
+            # structured context. Additive: absent when no detail row exists
+            # or all fields are NULL. Non-fatal: a read failure is swallowed.
+            try:
+                detail_rows = store.load_checkpoint_detail_rows(
+                    self._db, [int(latest["checkpoint_id"])]
+                )
+                if detail_rows:
+                    detail = detail_rows[0]
+                    parsed = {
+                        "completed_steps": _json_loads(
+                            detail.get("completed_steps_json")
+                        ),
+                        "remaining_steps": _json_loads(
+                            detail.get("remaining_steps_json")
+                        ),
+                        "tests": _json_loads(detail.get("tests_json")),
+                        "decisions": _json_loads(detail.get("decisions_json")),
+                        "tool_history": _json_loads(
+                            detail.get("tool_history_json")
+                        ),
+                    }
+                    if any(value is not None for value in parsed.values()):
+                        snapshot["checkpoint_detail"] = parsed
+            except Exception:
+                pass
         # M-EV-05: surface the authority records behind this job's governance
         # events (actor, authority source, scope, classification) so an
         # orchestrator can audit who/what authorized each instruction.
@@ -1707,6 +1839,42 @@ class DevelopmentJobManager:
         fingerprint = checkpoint.get("partial_fingerprint")
         if fingerprint:
             lines.append(f"Last partial fingerprint: {fingerprint}")
+        # M-CT-03: enrich the resume seed with the rich detail fields
+        # (completed/remaining steps, decisions) so the resumed drafter has the
+        # structured context from the last checkpoint. Additive: appended only
+        # when a detail row exists with non-null fields. Non-fatal.
+        try:
+            detail_rows = store.load_checkpoint_detail_rows(
+                self._db, [int(checkpoint["checkpoint_id"])]
+            )
+            if detail_rows:
+                detail = detail_rows[0]
+                completed = _json_loads(detail.get("completed_steps_json"))
+                if isinstance(completed, list) and completed:
+                    lines.append("Completed steps:")
+                    for step in completed[:20]:
+                        if isinstance(step, dict):
+                            lines.append(f"  - {step.get('step') or step}")
+                        else:
+                            lines.append(f"  - {step}")
+                remaining = _json_loads(detail.get("remaining_steps_json"))
+                if isinstance(remaining, list) and remaining:
+                    lines.append("Remaining steps:")
+                    for step in remaining[:20]:
+                        if isinstance(step, dict):
+                            lines.append(f"  - {step.get('step') or step}")
+                        else:
+                            lines.append(f"  - {step}")
+                decisions = _json_loads(detail.get("decisions_json"))
+                if isinstance(decisions, list) and decisions:
+                    lines.append("Prior decisions:")
+                    for decision in decisions[:10]:
+                        if isinstance(decision, dict):
+                            lines.append(f"  - {decision.get('choice') or decision}")
+                        else:
+                            lines.append(f"  - {decision}")
+        except Exception:
+            pass
         lines.append("Continue from this state; do not redo completed work.")
         return "\n".join(lines)
 
@@ -1830,7 +1998,7 @@ class DevelopmentJobManager:
                         job, result, slice_wall_seconds=slice_wall
                     )
                     boundary_paths = await self._record_checkpoint(
-                        job, "boundary", event={"slice": slice_index}
+                        job, "boundary", event={"slice": slice_index}, result=result
                     )
                     # M-CT-04: close any milestone whose acceptance criteria are
                     # now met (paths present + optional acceptance command passes).
@@ -2026,7 +2194,7 @@ class DevelopmentJobManager:
                                 "classification": "inferred",
                             },
                         )
-                        await self._record_checkpoint(job, "extension")
+                        await self._record_checkpoint(job, "extension", result=result)
                         self._persist_progress(job)
                         session_id = job.session_id
                         slice_index += 1

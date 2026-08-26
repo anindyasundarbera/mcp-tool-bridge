@@ -7,6 +7,7 @@ real Claude, no network), mirroring the patterns in ``tests/test_jobs.py`` and
 """
 
 import asyncio
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -20,6 +21,8 @@ from local_dev_mcp.registry import ProjectLockManager
 from local_dev_mcp.store import (
     checkpoint_count,
     insert_checkpoint_row,
+    load_checkpoint_detail_for_job,
+    load_checkpoint_detail_rows,
     load_checkpoint_rows,
     open_state_db,
 )
@@ -206,6 +209,55 @@ class ToolUseInputRequiredExecutor:
             "result": "asking a question",
             "tool_uses": [
                 {"name": "ask_question", "message": "confirm the approach"},
+            ],
+        }
+
+
+class StreamingDetailExecutor:
+    """M-CT-03: returns a completed slice with structured stream events
+    (completed/remaining steps, tests, decisions) and a ``tool_uses`` list,
+    so the checkpoint detail sidecar row is populated with the parsed fields.
+
+    Mirrors the real Claude stream-json contract: the executor result carries a
+    ``stream_events`` list of typed events plus a ``tool_uses`` list. The job
+    manager's ``_record_checkpoint`` parses these into the
+    ``job_checkpoint_detail`` sidecar (completed_steps / remaining_steps /
+    tests / decisions / tool_history).
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def execute(
+        self,
+        project: ProjectPolicy,
+        specification: str,
+        effort: str,
+        *,
+        root: Path | None = None,
+        resume_session_id: str | None = None,
+        max_turns: int | None = None,
+    ) -> dict[str, Any]:
+        assert root is not None
+        self.calls.append({"root": root, "resume_session_id": resume_session_id})
+        (root / "candidate.txt").write_text("done\n", encoding="utf-8")
+        return {
+            "status": "completed",
+            "session_id": "bridge-session-detail",
+            "num_turns": 2,
+            "result": "done with structured events",
+            "stream_events": [
+                {"type": "step_completed", "data": {"step": "write module"}},
+                {"type": "step_remaining", "data": {"step": "add tests"}},
+                {
+                    "type": "test_result",
+                    "data": {"name": "test_smoke", "passed": True},
+                },
+                {"type": "decision", "data": {"choice": "use sidecar table"}},
+            ],
+            "tool_uses": [
+                {"name": "Read", "input": {"file_path": "src/store.py"}},
+                {"name": "Edit", "input": {"file_path": "src/store.py"}},
             ],
         }
 
@@ -505,6 +557,126 @@ class CheckpointTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_streaming_executor_yields_detail_row(self) -> None:
+        """M-CT-03: a streaming executor with structured stream events yields a
+        ``job_checkpoint_detail`` sidecar row with the parsed rich fields."""
+
+        async def exercise() -> None:
+            executor = StreamingDetailExecutor()
+            manager = DevelopmentJobManager(
+                self.settings, ProjectLockManager(), executor  # type: ignore[arg-type]
+            )
+            started = await manager.start(self.project, "work", "high")
+            job_id = str(started["job_id"])
+            completed = await wait_for_status(
+                manager, self.project, job_id, {"completed"}
+            )
+            # The latest checkpoint has a detail row with the parsed fields.
+            detail_rows = load_checkpoint_detail_for_job(manager._db, job_id)
+            self.assertGreaterEqual(len(detail_rows), 1)
+            detail = detail_rows[-1]
+            self.assertEqual(
+                json.loads(detail["completed_steps_json"]),
+                [{"step": "write module"}],
+            )
+            self.assertEqual(
+                json.loads(detail["remaining_steps_json"]),
+                [{"step": "add tests"}],
+            )
+            self.assertEqual(
+                json.loads(detail["tests_json"]),
+                [{"name": "test_smoke", "passed": True}],
+            )
+            self.assertEqual(
+                json.loads(detail["decisions_json"]),
+                [{"choice": "use sidecar table"}],
+            )
+            tool_history = json.loads(detail["tool_history_json"])
+            self.assertEqual(len(tool_history), 2)
+            self.assertEqual(tool_history[0]["name"], "Read")
+            self.assertEqual(tool_history[1]["name"], "Edit")
+            # The snapshot surfaces the detail for the latest checkpoint.
+            self.assertIn("checkpoint_detail", completed)
+            self.assertEqual(
+                completed["checkpoint_detail"]["completed_steps"],
+                [{"step": "write module"}],
+            )
+            self.assertEqual(
+                completed["checkpoint_detail"]["tool_history"][1]["name"],
+                "Edit",
+            )
+
+        asyncio.run(exercise())
+
+    def test_detail_rows_rehydrated_on_reload(self) -> None:
+        """M-CT-03: a fresh manager re-hydrates the detail rows from the same
+        durable db so the snapshot surfaces them across restart."""
+
+        async def exercise() -> None:
+            executor = StreamingDetailExecutor()
+            manager = DevelopmentJobManager(
+                self.settings, ProjectLockManager(), executor  # type: ignore[arg-type]
+            )
+            started = await manager.start(self.project, "work", "high")
+            job_id = str(started["job_id"])
+            await wait_for_status(manager, self.project, job_id, {"completed"})
+
+            # A fresh manager re-hydrates the detail rows from the same db.
+            b = DevelopmentJobManager(
+                self.settings, ProjectLockManager(), ImmediateExecutor()  # type: ignore[arg-type]
+            )
+            reloaded = await b.get(self.project, job_id)
+            self.assertEqual(reloaded["status"], "completed")
+            self.assertIn("checkpoint_detail", reloaded)
+            self.assertEqual(
+                reloaded["checkpoint_detail"]["completed_steps"],
+                [{"step": "write module"}],
+            )
+            self.assertEqual(
+                reloaded["checkpoint_detail"]["remaining_steps"],
+                [{"step": "add tests"}],
+            )
+            # The durable detail rows survive the reload.
+            detail_rows = load_checkpoint_detail_for_job(b._db, job_id)
+            self.assertGreaterEqual(len(detail_rows), 1)
+
+        asyncio.run(exercise())
+
+    def test_plain_executor_detail_row_nullable_no_crash(self) -> None:
+        """M-CT-03: a plain executor (no structured events) still gets a
+        checkpoint; the detail row has NULL fields and nothing crashes."""
+
+        async def exercise() -> None:
+            executor = ImmediateExecutor()
+            manager = DevelopmentJobManager(
+                self.settings, ProjectLockManager(), executor  # type: ignore[arg-type]
+            )
+            started = await manager.start(self.project, "work", "high")
+            job_id = str(started["job_id"])
+            completed = await wait_for_status(
+                manager, self.project, job_id, {"completed"}
+            )
+            # The checkpoint succeeded; detail rows exist with NULL fields.
+            detail_rows = load_checkpoint_detail_for_job(manager._db, job_id)
+            self.assertGreaterEqual(len(detail_rows), 1)
+            for detail in detail_rows:
+                for field in (
+                    "completed_steps_json",
+                    "remaining_steps_json",
+                    "tests_json",
+                    "decisions_json",
+                    "tool_history_json",
+                ):
+                    self.assertIsNone(
+                        detail.get(field),
+                        f"{field} should be NULL for a plain executor",
+                    )
+            # The snapshot does not surface a checkpoint_detail (all NULL).
+            self.assertNotIn("checkpoint_detail", completed)
+            self.assertEqual(completed["status"], "completed")
+
+        asyncio.run(exercise())
+
     def test_token_capture(self) -> None:
         async def exercise() -> None:
             executor = UsageExecutor()
@@ -564,6 +736,97 @@ class CheckpointStoreTests(unittest.TestCase):
             "event_json": None,
             "milestone": None,
         }
+
+    def test_checkpoint_detail_sidecar_additive_schema_version_stays_1(self) -> None:
+        """M-CT-03: the ``job_checkpoint_detail`` sidecar table is created
+        additively (``CREATE TABLE IF NOT EXISTS``), never alters
+        ``job_checkpoints``, and ``SCHEMA_VERSION`` stays 1. A detail row
+        round-trips through the insert/load helpers and cascades on
+        checkpoint compaction."""
+        from local_dev_mcp.store import (
+            compact_checkpoints,
+            insert_checkpoint_detail_row,
+        )
+
+        connection, _ = self._fresh_db()
+        try:
+            # The sidecar table exists alongside the legacy checkpoint table.
+            row = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='job_checkpoint_detail'"
+            ).fetchone()
+            self.assertIsNotNone(row)
+            # SCHEMA_VERSION stays 1.
+            version = connection.execute(
+                "SELECT value FROM schema_meta WHERE key='version'"
+            ).fetchone()[0]
+            self.assertEqual(int(version), 1)
+
+            # Insert a checkpoint, then a detail row referencing it (FK).
+            cp_id = insert_checkpoint_row(
+                connection, self._row("job-detail", "sample", 0)
+            )
+            insert_checkpoint_detail_row(
+                connection,
+                {
+                    "checkpoint_id": cp_id,
+                    "completed_steps_json": '[{"step": "x"}]',
+                    "remaining_steps_json": None,
+                    "tests_json": None,
+                    "decisions_json": None,
+                    "tool_history_json": None,
+                },
+            )
+            rows = load_checkpoint_detail_rows(connection, [cp_id])
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["completed_steps_json"], '[{"step": "x"}]')
+            self.assertIsNone(rows[0]["remaining_steps_json"])
+
+            # load_checkpoint_detail_for_job joins back to job_checkpoints.
+            job_rows = load_checkpoint_detail_for_job(connection, "job-detail")
+            self.assertEqual(len(job_rows), 1)
+            self.assertEqual(job_rows[0]["completed_steps_json"], '[{"step": "x"}]')
+
+            # An empty checkpoint_ids list returns an empty list (no SQL error).
+            self.assertEqual(load_checkpoint_detail_rows(connection, []), [])
+
+            # Upsert: re-recording the same checkpoint_id updates, not fails.
+            insert_checkpoint_detail_row(
+                connection,
+                {
+                    "checkpoint_id": cp_id,
+                    "completed_steps_json": '[{"step": "y"}]',
+                    "remaining_steps_json": '[{"step": "z"}]',
+                    "tests_json": None,
+                    "decisions_json": None,
+                    "tool_history_json": None,
+                },
+            )
+            rows = load_checkpoint_detail_rows(connection, [cp_id])
+            self.assertEqual(rows[0]["completed_steps_json"], '[{"step": "y"}]')
+            self.assertEqual(rows[0]["remaining_steps_json"], '[{"step": "z"}]')
+
+            # ON DELETE CASCADE: compacting the checkpoint prunes its detail.
+            # Add 60 more sample rows so compaction prunes the oldest sample
+            # (seq 0, not in keep_kinds) when keep_latest_n is small. The detail
+            # row for the pruned checkpoint must cascade-delete, not orphan.
+            for seq in range(60):
+                insert_checkpoint_row(
+                    connection, self._row("job-detail", "sample", seq + 1)
+                )
+            deleted = compact_checkpoints(
+                connection, "job-detail", keep_latest_n=5
+            )
+            self.assertGreater(deleted, 0)
+            # The oldest sample checkpoint (seq 0) was pruned by compaction; its
+            # detail row cascaded away.
+            orphan = connection.execute(
+                "SELECT 1 FROM job_checkpoint_detail WHERE checkpoint_id = ?",
+                (cp_id,),
+            ).fetchone()
+            self.assertIsNone(orphan)
+        finally:
+            connection.close()
 
     def test_compaction_keeps_milestone_and_boundary_checkpoints(self) -> None:
         connection, _ = self._fresh_db()

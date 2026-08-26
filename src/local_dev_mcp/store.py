@@ -244,6 +244,16 @@ CREATE TABLE IF NOT EXISTS oh_ledger (
     failure_reason TEXT,
     recorded_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS job_checkpoint_detail (
+    checkpoint_id INTEGER PRIMARY KEY,
+    completed_steps_json TEXT,
+    remaining_steps_json TEXT,
+    tests_json TEXT,
+    decisions_json TEXT,
+    tool_history_json TEXT,
+    FOREIGN KEY (checkpoint_id) REFERENCES job_checkpoints(checkpoint_id)
+      ON DELETE CASCADE
+);
 """
 
 _UPSERT_JOB = """
@@ -717,7 +727,7 @@ def insert_sync_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None
         connection.execute(_INSERT_SYNC, row)
 
 
-def insert_checkpoint_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
+def insert_checkpoint_row(connection: sqlite3.Connection, row: dict[str, Any]) -> int:
     """Append one checkpoint row as a single ACID transaction.
 
     Checkpoints are an append-only, turn-level mission-state ledger: each
@@ -726,9 +736,13 @@ def insert_checkpoint_row(connection: sqlite3.Connection, row: dict[str, Any]) -
     ``seq``. A crashed job's last checkpoint is what makes it resumable rather
     than discarded. No single-use bound; the table exists for restart-safe
     resumability and progress intelligence.
+
+    Returns the autoincrement ``checkpoint_id`` of the inserted row so the
+    caller can attach a sidecar detail row (M-CT-03).
     """
     with connection:
-        connection.execute(_INSERT_CHECKPOINT, row)
+        cursor = connection.execute(_INSERT_CHECKPOINT, row)
+        return int(cursor.lastrowid)
 
 
 def load_checkpoint_rows(
@@ -763,6 +777,86 @@ def checkpoint_count(connection: sqlite3.Connection, job_id: str) -> int:
         "SELECT COUNT(*) FROM job_checkpoints WHERE job_id = ?", (job_id,)
     ).fetchone()
     return int(row[0]) if row is not None else 0
+
+
+_INSERT_CHECKPOINT_DETAIL = """
+INSERT INTO job_checkpoint_detail (
+    checkpoint_id, completed_steps_json, remaining_steps_json,
+    tests_json, decisions_json, tool_history_json
+) VALUES (
+    :checkpoint_id, :completed_steps_json, :remaining_steps_json,
+    :tests_json, :decisions_json, :tool_history_json
+)
+ON CONFLICT(checkpoint_id) DO UPDATE SET
+    completed_steps_json = excluded.completed_steps_json,
+    remaining_steps_json = excluded.remaining_steps_json,
+    tests_json = excluded.tests_json,
+    decisions_json = excluded.decisions_json,
+    tool_history_json = excluded.tool_history_json
+"""
+
+
+def insert_checkpoint_detail_row(
+    connection: sqlite3.Connection, row: dict[str, Any]
+) -> None:
+    """Persist one checkpoint detail sidecar row as a single ACID transaction.
+
+    M-CT-03: a 1:1 sidecar to ``job_checkpoints`` keyed by ``checkpoint_id``
+    (INTEGER PRIMARY KEY, FK to ``job_checkpoints.checkpoint_id`` with
+    ``ON DELETE CASCADE`` so compaction prunes the detail too). All five rich
+    fields (completed/remaining steps, tests, decisions, tool history) are
+    NULLABLE TEXT JSON — a checkpoint with no structured events simply has
+    NULL fields. The upsert makes re-recording a detail row idempotent.
+    ``SCHEMA_VERSION`` stays 1; the table is additive (``CREATE TABLE IF NOT
+    EXISTS``) and never alters ``job_checkpoints``.
+    """
+    with connection:
+        connection.execute(_INSERT_CHECKPOINT_DETAIL, row)
+
+
+def load_checkpoint_detail_rows(
+    connection: sqlite3.Connection,
+    checkpoint_ids: list[int],
+) -> list[dict[str, Any]]:
+    """Return detail sidecar rows for the given checkpoint ids (M-CT-03).
+
+    Ordered by ``checkpoint_id`` ascending. Returns an empty list when no ids
+    are given or no rows match. Used by the snapshot/resume path to rehydrate
+    the rich fields for a specific checkpoint.
+    """
+    if not checkpoint_ids:
+        return []
+    placeholders = ",".join("?" for _ in checkpoint_ids)
+    return [
+        dict(row)
+        for row in connection.execute(
+            f"SELECT * FROM job_checkpoint_detail "
+            f"WHERE checkpoint_id IN ({placeholders}) "
+            f"ORDER BY checkpoint_id ASC",
+            tuple(checkpoint_ids),
+        ).fetchall()
+    ]
+
+
+def load_checkpoint_detail_for_job(
+    connection: sqlite3.Connection,
+    job_id: str,
+) -> list[dict[str, Any]]:
+    """Return all detail sidecar rows for one job, ordered by checkpoint seq.
+
+    M-CT-03: joins ``job_checkpoint_detail`` to ``job_checkpoints`` on
+    ``checkpoint_id`` and filters by ``job_id``, so a reload or replay can
+    walk the full rich-field history of a job's checkpoints.
+    """
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT d.* FROM job_checkpoint_detail d "
+            "JOIN job_checkpoints c ON d.checkpoint_id = c.checkpoint_id "
+            "WHERE c.job_id = ? ORDER BY c.seq ASC, c.checkpoint_id ASC",
+            (job_id,),
+        ).fetchall()
+    ]
 
 
 def compact_checkpoints(
