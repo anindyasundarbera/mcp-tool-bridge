@@ -254,6 +254,12 @@ CREATE TABLE IF NOT EXISTS job_checkpoint_detail (
     FOREIGN KEY (checkpoint_id) REFERENCES job_checkpoints(checkpoint_id)
       ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS verification_environment (
+    verification_id TEXT PRIMARY KEY,
+    environment_digest TEXT NOT NULL,
+    FOREIGN KEY (verification_id) REFERENCES verifications(verification_id)
+      ON DELETE CASCADE
+);
 """
 
 _UPSERT_JOB = """
@@ -602,6 +608,58 @@ def upsert_record_row(connection: sqlite3.Connection, row: dict[str, Any]) -> No
     """Persist one verification row as a single ACID transaction."""
     with connection:
         connection.execute(_UPSERT_RECORD, row)
+
+
+_UPSERT_VERIFICATION_ENVIRONMENT = """
+INSERT INTO verification_environment (
+    verification_id, environment_digest
+) VALUES (
+    :verification_id, :environment_digest
+)
+ON CONFLICT(verification_id) DO UPDATE SET
+    environment_digest = excluded.environment_digest
+"""
+
+
+def upsert_verification_environment_row(
+    connection: sqlite3.Connection, row: dict[str, Any]
+) -> None:
+    """Persist one verification-environment sidecar row (M-EV-02).
+
+    A 1:1 sidecar to ``verifications`` keyed by ``verification_id`` (FK with
+    ``ON DELETE CASCADE`` so pruning a verification row prunes its environment
+    digest too). Holds the ``environment_digest`` (SHA-256 over the Python
+    interpreter version + the allowlisted deterministic env keys + the
+    verification command argv + an optional toolchain-pin digest) so a
+    verification result carries a stable, bounded environment/toolchain
+    fingerprint. Additive: ``CREATE TABLE IF NOT EXISTS``, never alters
+    ``verifications``, ``SCHEMA_VERSION`` stays 1.
+    """
+    with connection:
+        connection.execute(_UPSERT_VERIFICATION_ENVIRONMENT, row)
+
+
+def load_verification_environment_rows(
+    connection: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Return every persisted verification-environment sidecar row as a dict."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM verification_environment"
+        ).fetchall()
+    ]
+
+
+def load_verification_environment_row(
+    connection: sqlite3.Connection, verification_id: str
+) -> dict[str, Any] | None:
+    """Return one verification-environment sidecar row, or None."""
+    row = connection.execute(
+        "SELECT * FROM verification_environment WHERE verification_id = ?",
+        (verification_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
 
 
 def job_id_exists(connection: sqlite3.Connection, job_id: str) -> bool:

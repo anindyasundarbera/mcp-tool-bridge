@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import platform
 import secrets
 import signal
 import stat
@@ -28,6 +29,78 @@ class VerificationError(RuntimeError):
 
 MAX_COMMIT_PATHS = 500
 _FINGERPRINT_MARKER = b"local-dev-mcp-candidate-state-v1\0"
+
+# M-EV-02: the allowlisted env keys used by ``_run_exec`` that form the
+# deterministic verification environment. Only their *set* values (constants
+# pinned by M-CC-09, not the real process env) are part of the digest, so the
+# digest is stable across runs with the same declared environment. Kept in a
+# stable sorted definition order so the digest is deterministic.
+_ENV_DIGEST_KEYS: tuple[str, ...] = (
+    "LANG",
+    "LC_ALL",
+    "PYTHONIOENCODING",
+    "PYTHONHASHSEED",
+    "SOURCE_DATE_EPOCH",
+    "TZ",
+)
+
+# The fixed values ``_run_exec`` sets for the deterministic env (M-CC-09). These
+# are constants, so the environment digest is stable across runs/machines.
+_DETERMINISTIC_ENV: dict[str, str] = {
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "PYTHONIOENCODING": "utf-8",
+    "PYTHONHASHSEED": "0",
+    "SOURCE_DATE_EPOCH": "0",
+    "TZ": "UTC",
+}
+
+
+def _command_digest(command: VerificationCommand) -> str:
+    """SHA-256 over a command's declared id + argv (M-EV-02).
+
+    The digest is over the *declared* argv (the fixed ``VerificationCommand``
+    vector), not the expanded argv (``{python}`` substitution, sandbox
+    wrapping, PYTHONPATH injection), so it is stable across runs and does not
+    leak absolute paths. A changed argv or id therefore changes the digest.
+    """
+    digest = hashlib.sha256()
+    digest.update(_frame(command.id.encode("utf-8")))
+    for argument in command.argv:
+        digest.update(_frame(argument.encode("utf-8")))
+    return digest.hexdigest()
+
+
+def compute_environment_digest(
+    commands: tuple[VerificationCommand, ...],
+    *,
+    toolchain_pin_digest: str | None = None,
+) -> str:
+    """SHA-256 over the stable, bounded verification environment tuple.
+
+    M-EV-02: covers the Python interpreter version
+    (``platform.python_version()``), the allowlisted deterministic env keys
+    used by ``_run_exec`` (their set values, not the real process env), each
+    verification command's id + argv (the declared fixed vector), and
+    (optionally, if configured) a toolchain-pin file digest. Deterministic:
+    keys are in a fixed sorted order, volatile values (timestamps, PIDs,
+    absolute paths that vary per run) are excluded, and the argv is the
+    declared vector rather than the expanded one.
+    """
+    digest = hashlib.sha256()
+    digest.update(b"local-dev-mcp-env-digest-v1\0")
+    digest.update(_frame(platform.python_version().encode("ascii")))
+    for key in _ENV_DIGEST_KEYS:
+        digest.update(_frame(key.encode("ascii")))
+        digest.update(_frame(_DETERMINISTIC_ENV[key].encode("utf-8")))
+    for command in commands:
+        digest.update(_frame(command.id.encode("utf-8")))
+        for argument in command.argv:
+            digest.update(_frame(argument.encode("utf-8")))
+    if toolchain_pin_digest is not None:
+        digest.update(_frame(b"toolchain"))
+        digest.update(_frame(toolchain_pin_digest.encode("ascii")))
+    return digest.hexdigest()
 
 
 def _stderr_text(result: dict[str, Any]) -> str:
@@ -370,6 +443,11 @@ class VerificationRecord:
     verified_at: str
     commands: tuple[dict[str, Any], ...]
     used: bool = False
+    # M-EV-02: SHA-256 over the Python interpreter version + the allowlisted
+    # deterministic env keys + the verification command argv + an optional
+    # toolchain-pin digest. Persisted in the ``verification_environment``
+    # sidecar (not on ``verifications``) so the schema stays additive.
+    environment_digest: str | None = None
 
 
 def _record_json_loads(value: str | None) -> Any:
@@ -396,8 +474,18 @@ def record_to_row(record: VerificationRecord) -> dict[str, Any]:
     }
 
 
-def record_from_row(row: dict[str, Any]) -> VerificationRecord | None:
-    """Rebuild a verification record from a dict row, or None if unparseable."""
+def record_from_row(
+    row: dict[str, Any],
+    *,
+    environment_digest: str | None = None,
+) -> VerificationRecord | None:
+    """Rebuild a verification record from a dict row, or None if unparseable.
+
+    M-EV-02: the optional ``environment_digest`` comes from the
+    ``verification_environment`` sidecar (loaded separately by the caller) so
+    the record carries the environment/toolchain fingerprint without the
+    ``verifications`` table being altered.
+    """
     paths = _record_json_loads(row.get("paths_json"))
     commands = _record_json_loads(row.get("commands_json"))
     if not isinstance(paths, list) or not isinstance(commands, list):
@@ -413,6 +501,7 @@ def record_from_row(row: dict[str, Any]) -> VerificationRecord | None:
             verified_at=row["verified_at"],
             commands=tuple(commands),
             used=bool(row.get("used", 0)),
+            environment_digest=environment_digest,
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -1056,9 +1145,20 @@ class VerificationCommitManager:
         self._reload_records()
 
     def _reload_records(self) -> None:
-        """Load persisted verification records, skipping unparseable rows."""
+        """Load persisted verification records, skipping unparseable rows.
+
+        M-EV-02: also loads the ``verification_environment`` sidecar so each
+        re-hydrated record carries its ``environment_digest``.
+        """
+        env_digests = {
+            row["verification_id"]: row["environment_digest"]
+            for row in store.load_verification_environment_rows(self._db)
+        }
         for row in store.load_record_rows(self._db):
-            record = record_from_row(row)
+            record = record_from_row(
+                row,
+                environment_digest=env_digests.get(row["verification_id"]),
+            )
             if record is not None:
                 self._records[record.verification_id] = record
 
@@ -1066,9 +1166,19 @@ class VerificationCommitManager:
         """Persist one verification record as a single ACID transaction.
 
         Call this inside ``async with self._records_lock`` after mutating a
-        record so the durable store mirrors the in-memory state.
+        record so the durable store mirrors the in-memory state. M-EV-02: also
+        upserts the ``verification_environment`` sidecar row when the record
+        carries an ``environment_digest``.
         """
         store.upsert_record_row(self._db, record_to_row(record))
+        if record.environment_digest is not None:
+            store.upsert_verification_environment_row(
+                self._db,
+                {
+                    "verification_id": record.verification_id,
+                    "environment_digest": record.environment_digest,
+                },
+            )
 
     def _new_verification_id(self) -> str:
         for _ in range(10):
@@ -1131,6 +1241,13 @@ class VerificationCommitManager:
                             first = bounded
                         elif self._commands_diverge(first, bounded):
                             nondeterminism_labeled = True
+                    # M-EV-02: per-command structured fields (additive aliases +
+                    # digest). ``id`` aliases the existing ``command_id``;
+                    # ``command_digest`` is the SHA-256 over the declared argv
+                    # so a changed command vector is detectable.
+                    if first is not None:
+                        first["id"] = first.get("command_id", command.id)
+                        first["command_digest"] = _command_digest(command)
                     command_results.append(first)
                 results = tuple(command_results)
                 after = await _candidate_state(self.settings, project, worktree)
@@ -1139,6 +1256,13 @@ class VerificationCommitManager:
 
             unchanged = before == after
             passed = unchanged and all(result["status"] == "passed" for result in results)
+            # M-EV-02: environment/toolchain fingerprint (SHA-256 over the
+            # Python interpreter version + the allowlisted deterministic env
+            # keys + the verification command argv). Stable across identical-env
+            # runs; changes when the declared argv changes.
+            environment_digest = compute_environment_digest(
+                project.verification_commands
+            )
             response: dict[str, Any] = {
                 "status": "passed" if passed else "failed",
                 "project_id": project.id,
@@ -1153,6 +1277,12 @@ class VerificationCommitManager:
                 "infrastructure_status": "DEGRADED"
                 if nondeterminism_labeled
                 else "HEALTHY",
+                # M-EV-02: structured verification result schema (additive
+                # aliases/fields; existing fields are preserved).
+                "candidate_fingerprint": before.fingerprint,
+                "base_commit": before.base_head,
+                "environment_digest": environment_digest,
+                "conclusion": "PASS" if passed else "FAIL",
             }
             if not passed:
                 if not unchanged:
@@ -1183,6 +1313,7 @@ class VerificationCommitManager:
                 paths=before.paths,
                 verified_at=_timestamp(),
                 commands=results,
+                environment_digest=environment_digest,
             )
             async with self._records_lock:
                 self._records[record.verification_id] = record

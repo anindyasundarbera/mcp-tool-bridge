@@ -606,6 +606,179 @@ class VerificationCommitTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_structured_verification_result_fields_present(self) -> None:
+        """M-EV-02: verify() returns the structured fields additively."""
+        async def exercise() -> dict[str, Any]:
+            policy = project(self.root, ["{python}", "-c", "pass"])
+            _, manager, completed = await self.prepare(
+                policy,
+                lambda root: (root / "candidate.txt").write_text(
+                    "candidate", encoding="utf-8"
+                ),
+            )
+            return await manager.verify(
+                policy, str(completed["job_id"]), str(completed["base_head"])
+            )
+
+        result = asyncio.run(exercise())
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["conclusion"], "PASS")
+        # Additive aliases for the existing fingerprint/base fields.
+        self.assertEqual(result["candidate_fingerprint"], result["diff_fingerprint"])
+        self.assertEqual(result["base_commit"], result["base_head"])
+        # Environment digest is a stable SHA-256 hex string.
+        self.assertRegex(str(result["environment_digest"]), r"^[0-9a-f]{64}$")
+        # Per-command structured fields.
+        command = result["commands"][0]
+        self.assertIn("id", command)
+        self.assertEqual(command["id"], command["command_id"])
+        self.assertRegex(str(command["command_digest"]), r"^[0-9a-f]{64}$")
+        # Existing structured fields (M-CC-09) preserved.
+        self.assertEqual(result["deterministic_repetitions"], 1)
+        self.assertEqual(result["infrastructure_status"], "HEALTHY")
+        self.assertFalse(result["nondeterminism_labeled"])
+
+    def test_environment_digest_stable_across_identical_env_runs(self) -> None:
+        """M-EV-02: the digest is stable across two identical-env runs."""
+        async def exercise() -> tuple[str, str]:
+            policy = project(self.root, ["{python}", "-c", "pass"])
+            _, manager, completed = await self.prepare(
+                policy,
+                lambda root: (root / "candidate.txt").write_text(
+                    "candidate", encoding="utf-8"
+                ),
+            )
+            first = await manager.verify(
+                policy, str(completed["job_id"]), str(completed["base_head"])
+            )
+            second = await manager.verify(
+                policy, str(completed["job_id"]), str(completed["base_head"])
+            )
+            assert first["status"] == "passed"
+            assert second["status"] == "passed"
+            return str(first["environment_digest"]), str(second["environment_digest"])
+
+        first_digest, second_digest = asyncio.run(exercise())
+        self.assertEqual(first_digest, second_digest)
+
+    def test_environment_digest_changes_when_argv_changes(self) -> None:
+        """M-EV-02: a changed command argv changes the environment digest."""
+        async def run_one(command: list[str]) -> str:
+            policy = project(self.root, command)
+            _, manager, completed = await self.prepare(
+                policy,
+                lambda root: (root / "candidate.txt").write_text(
+                    "candidate", encoding="utf-8"
+                ),
+            )
+            result = await manager.verify(
+                policy, str(completed["job_id"]), str(completed["base_head"])
+            )
+            assert result["status"] == "passed"
+            return str(result["environment_digest"])
+
+        digest_a = asyncio.run(run_one(["{python}", "-c", "pass"]))
+        digest_b = asyncio.run(run_one(["{python}", "-c", "print('x')"]))
+        self.assertNotEqual(digest_a, digest_b)
+        # The per-command digest also reflects the argv change.
+        async def run_with_command_digest(command: list[str]) -> str:
+            policy = project(self.root, command)
+            _, manager, completed = await self.prepare(
+                policy,
+                lambda root: (root / "candidate.txt").write_text(
+                    "candidate", encoding="utf-8"
+                ),
+            )
+            result = await manager.verify(
+                policy, str(completed["job_id"]), str(completed["base_head"])
+            )
+            return str(result["commands"][0]["command_digest"])
+
+        cmd_digest_a = asyncio.run(run_with_command_digest(["{python}", "-c", "pass"]))
+        cmd_digest_b = asyncio.run(
+            run_with_command_digest(["{python}", "-c", "print('x')"])
+        )
+        self.assertNotEqual(cmd_digest_a, cmd_digest_b)
+        # Same argv yields the same per-command digest (stable).
+        cmd_digest_a2 = asyncio.run(
+            run_with_command_digest(["{python}", "-c", "pass"])
+        )
+        self.assertEqual(cmd_digest_a, cmd_digest_a2)
+
+    def test_environment_digest_persists_and_reloads(self) -> None:
+        """M-EV-02: the environment digest is persisted in the sidecar and
+        re-hydrated when a new manager opens the same database."""
+        async def exercise() -> tuple[str, str | None, str | None]:
+            policy = project(self.root, ["{python}", "-c", "pass"])
+            locks = ProjectLockManager()
+            jobs = DevelopmentJobManager(
+                self.settings,
+                locks,
+                EditingExecutor(
+                    lambda root: (root / "candidate.txt").write_text(
+                        "candidate", encoding="utf-8"
+                    )
+                ),  # type: ignore[arg-type]
+                projects=(policy,),
+            )
+            manager = VerificationCommitManager(
+                self.settings, locks, jobs, projects=(policy,)
+            )
+            started = await jobs.start(policy, "candidate", "high")
+            completed = await wait_completed(jobs, policy, str(started["job_id"]))
+            verified = await manager.verify(
+                policy, str(completed["job_id"]), str(completed["base_head"])
+            )
+            assert verified["status"] == "passed"
+            digest = str(verified["environment_digest"])
+            verification_id = str(verified["verification_id"])
+
+            # A fresh manager over the same state DB re-hydrates the record
+            # with its environment digest from the sidecar.
+            reloaded = VerificationCommitManager(
+                self.settings, locks, jobs, projects=(policy,)
+            )
+            record = reloaded._records.get(verification_id)
+            reloaded_digest = record.environment_digest if record else None
+
+            # The sidecar row is also directly queryable.
+            from local_dev_mcp import store as store_module
+            sidecar = store_module.load_verification_environment_row(
+                reloaded._db, verification_id
+            )
+            sidecar_digest = sidecar["environment_digest"] if sidecar else None
+            return digest, reloaded_digest, sidecar_digest
+
+        digest, reloaded_digest, sidecar_digest = asyncio.run(exercise())
+        self.assertRegex(digest, r"^[0-9a-f]{64}$")
+        self.assertEqual(reloaded_digest, digest)
+        self.assertEqual(sidecar_digest, digest)
+
+    def test_failed_verification_carries_structured_fields(self) -> None:
+        """M-EV-02: the structured fields are present on a failed result too."""
+        async def exercise() -> dict[str, Any]:
+            policy = project(
+                self.root, ["{python}", "-c", "raise SystemExit(7)"]
+            )
+            _, manager, completed = await self.prepare(
+                policy,
+                lambda root: (root / "candidate.txt").write_text(
+                    "candidate", encoding="utf-8"
+                ),
+            )
+            return await manager.verify(
+                policy, str(completed["job_id"]), str(completed["base_head"])
+            )
+
+        result = asyncio.run(exercise())
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["conclusion"], "FAIL")
+        self.assertRegex(str(result["environment_digest"]), r"^[0-9a-f]{64}$")
+        self.assertEqual(result["candidate_fingerprint"], result["diff_fingerprint"])
+        self.assertEqual(result["base_commit"], result["base_head"])
+        self.assertIn("id", result["commands"][0])
+        self.assertIn("command_digest", result["commands"][0])
+
 
 if __name__ == "__main__":
     unittest.main()
