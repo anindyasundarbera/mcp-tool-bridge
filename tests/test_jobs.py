@@ -1,10 +1,12 @@
 import asyncio
+import json
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 
+from local_dev_mcp import store
 from local_dev_mcp.config import Settings
 from local_dev_mcp.jobs import DevelopmentJobError, DevelopmentJobManager
 from local_dev_mcp.models import Effort, ProjectPolicy
@@ -358,6 +360,241 @@ class DevelopmentJobManagerTests(unittest.TestCase):
             )
             await wait_for_status(
                 manager, other, str(second["job_id"]), {"completed"}
+            )
+
+        asyncio.run(exercise())
+
+
+class TrackedEditExecutor:
+    """Edits a tracked file so ``git diff --numstat HEAD`` reports the change.
+
+    Unlike ``ImmediateExecutor`` (which creates an untracked ``candidate.txt``),
+    this executor appends a line to the already-tracked ``README.md`` so the
+    diff summary surfaces a real tracked change.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def execute(
+        self,
+        project: ProjectPolicy,
+        specification: str,
+        effort: Effort,
+        *,
+        root: Path | None = None,
+        resume_session_id: str | None = None,
+        max_turns: int | None = None,
+    ) -> dict[str, Any]:
+        assert root is not None
+        self.calls.append({"root": root})
+        original = (root / "README.md").read_text(encoding="utf-8")
+        (root / "README.md").write_text(
+            original + "candidate line\n", encoding="utf-8"
+        )
+        return {
+            "status": "completed",
+            "project_id": project.id,
+            "result": "done",
+            "session_id": "bridge-session-1",
+        }
+
+
+class DiffSummaryAndValidationEvidenceTests(unittest.TestCase):
+    """M-CT-06: ``diff_summary`` and ``validation_evidence`` in the terminal report."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        initialize_git_repository(self.root)
+        self.settings = settings(self.base)
+        self.project = policy(self.root)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _manager(
+        self, executor: Any
+    ) -> DevelopmentJobManager:
+        return DevelopmentJobManager(
+            self.settings,
+            ProjectLockManager(),
+            executor,  # type: ignore[arg-type]
+            projects=(self.project,),
+        )
+
+    def _verification_row(
+        self, job_id: str, base_head: str, *, status: str = "passed"
+    ) -> dict[str, Any]:
+        return {
+            "verification_id": "testverification0000000000000000001",
+            "project_id": self.project.id,
+            "job_id": job_id,
+            "base_head": base_head,
+            "diff_fingerprint": "a" * 64,
+            "paths_json": json.dumps(["README.md"]),
+            "verified_at": "2026-01-01T00:00:00Z",
+            "used": 0,
+            "commands_json": json.dumps(
+                [{"command_id": "test", "status": status, "exit_code": 0 if status == "passed" else 1}]
+            ),
+        }
+
+    def _review_row(self, job_id: str, base_head: str) -> dict[str, Any]:
+        return {
+            "review_id": "testreview000000000000000000000000001",
+            "project_id": self.project.id,
+            "job_id": job_id,
+            "base_head": base_head,
+            "diff_fingerprint": "a" * 64,
+            "paths_json": json.dumps(["README.md"]),
+            "reviewed_at": "2026-01-01T00:00:00Z",
+            "reviewer_id": "human-reviewer",
+            "verdict_json": json.dumps({"recommendation": "approve", "summary": "good"}),
+            "used": 0,
+        }
+
+    def test_diff_summary_matches_known_tracked_change(self) -> None:
+        async def exercise() -> None:
+            executor = TrackedEditExecutor()
+            manager = self._manager(executor)
+            started = await manager.start(self.project, "approved work", "high")
+            job_id = str(started["job_id"])
+            completed = await wait_for_status(
+                manager, self.project, job_id, {"completed"}
+            )
+            self.assertIn("diff_summary", completed)
+            self.assertEqual(completed["diff_summary"]["files_changed"], 1)
+            self.assertEqual(completed["diff_summary"]["insertions"], 1)
+            self.assertEqual(completed["diff_summary"]["deletions"], 0)
+            # The absolute worktree path must never appear in the snapshot.
+            self.assertNotIn(str(self.settings.job_worktree_root), str(completed))
+
+        asyncio.run(exercise())
+
+    def test_validation_evidence_present_when_verification_exists(self) -> None:
+        async def exercise() -> None:
+            executor = ImmediateExecutor()
+            manager = self._manager(executor)
+            started = await manager.start(self.project, "approved work", "high")
+            job_id = str(started["job_id"])
+            completed = await wait_for_status(
+                manager, self.project, job_id, {"completed"}
+            )
+            store.upsert_record_row(
+                manager._db,
+                self._verification_row(job_id, completed["base_head"]),
+            )
+            snapshot = await manager.get(self.project, job_id)
+            self.assertIn("validation_evidence", snapshot)
+            self.assertIn("verifications", snapshot["validation_evidence"])
+            verifs = snapshot["validation_evidence"]["verifications"]
+            self.assertEqual(len(verifs), 1)
+            self.assertEqual(
+                verifs[0]["verification_id"],
+                "testverification0000000000000000001",
+            )
+            self.assertEqual(verifs[0]["status"], "passed")
+            self.assertFalse(verifs[0]["used"])
+
+        asyncio.run(exercise())
+
+    def test_validation_evidence_includes_review_verdict(self) -> None:
+        async def exercise() -> None:
+            executor = ImmediateExecutor()
+            manager = self._manager(executor)
+            started = await manager.start(self.project, "approved work", "high")
+            job_id = str(started["job_id"])
+            completed = await wait_for_status(
+                manager, self.project, job_id, {"completed"}
+            )
+            store.upsert_review_row(
+                manager._db,
+                self._review_row(job_id, completed["base_head"]),
+            )
+            snapshot = await manager.get(self.project, job_id)
+            self.assertIn("validation_evidence", snapshot)
+            self.assertIn("reviews", snapshot["validation_evidence"])
+            reviews = snapshot["validation_evidence"]["reviews"]
+            self.assertEqual(len(reviews), 1)
+            self.assertEqual(
+                reviews[0]["review_id"],
+                "testreview000000000000000000000000001",
+            )
+            self.assertEqual(reviews[0]["verdict_summary"]["recommendation"], "approve")
+            self.assertFalse(reviews[0]["used"])
+
+        asyncio.run(exercise())
+
+    def test_verified_job_returns_both_diff_summary_and_validation_evidence(self) -> None:
+        async def exercise() -> None:
+            executor = TrackedEditExecutor()
+            manager = self._manager(executor)
+            started = await manager.start(self.project, "approved work", "high")
+            job_id = str(started["job_id"])
+            completed = await wait_for_status(
+                manager, self.project, job_id, {"completed"}
+            )
+            base_head = completed["base_head"]
+            store.upsert_record_row(manager._db, self._verification_row(job_id, base_head))
+            store.upsert_review_row(manager._db, self._review_row(job_id, base_head))
+            snapshot = await manager.get(self.project, job_id)
+            # Both enrichment fields are present on a verified job.
+            self.assertIn("diff_summary", snapshot)
+            self.assertIn("validation_evidence", snapshot)
+            # diff_summary reflects the tracked change.
+            self.assertEqual(snapshot["diff_summary"]["files_changed"], 1)
+            self.assertEqual(snapshot["diff_summary"]["insertions"], 1)
+            # validation_evidence carries both verifications and reviews.
+            self.assertIn("verifications", snapshot["validation_evidence"])
+            self.assertIn("reviews", snapshot["validation_evidence"])
+            self.assertEqual(
+                snapshot["validation_evidence"]["verifications"][0]["status"], "passed"
+            )
+            self.assertEqual(
+                snapshot["validation_evidence"]["reviews"][0]["verdict_summary"]["recommendation"],
+                "approve",
+            )
+
+        asyncio.run(exercise())
+
+    def test_no_verification_row_omits_validation_evidence(self) -> None:
+        async def exercise() -> None:
+            executor = ImmediateExecutor()
+            manager = self._manager(executor)
+            started = await manager.start(self.project, "approved work", "high")
+            job_id = str(started["job_id"])
+            completed = await wait_for_status(
+                manager, self.project, job_id, {"completed"}
+            )
+            # A completed job with no verification/review row must NOT emit
+            # validation_evidence (no empty placeholder that reads as "verified").
+            self.assertNotIn("validation_evidence", completed)
+            # diff_summary is still present (the worktree exists).
+            self.assertIn("diff_summary", completed)
+
+        asyncio.run(exercise())
+
+    def test_failed_verification_status_is_reported(self) -> None:
+        async def exercise() -> None:
+            executor = ImmediateExecutor()
+            manager = self._manager(executor)
+            started = await manager.start(self.project, "approved work", "high")
+            job_id = str(started["job_id"])
+            completed = await wait_for_status(
+                manager, self.project, job_id, {"completed"}
+            )
+            store.upsert_record_row(
+                manager._db,
+                self._verification_row(
+                    job_id, completed["base_head"], status="failed"
+                ),
+            )
+            snapshot = await manager.get(self.project, job_id)
+            self.assertIn("validation_evidence", snapshot)
+            self.assertEqual(
+                snapshot["validation_evidence"]["verifications"][0]["status"], "failed"
             )
 
         asyncio.run(exercise())

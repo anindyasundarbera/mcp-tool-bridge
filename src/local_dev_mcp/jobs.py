@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import stat
+import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -134,6 +135,11 @@ PROHIBITED_ACTIONS = (
 # durable jobs still returns a bounded response. The caller's ``limit`` is
 # clamped to this value before slicing.
 MAX_LIST_JOBS = 200
+
+# M-CT-06: cap on the number of verification/review entries surfaced in the
+# terminal report's ``validation_evidence`` so a job with very many rows still
+# returns a bounded response.
+MAX_VALIDATION_EVIDENCE_ENTRIES = 50
 
 
 def _timestamp() -> str:
@@ -1173,7 +1179,179 @@ class DevelopmentJobManager:
                 snapshot["requirements_covered"] = summary
         except Exception:
             pass
+        # M-CT-06: bounded diff summary from the retained worktree. Computed
+        # from a fixed-argv ``git diff --numstat HEAD`` (no shell) so the
+        # terminal report carries insertions/deletions/files_changed without
+        # exposing raw git output or absolute paths. Omitted when the worktree
+        # is unavailable (e.g. a cancelled job whose worktree was cleared) or
+        # the bounded git read fails — the existing ``changed_path_count``
+        # field remains as the fallback.
+        diff_summary = self._compute_diff_summary(job)
+        if diff_summary is not None:
+            snapshot["diff_summary"] = diff_summary
+        # M-CT-06: validation evidence from the durable verifications/reviews
+        # tables. Present only when at least one row exists for the job so an
+        # unverified job does not emit an empty placeholder that reads as
+        # "verified". Bounded + redacted.
+        validation_evidence = self._validation_evidence(job)
+        if validation_evidence is not None:
+            snapshot["validation_evidence"] = validation_evidence
         return snapshot
+
+    def _compute_diff_summary(self, job: DevelopmentJob) -> dict[str, int] | None:
+        """M-CT-06: bounded ``git diff --numstat HEAD`` over the retained worktree.
+
+        Returns a compact summary (files_changed, insertions, deletions) computed
+        from a fixed-argv ``git diff --numstat HEAD`` in the worktree — never raw
+        git output, never an absolute path. ``--numstat`` emits one TSV line per
+        changed file (``insertions\\tdeletions\\tpath``) which is trivially
+        summable; binary files show ``-`` and are skipped. The summary carries only
+        the three integer counts so no path or secret can leak.
+
+        Returns ``None`` when the worktree is unavailable (e.g. a cancelled job
+        whose worktree was cleared) or the bounded git read fails — the existing
+        ``changed_path_count`` field remains as the fallback. Mirrors
+        ``evidence.py:EvidenceBundleManager._diff_summary``'s intent (a bounded
+        redacted diff stat) but is sync because ``_snapshot`` is sync.
+        """
+        if job.worktree is None:
+            return None
+        try:
+            completed = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(job.worktree.path),
+                    "diff",
+                    "--numstat",
+                    "HEAD",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=self.settings.git_command_timeout_seconds,
+                start_new_session=True,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return None
+        if completed.returncode != 0:
+            return None
+        files_changed = 0
+        insertions = 0
+        deletions = 0
+        for line in completed.stdout.splitlines():
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            ins_text, dels_text = parts[0], parts[1]
+            # Binary files report ``-`` instead of counts; skip them.
+            if ins_text == "-" or dels_text == "-":
+                continue
+            try:
+                insertions += int(ins_text)
+                deletions += int(dels_text)
+            except ValueError:
+                continue
+            files_changed += 1
+        return {
+            "files_changed": files_changed,
+            "insertions": insertions,
+            "deletions": deletions,
+        }
+
+    def _validation_evidence(self, job: DevelopmentJob) -> dict[str, Any] | None:
+        """M-CT-06: bounded, redacted summary of durable verification/review rows.
+
+        Returns ``None`` (so the field is omitted from the snapshot entirely) when
+        the job has no verification and no review row — an unverified job must not
+        emit an empty placeholder that reads as "verified". When at least one row
+        exists, returns:
+
+        ``{
+            "verifications": [
+                {"verification_id": ..., "status": "passed"|"failed", "used": bool},
+                ...
+            ],
+            "reviews": [
+                {"review_id": ..., "verdict_summary": {...}, "used": bool},
+                ...
+            ],
+        }``
+
+        The verification ``status`` is computed from ``commands_json``: "passed"
+        when every command reports ``status == "passed"``, else "failed". The
+        review ``verdict_summary`` mirrors ``evidence.py``'s extraction (the
+        ``approve``/``reject``/``verdict``/``approved``/``conclusion``/
+        ``status``/``recommendation`` keys). Both lists are capped at
+        ``MAX_VALIDATION_EVIDENCE_ENTRIES``. Verdict summaries are redacted over
+        the job's redaction paths so an echoed absolute path cannot leak.
+        """
+        verification_rows = store.load_record_rows_for_job(self._db, job.job_id)
+        review_rows = store.load_review_rows_for_job(self._db, job.job_id)
+        if not verification_rows and not review_rows:
+            return None
+
+        def _verification_status(commands_json: str | None) -> str:
+            commands = _json_loads(commands_json)
+            if not isinstance(commands, list) or not commands:
+                return "unknown"
+            for command in commands:
+                if isinstance(command, dict):
+                    if command.get("status") != "passed":
+                        return "failed"
+            return "passed"
+
+        def _verdict_summary(verdict_json: str | None) -> dict[str, Any]:
+            verdict = _json_loads(verdict_json)
+            if not isinstance(verdict, dict):
+                return {}
+            summary: dict[str, Any] = {}
+            for key in (
+                "approve",
+                "reject",
+                "verdict",
+                "approved",
+                "conclusion",
+                "status",
+                "recommendation",
+            ):
+                if key in verdict:
+                    summary[key] = verdict[key]
+            return summary
+
+        redaction_paths: tuple[Path, ...] = (
+            self.settings.job_worktree_root,
+            self.settings.projects_config_path,
+            *self._project_roots,
+        )
+        if job.worktree is not None:
+            redaction_paths += (job.worktree.path,)
+        verifications = [
+            {
+                "verification_id": row.get("verification_id"),
+                "status": _verification_status(row.get("commands_json")),
+                "used": bool(row.get("used", 0)),
+            }
+            for row in verification_rows[:MAX_VALIDATION_EVIDENCE_ENTRIES]
+        ]
+        reviews = [
+            {
+                "review_id": row.get("review_id"),
+                "verdict_summary": _redact(
+                    _verdict_summary(row.get("verdict_json")),
+                    redaction_paths,
+                ),
+                "used": bool(row.get("used", 0)),
+            }
+            for row in review_rows[:MAX_VALIDATION_EVIDENCE_ENTRIES]
+        ]
+        evidence: dict[str, Any] = {}
+        if verifications:
+            evidence["verifications"] = verifications
+        if reviews:
+            evidence["reviews"] = reviews
+        return evidence if evidence else None
 
     def _require_job(
         self,
