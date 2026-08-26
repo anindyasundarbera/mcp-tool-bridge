@@ -22,16 +22,32 @@
 > discipline) and the **non-negotiable security boundaries** in `AGENTS.md` apply
 > to every milestone below.
 
-## Current state (2026-08-07)
+## Current state (2026-08-26)
 
-- **MCPB-001 → MCPB-009 are merged to `origin/main`** (`2a8ad1d`): PR #1
-  (MCPB-001→006), PR #3 (MCPB-007 + the MCPB-008 commit on the same branch),
-  PR #4 (MCPB-009).
-- **MCPB-010 — Continuity release is open as PR #5**
-  (`feature/mcpb-010-continuity` → `main`), commit `09aca52`, version `0.10.0`,
-  167 tests pass, **zero new MCP tools**. Decision record: `docs/MCPB-010.md`.
-- **Nothing past MCPB-010 is implemented or committed.** Everything in the
-  closure plan is future work.
+- **MCPB-001 → MCPB-012 and M-AL-01 have all shipped** (see `git log` and
+  `docs/README.md` for the milestone index). The dated 2026-08-07 verdict
+  table below is retained as the original point-in-time audit; the
+  **2026-08-26 true status audit** (added after the verdict summary)
+  supersedes its DONE/PARTIAL/MISSING verdicts and is authoritative.
+- **Major gap-closure work landed after the original audit**, much of it
+  partially: the M-CT continuity tail (`8d863c7`), M-EV-01 requirement
+  traceability (`4596ceb`), M-EV-05 authority records (`b09b1a8`), M-EV-06
+  evidence bundle (`9422774`), M-GV-01 authorization objects (`1163a3a`),
+  M-GV-06 delegation (`16fd2e7`), M-GV-07 review reconciliation (`1a8bfe4`),
+  M-CC-01/02/05 draft PR (`f80c05a`), M-CC-09 hermetic lab (`7186368`), and
+  M-CC-11 in three sub-commits (prompt-injection defense `b5ed195`,
+  supply-chain gate `7df464a`, sandboxed scripts `0fe99d8`).
+- **Extras delivered beyond the original 149-item audit** (now reflected in
+  the verdict table): MCPB-011 governed host runtime verification (`a014678`),
+  MCPB-012 working-tree candidate capture (`38dd3b4`), M-AL-01 read-only
+  introspection tools, and a governed disposable OpenHands runtime action
+  execution capability (`3b792a9`).
+- The 2026-08-26 code-level audit found that **many "shipped" milestones are
+  PARTIAL, not DONE** — commit messages claimed completion but named pieces
+  are missing or unwired (e.g. M-EV-01 has the module but is not wired into
+  jobs/snapshot; M-GV-01 has the manager but it is not invoked by handlers;
+  M-CT-05's `QUARANTINED_PROVENANCE` is defined but unreachable). Treat the
+  audit table below as authoritative.
 - Local `main` may be stale; run `git fetch --prune origin` before any
   base-branch reasoning.
 
@@ -239,6 +255,65 @@ exists, a named piece is missing; **MISSING** = nothing delivers it.
 | P3 | Evidence-based agent selection | MISSING | none found. registry.py handles project registr… |
 | P3 | Delta qualification when a capability contract changes | MISSING | none found. grep -rni 'delta_qualif|delta' src/… |
 | P3 | Versioned lessons that improve future workflows without smugg… | MISSING | none found. grep -rni 'versioned_lesson|lesson'… |
+
+## 2026-08-26 true status audit (authoritative)
+
+A code-level re-audit of every milestone against the actual source (25
+verified by parallel read-only subagents, 13 verified by direct grep/Read
+after the subagent fleet hit the ollama session-usage cap). **This table
+supersedes the dated verdict summary above.** Status counts: **8 DONE,
+22 PARTIAL, 8 MISSING** (of 38 milestones audited, including 4 extras not in
+the original 149-item table). M-IN-01 remains an explicit non-goal.
+
+The "Gap" column is the concrete remaining work to reach DONE; it is the
+authoritative input to the implementation order in "Recommended next action".
+
+| Milestone | Title | Status | Gap (remaining work to DONE) |
+|---|---|---|---|
+| M-CT-01 | Worktree base fetch + pin | DONE | — (worktrees.py:267 create(requested_base); _resolve_remote_default_tip fetches origin; jobs.py:1508 threads requested_base; tests/test_mct.py) |
+| M-CT-02 | Compute + cumulative wall-time budgets | PARTIAL | Add `CLAUDE_HARD_WALL_SECONDS` (cumulative wall) + a `wall_seconds_used` job field persisted in job_progress; `_absorb_result_budget` accumulates per-slice wall; pause on cumulative ceiling; tests. |
+| M-CT-03 | Checkpoint rich fields | MISSING | Create sidecar `job_checkpoint_detail` (completed_steps_json/remaining_steps_json/tests_json/decisions_json/tool_history_json); wire `_record_checkpoint` to parse `CLAUDE_STREAM_JSON` events; rehydration; tests. |
+| M-CT-04 | Atomic milestone execution | PARTIAL | Add `completed_milestones`/`remaining_milestones` to `_snapshot` (partition by `closed`); test the `acceptance_command_id` pass/fail/unknown branches; (optional) typed `Milestone` model. |
+| M-CT-05 | BLOCKED_INPUT_REQUIRED + QUARANTINED_PROVENANCE reachable | PARTIAL | Make `_run` enter `QUARANTINED_PROVENANCE` on real provenance corruption (fingerprint mismatch / re-derive failure) instead of raising PublicationError; add a stream-json `input required` signal to `_blocked_input_signal`; reachability tests. |
+| M-CT-06 | Diff summary + validation evidence in terminal report | PARTIAL | Add `diff_summary` (bounded redacted `git diff --stat`) and `validation_evidence` (pass/fail + ids when a verifications/reviews row exists) to `jobs.py:_snapshot`; tests. |
+| M-CT-07 | Progress-intelligence enrichment | PARTIAL | Compare consecutive checkpoints in `_record_checkpoint` for oscillating edits / scope growth / weakened tests; pause with distinct `pause_reason` per trigger; tests. |
+| M-EV-01 | Requirement traceability | PARTIAL | Wire `RequirementManager` into jobs/server (scan/parse on job create, persist links); surface `requirements_covered` in `get_development_job`/`get_project_status`; full matrix() covered/uncovered/contradictory + deferrals-with-authority; tests. |
+| M-EV-02 | Structured verification result schema + env fingerprint | PARTIAL | Compute `environment_digest` (SHA-256 over python ver + allowlisted env + argv + toolchain pin); add named fields (candidate_fingerprint/base_commit/environment_digest/conclusion or aliases) to verify() response; sidecar `verification_environment` table; tests. |
+| M-EV-03 | Evidence binding completeness | MISSING | Sidecar `verification_bindings`+`review_bindings` (toolchain_digest, reviewer_independence_class, expires_at, authority_ref); stamp independence class on review; reject expired bindings at commit gate; tests. |
+| M-EV-04 | Review content-addressing + revision→finding links | MISSING | Sidecar `review_content` with `verdict_hash`; `revision_resolves_finding` table + follow-up revision job path; queryable finding→revision→closure chain; tests. |
+| M-EV-05 | Source classifications + authority-behind-instructions | DONE | — (source_classifications + authority_records tables, seeded vocabulary, _record_event stamps authority_ref; tests) |
+| M-EV-06 | Portable evidence bundle export | PARTIAL | Wire `RequirementManager` coverage section into `EvidenceBundleManager`; explicit `.env`/`.venv`/token exclude filter on changed_paths+diff; (optional) zip serialization; tests. |
+| M-EV-07 | Nondeterminism detection + deterministic replay | PARTIAL | Compute+persist env digest into `verifications` row (additive `env_digest` column + VerificationRecord field); (optional) per-command digests; replay tool deferred. |
+| M-EV-08 | Artifact retention + GC policy | PARTIAL | Add `EVIDENCE_RETENTION_DAYS`/`CHECKPOINT_RETENTION` settings; `store.gc_artifacts` deletes non-promoted checkpoint+detail rows older than retention, never verifications/reviews/publications/syncs; tests. |
+| M-GV-01 | Durable authorization objects | PARTIAL | Wire `AuthorizationManager` into commit/push/review/export handlers (require unused unexpired project+capability+target authz, mark used in SAME ACID txn); opt-in Settings flag; handler-integration tests; confirm runtime instantiation. |
+| M-GV-02 | Named roles Planner / Evidence-officer / Supervisor | PARTIAL | Implement `build_planner_command`/`build_evidence_officer_command`/`build_supervisor_command` (read-only, Read/Glob/Grep only); wire as capability-gated invocations; tests/test_roles.py. |
+| M-GV-03 | External grounding for genesis/apex authority | MISSING | `ProjectPolicy.apex_authority_ref`; `REQUIRE_APEX_GROUNDING` opt-in; registry rejects ungrounded policy; genesis jobs require ref present+unchanged; tests. |
+| M-GV-04 | Spec-gated runtime under ratified spec commit | MISSING | `ProjectPolicy.ratified_spec_commit`; jobs.create requires job spec pinned to that commit; reject spec drift; tests. |
+| M-GV-05 | Self-certification prevention | PARTIAL | Record drafter identity on job; `record_candidate_review` rejects reviewer_id == drafter with clear error; self-review test. |
+| M-GV-06 | Sub-agent delegation + parent/child task trees | PARTIAL | Enforce capability-subset bound at runtime (child invoked caps ⊆ mandate authority); reconcile scoping wording; expose parent_job_id via start()/create() or document delegate() as canonical; tests. |
+| M-GV-07 | Parallel verify + review + conflict reconciliation | PARTIAL | `asyncio.gather` verify+review once candidate stable; wire `reconcile_reviews` into commit gate (require reconciled pass over multiple review_ids); reconcile tie-breaker wording with stricter impl; parallel+gate tests. |
+| M-CC-01 | PR creation + existing-PR discovery + update draft PR | DONE | — (pr.py PullRequestManager; open_pull_request tool server.py:1202; OPEN_PULL_REQUEST cap; gh pr list/create/edit; tests/test_pr.py) |
+| M-CC-02 | Confirm remote branch/PR state | DONE | — (pr.py:364-365 remote_branch_state+pr_state; introspection.py:717) |
+| M-CC-03 | Successor job from immutable completed candidate | PARTIAL | Add `create_successor_job(parent_job_id, instructions)` pinning base_head to parent's `CommittedCandidate.committed_sha` (not canonical HEAD); preserve immutable parent; record via parent/child tree; tests. |
+| M-CC-04 | Merge-vs-ratification + separate authz | PARTIAL | `ratifications` sidecar table; internal `ratify_candidate` act; ProjectCapability+ToolAnnotations (off by default) + authz gate; tests; Option B merge tool only if user authorizes. |
+| M-CC-05 | Branch/PR race-safe idempotency | PARTIAL | Add concurrency test (two open_pull_request via asyncio.gather under shared manager + mocked _gh → exactly one create + one edit); note cross-process TOCTOU scope limit (in-process lock only). |
+| M-CC-06 | Unexpected-files / generated-artifact / submodule detection | MISSING | Configurable `unexpected_paths` policy per project (block `*.lock`/`dist/`/`node_modules/`/generated artifacts not in declared changed set); flag + reject at commit gate; tests. |
+| M-CC-07 | Read-only completed-worktree recovery | MISSING | `worktrees.recover_completed_worktree(job_id)` re-attaches vanished completed worktree from content-addressed candidate (detached checkout, verify fingerprint), read-only; tests. |
+| M-CC-08 | Human control surface | PARTIAL | Dashboard: add `requirements_covered` (M-EV-01) + `authorities_in_force` (M-GV-01) to `_snapshot`. Control tools (NEW SURFACE each, opt-in): pause_development_job, extend_budget, narrow_scope, replace_worker, discard_candidate, revoke_authorization (+export_evidence=M-EV-06). All currently MISSING. |
+| M-CC-09 | Verification-lab determinism | PARTIAL | Has TZ=UTC/SOURCE_DATE_EPOCH/PYTHONHASHSEED/deterministic_repetitions/baseline_fingerprint. Missing: `PIN_TOOLCHAIN` (pinned venv/lockfile), `DEPS_CACHE_DIR` (read-only cached deps), `NETWORK_POLICY` (none\|allowlist); tests. |
+| M-CC-10 | Failure-recovery hardening | PARTIAL | `FAILED_INFRASTRUCTURE` reachable (jobs.py:1722); `QUARANTINED_PROVENANCE` defined but only test-injected. Missing: tool-failure retry→isolate, corruption rollback to last verified checkpoint, lost-worktree reconstruction from content-addressed patch, quarantine machinery; tests/test_recovery.py. |
+| M-CC-11 | Security hardening | PARTIAL | Has supply_chain_scans, bwrap sandbox, reader_injection_defense. Missing: per-job filesystem_policy/network_policy/credential_policy (least-priv short-lived), signed_manifests, sensitivity_classification-before-export. |
+| M-IN-01 | P3 capability learning & reconstruction | MISSING | Explicitly deferred (non-goal) until R1–R3 prove out. No P3 tables exist. |
+| **X-MCPB-011** | Governed host runtime verification (extra) | DONE | — (RUNTIME_VERIFICATION cap models.py:34; runtime_verification_commands; docs/MCPB-011.md) |
+| **X-MCPB-012** | Working-tree candidate capture (extra) | DONE | — (WORKING_TREE_CANDIDATE_CAPTURE cap models.py:43; docs/MCPB-012.md) |
+| **X-M-AL-01** | Read-only introspection tools (extra) | DONE | — (list_development_jobs/get_effective_project_policy/resolve_candidate_canonicalization tools server.py:1269/1307/1343; job_introspection/policy_introspection/canonical_history_read caps; docs/M-AL-01.md) |
+| **X-OPENHANDS** | Governed disposable runtime action execution (extra) | DONE | — (open_hands_action.py OpenHandsActionManager; GOVERNED_DISPOSABLE_RUNTIME_ACTION_EXECUTION cap models.py:44; execute_action tool server.py:1604; test_open_hands_action.py) |
+
+**Implementation order (unblock value first):** M-CT-04 → M-CT-05 → M-EV-01
+(the three CKS-002B blockers still open), then the small additive R1 tail
+(M-CT-02/03/06/07), then R2 Evidence (M-EV-02→08), then R3 Governance
+(M-GV-02→07, building on M-GV-01 wiring), then Cross-cutting (M-CC-03→11).
+M-IN-01 stays deferred.
 
 ## Closure plan — by release
 
@@ -859,35 +934,49 @@ is unblocked when every `required` row is DONE.
 | `minimum_unblock` item | Milestone | Status |
 |---|---|---|
 | `canonical_sync` | (MCPB-009, merged) | DONE |
-| `pinned_base` | M-CT-01 | PARTIAL → R1 |
+| `pinned_base` | M-CT-01 | DONE (2026-08-26) |
 | `resumable_checkpoint` | (MCPB-010) | DONE |
 | `soft_turn_limit:30` / `extension_block:30` / `hard_turn_limit:120` / `max_no_progress_turns:6` | (MCPB-010) | DONE |
 | `compaction` | (MCPB-010) | DONE |
-| `milestone_plan` | M-CT-04 | PARTIAL → R1 |
-| `requirement_traceability` | M-EV-01 | MISSING → R2 |
+| `milestone_plan` | M-CT-04 | PARTIAL → R1 (snapshot partition + acceptance_command tests) |
+| `requirement_traceability` | M-EV-01 | PARTIAL → R2 (module exists; wire into jobs/snapshot; full matrix) |
 | `fixed_verification_binding` | (MCPB-005) | DONE |
 | `independent_review_binding` | (MCPB-007) | DONE |
 | `candidate_fingerprint` | (MCPB-005) | DONE |
-| terminal states `COMPLETE/PAUSED_BUDGET_EXHAUSTED/BLOCKED_INPUT_REQUIRED/FAILED_CANDIDATE/FAILED_INFRASTRUCTURE/QUARANTINED_PROVENANCE` | M-CT-05 (BLOCKED_INPUT_REQUIRED, QUARANTINED_PROVENANCE) | PARTIAL → R1 |
+| terminal states `COMPLETE/PAUSED_BUDGET_EXHAUSTED/BLOCKED_INPUT_REQUIRED/FAILED_CANDIDATE/FAILED_INFRASTRUCTURE/QUARANTINED_PROVENANCE` | M-CT-05 (BLOCKED_INPUT_REQUIRED, QUARANTINED_PROVENANCE) | PARTIAL → R1 (QUARANTINED_PROVENANCE unreachable) |
 
-**Conclusion:** the only CKS-002B blockers remaining are M-CT-01 (fetch+pin
-base), M-CT-04 (atomic milestones), M-CT-05 (the two dormant states), and
-M-EV-01 (requirement traceability). Everything else is hardening or vision.
+**Conclusion:** the only CKS-002B blockers remaining are M-CT-04 (atomic
+milestones — PARTIAL), M-CT-05 (the two dormant states — PARTIAL,
+`QUARANTINED_PROVENANCE` unreachable), and M-EV-01 (requirement traceability —
+PARTIAL, not wired in). M-CT-01 is now DONE. Everything else is hardening or
+vision.
 
 ## Recommended next action
 
-1. **Get PR #5 (MCPB-010) merged to `main`.** MCPB-010 is complete, tested
-   (167 tests), and zero-new-surface.
-2. **Start the Evidence release with M-EV-01 (requirement traceability).**
-   It is the highest-value, most- blockers-removing single milestone: it
-   directly serves CKS-002B, is purely additive (`requirements` +
-   `requirement_links` tables), and is internal-first (no new tool). Branch
-   `feature/mcpb-011-evidence` off `main`.
-3. **Then M-CT-01 / M-CT-04 / M-CT-05** to finish the Continuity tail (these
-   can ride an R1 follow-up branch or be folded into the Evidence release if
-   small enough).
-4. Defer Governance, Cross-cutting PR/controls, and P3 per the priorities
-   above.
+1. **MCPB-001 → MCPB-012 and M-AL-01 are all shipped.** The PR-#5 / merge
+   step is historical.
+2. **Close the three remaining CKS-002B blockers first**, in this order:
+   - **M-CT-04** (atomic milestones): add `completed_milestones`/
+     `remaining_milestones` to `_snapshot` and test the
+     `acceptance_command_id` branches. Small, additive, zero-new-surface.
+   - **M-CT-05** (dormant states): make `_run` enter
+     `QUARANTINED_PROVENANCE` on real provenance corruption and add the
+     stream-json `input required` signal. Zero-new-surface.
+   - **M-EV-01** (requirement traceability): wire the existing
+     `RequirementManager` into jobs/server, surface `requirements_covered`
+     in the snapshots, and implement the full matrix + deferrals. Internal,
+     additive, no new tool.
+3. **Then the R1 Continuity tail** (M-CT-02/03/06/07) — small additive
+   pieces (wall budget, checkpoint rich fields, diff/validation in report,
+   progress intelligence).
+4. **Then R2 Evidence** (M-EV-02 → M-EV-08), then R3 Governance (M-GV-02 →
+   M-GV-07, building on M-GV-01 handler wiring), then Cross-cutting
+   (M-CC-03 → M-CC-11). Defer M-IN-01 (P3) per the priorities above.
+5. Each milestone: implement → run the full core suite
+   (`PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v`) →
+   inspect → commit (AGENTS.md §3). NEW SURFACE milestones add a
+   `ProjectCapability` + `ToolAnnotations`, dormant by default, and bump the
+   tool-count canary (currently 32).
 
 ## Non-goals (explicitly out of scope for the unblock)
 
