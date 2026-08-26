@@ -1,262 +1,108 @@
-# Local Development MCP v2
+# Local Development MCP (BridgeLab)
 
-This is the MCPB-005 project-aware ChatGPT-to-Claude Code development bridge.
-ChatGPT addresses projects by stable `project_id`; the server resolves those
-IDs through a local allowlist and never accepts an arbitrary filesystem root,
-worktree path, or Claude session ID from a tool call.
+A **project-aware MCP bridge** that lets a remote assistant (ChatGPT) safely
+delegate engineering work to a local Claude Code runtime on allowlisted Git
+repositories, with deterministic verification, human-gated commits, and bounded
+publication — all enforced in server code, never by model instructions.
 
-## Capabilities through MCPB-005
+ChatGPT addresses projects by a stable `project_id`. The bridge resolves those
+IDs through a local registry (`projects.json`) and **never** accepts an
+arbitrary filesystem root, worktree path, or Claude session ID from a tool
+call. Every modifying operation runs in an isolated detached Git worktree; the
+production checkout is never edited directly.
 
-- Validated multi-project registry and exact capability authorization
-- Safe project discovery and Git status
-- Bounded Markdown list, search, full read, range read, outline, and metadata
-- Hash-protected Markdown create/update beneath approved write roots
-- Hidden, protected, traversal, non-Markdown, non-regular, and symlink access
-  denied
-- One shared per-project modifying lock; independent projects remain
-  independent
-- Clean-baseline-gated detached Git worktree per development job
-- Asynchronous job IDs, status/results, cancellation, and retained candidates
-- Resume only through a bridge-created job with a bridge-captured Claude
-  session
-- Self-managed candidates started temporarily on a separate localhost port and
-  health-checked through MCP
-- Registry-fixed verification commands with bounded structured evidence
-- SHA-256 candidate fingerprints bound to base HEAD and exact changed paths
-- Separate human-approved detached commits of only the unchanged verified state
-- Exact staging with `git add -- <paths>`; hooks, signing, and ref updates disabled
-- Existing Claude `acceptEdits` boundary with Bash, web, secondary MCP tools,
-  slash commands, and `bypassPermissions` disabled
-
-Candidate promotion, production restart, branch/ref updates, merge, tags,
-worktree deletion, and rollback switching remain outside bridge authority. The
-one push surface is the opt-in `push_development_commit` capability: a single
-verified detached commit to a new non-trunk branch on `origin`, never a
-force-push, merge, tag, trunk update, or ref move. The one local-checkout
-update surface is the opt-in `sync_canonical_checkout` capability: a
-fast-forward only of the guarded canonical checkout to the verified current
-tip of `origin`'s default branch, never a push, force, merge-commit, tag,
-remote ref move, or trunk update.
-
-## MCP tools
-
-Repository and Markdown tools:
-
-- `list_allowed_projects`
-- `get_project_status`
-- `list_project_markdown`
-- `search_project_markdown`
-- `read_project_markdown`
-- `read_project_file_range`
-- `get_markdown_outline`
-- `get_project_file_metadata`
-- `write_project_markdown`
-
-Isolated development lifecycle:
-
-- `send_to_local_dev` queues a new worktree-isolated job and returns
-  immediately with a 32-character job ID.
-- `get_development_job` returns changing status and bounded terminal evidence.
-- `resume_development_job` continues a terminal job in its retained worktree;
-  callers provide the job ID, never a raw session ID.
-- `cancel_development_job` stops a queued or running job while retaining its
-  worktree and candidate changes.
-- `verify_development_job` runs only the fixed command vectors configured for
-  the project, then binds passing evidence to the exact unchanged candidate.
-- `commit_verified_development_job` creates one detached commit only after a
-  separate human approval repeats the verification ID, HEAD, fingerprint, and
-  complete ordered path list.
-- `push_detached_development_commit` publishes that exact detached commit to a
-  new non-trunk remote branch on `origin` after separate human approval repeats
-  the commit SHA, base HEAD, and fingerprint. It never force-pushes, merges,
-  tags, or moves another ref; one branch per job, with idempotent retry.
-- `sync_canonical_checkout` fast-forwards a project's guarded canonical
-  checkout to exactly the current tip of `origin`'s default branch after an
-  upstream merge, when the checkout is clean and on the default branch and the
-  caller repeats the exact current HEAD and target commit. It uses
-  `git merge --ff-only`; it never pushes, forces, merges (creates a merge
-  commit), tags, or moves a remote ref. It refuses while a non-terminal job
-  exists and warns about completed-uncommitted jobs that lose their
-  verify/commit path after the base moves.
-
-Candidate review (opt-in `candidate_review`):
-
-- `list_candidate_changes` and `read_candidate_file` expose a retained
-  candidate's changed paths to a reviewer, scoped to exactly the changed set.
-- `record_candidate_review` records a reviewer verdict bound to the candidate
-  state; `get_candidate_review` retrieves it. `run_independent_review` spawns a
-  fresh, read-only Claude reviewer distinct from the drafting session.
-
-Job states are `queued`, `preparing_worktree`, `running`, optionally
-`validating_candidate`, and one of `completed`, `failed`, `timed_out`, or
-`cancelled`. Job and verification records are persisted durably to a local
-SQLite database (see [Durable state](#durable-state)) so a server restart
-re-hydrates them instead of wiping them.
-
-Runtime verification (opt-in `runtime_verification`, which requires
-`repository_read`):
-
-- `run_runtime_verification` runs one **policy-named** runtime check against the
-  project's clean canonical checkout at an exact expected HEAD and returns
-  content-addressed PASS/FAIL evidence. The caller supplies only the project
-  ID, the check ID (selecting a check defined in trusted local policy), and the
-  expected 40-hex HEAD — never an executable, argv, environment, working
-  directory, or timeout. No shell is involved; commands run via
-  `asyncio.create_subprocess_exec` and the bridge's full process environment is
-  not inherited. It is evidence-only: it never stages, commits, pushes, merges,
-  tags, opens a PR, moves a ref, or grants commit authority (its `rtv_`-prefixed
-  IDs live in a separate namespace from candidate verification IDs). It binds to
-  a clean checkout at exactly the expected HEAD (on the default branch where
-  BridgeLab knows it), uses read-only git only, and rechecks repository
-  immutability after execution — any drift fails the run with no auto-restore.
-  Output is bounded and redacted; rows persist to an additive audit table.
-
-## Isolation rules
-
-Before a new job starts, the configured checkout must be a clean Git top level,
-including no staged or untracked files. The bridge records its exact `HEAD` and
-creates a detached worktree beneath:
-
-```text
-JOB_WORKTREE_ROOT/<project_id>/<job_id>
+```
+                    OpenAI connector mTLS
+                          ┌──────┐
+   ChatGPT  ─── HTTPS ──▶│ ngrok │──▶ 127.0.0.1:8000  FastMCP server (this repo)
+                          └──────┘                         │
+                                                       Git worktrees
+                                                       (isolated per job)
+                                                           │
+                                                    Claude Code (local)
 ```
 
-The worktree root must be private, symlink-free, and outside every configured
-project. Claude, verification, and any detached commit operate only in that
-worktree. Worktrees remain retained; the bridge exposes no deletion operation.
+> The project is also referred to as **BridgeLab** in its milestone records.
+> The git remote is `anindyasundarbera/mcp-tool-bridge`.
 
-All modifying bridge operations for one project use the same lock, so a
-Markdown write cannot overlap a Claude job. Jobs for different projects can run
-independently.
+---
 
-## Durable state
+## Why it exists
 
-Job and verification records persist to a single local SQLite database so a
-server restart no longer amnesiates in-flight or completed work:
+A raw `claude` CLI with `bypassPermissions` is unsafe to drive from a remote
+assistant: it can run arbitrary Bash, edit any file, push, merge, and move
+refs with no review. This bridge re-establishes a **governed boundary** between
+"the assistant asks for work" and "the local machine does it":
 
-```text
-JOB_WORKTREE_ROOT/.state/bridge.db
+- **Allowlisted projects only.** The local registry is the authorization source
+  of truth. Unknown, disabled, or malformed projects fail closed.
+- **Isolated worktrees.** Each development job gets a clean-baseline detached
+  worktree beneath a private, bridge-owned root, outside every project.
+- **Deterministic verification.** Only fixed, registry-configured command
+  vectors run — no shell, no caller-supplied argv/env/cwd/timeout.
+- **Human-gated commits.** A detached commit is created only after a *separate*
+  human approval repeats the verification ID, HEAD, fingerprint, and ordered
+  path list.
+- **Bounded publication.** The one push surface is opt-in: a single verified
+  detached commit to a *new, non-trunk* remote branch on `origin` — never a
+  force-push, merge, tag, trunk update, or ref move.
+- **Durable state.** Job, verification, review, publication, sync, checkpoint,
+  and audit records persist to a crash-safe SQLite database, so a restart
+  re-hydrates in-flight and completed work instead of wiping it.
+
+---
+
+## The governed development lifecycle
+
+```
+ develop in isolated worktree
+   → review diff            (list_candidate_changes / read_candidate_file / run_independent_review)
+   → verify fixed commands   (verify_development_job)        binds evidence → (HEAD, fingerprint, paths)
+   → approve commit          (commit_verified_development_job)  separate human approval; detached commit only
+   → publish (opt-in)        (push_detached_development_commit) one new non-trunk remote branch on origin
+   → sync canonical (opt-in) (sync_canonical_checkout)         ff-only to origin/<default> after a merge
 ```
 
-The `.state` directory is private (`0o700`) and lives under the same
-bridge-owned worktree root, outside every configured project. The database file
-is `0o600`, opened with WAL journaling and `synchronous=FULL` so each state
-transition commits crash-safely. On startup each manager re-hydrates its records
-synchronously before the event loop starts.
+Each arrow is a **separate** MCP call with its own capability gate and its own
+exact-match confirmation of the prior state. No single tool silently chains
+develop → commit → push.
 
-Reconciliation is honest, not magical: a job that was not terminal when the
-previous process died is reloaded as `failed` (`bridge restarted while job was
-in progress`), because its asyncio task and Claude process are gone and cannot
-be reattached. A terminal job whose retained worktree directory has since
-vanished is reloaded as `failed` (`job worktree no longer exists`). Completed
-jobs with a surviving worktree and a bridge-captured Claude `session_id` remain
-resumable across restarts, and single-use verification IDs remain valid for a
-later commit. Unparseable rows are skipped (fail-closed) so one corrupt record
-never blocks startup. A database whose stored schema version is newer than this
-code supports is refused on open to avoid silent data loss.
+Job states: `queued` → `preparing_worktree` → `running` → optionally
+`validating_candidate` → one of `completed` / `failed` / `timed_out` /
+`cancelled`, plus the resumable `paused_budget_exhausted` /
+`paused_interrupted` / `blocked_input_required` and the terminal
+`failed_infrastructure` / `quarantined_provenance`.
 
-The bridge does not auto-prune an orphaned worktree whose row is missing or
-corrupt; manual cleanup is `git -C <project> worktree remove --force <path>`.
-Run only one bridge process per `JOB_WORKTREE_ROOT`; two processes would race on
-the same database.
+---
 
-## Verification and commit policy
+## The MCP tool surface (32 tools)
 
-Projects opt in with `verification_commit`, `commit_roots`, and one or more
-`verification_commands`. These settings live only in the local registry. MCP
-callers cannot supply commands, arguments, environment variables, timeouts,
-working directories, or authorization roots. Commands use exact argv vectors
-without a shell; `{python}` means the interpreter running the bridge, and an
-optional relative `python_path` becomes a confined `PYTHONPATH`.
+Every tool takes an exact `project_id` (and an opaque `job_id` where relevant),
+never a raw path or session ID. Capability gates are listed in
+[docs/TOOLS.md](docs/TOOLS.md).
 
-Verification requires a completed retained job, a clean unchanged source
-checkout at the job's base HEAD, an empty candidate index, and changed paths
-that are symlink-free, outside protected paths, and beneath `commit_roots`.
-Hidden paths require a matching explicit hidden `commit_roots` entry; a broad
-`.` root does not authorize them.
-Every command must pass without changing the candidate. Output is bounded and
-hashed. Success returns a single-use verification ID, the exact changed paths,
-and a fingerprint covering the baseline and current file bytes/modes.
+| Group | Tools |
+|---|---|
+| **Project / repo read** | `list_allowed_projects`, `get_project_status`, `list_project_markdown`, `search_project_markdown`, `read_project_markdown`, `read_project_file_range`, `get_markdown_outline`, `get_project_file_metadata` |
+| **Markdown write** | `write_project_markdown` |
+| **Development lifecycle** | `send_to_local_dev`, `get_development_job`, `resume_development_job`, `cancel_development_job` |
+| **Candidate review** | `list_candidate_changes`, `read_candidate_file`, `record_candidate_review`, `run_independent_review`, `get_candidate_review` |
+| **Verification & commit** | `verify_development_job`, `commit_verified_development_job` |
+| **Publication & sync** | `push_detached_development_commit`, `sync_canonical_checkout`, `prepare_canonical_for_work` |
+| **Evidence & PR** | `export_evidence_bundle`, `open_pull_request` |
+| **Introspection (dormant)** | `list_development_jobs`, `get_effective_project_policy`, `resolve_candidate_canonicalization` |
+| **Host runtime verification (dormant)** | `run_runtime_verification` |
+| **Working-tree capture (dormant)** | `preflight_working_tree_capture`, `working_tree_candidate_capture` |
+| **Disposable runtime action (dormant)** | `standalone_openhands_action` |
 
-Commit is a separate destructive call. The supplied verification ID, base
-HEAD, fingerprint, ordered path list, and commit message must match exactly.
-The bridge rechecks the candidate, stages only `git add -- <paths>`, proves the
-index content matches verification, disables hooks and signing, and creates a
-commit on detached HEAD. It never creates or updates a branch or remote ref.
+Tools marked *dormant* are off by default; a project opts in by listing the
+matching capability in `projects.json`.
 
-Publication is a separate destructive call gated on the opt-in
-`push_development_commit` capability (which requires `verification_commit`).
-The supplied job ID, commit SHA, new branch name, base HEAD, and fingerprint
-must match exactly. The bridge confirms the commit is the one it created for
-that job, re-derives the fingerprint from the commit object, requires a used
-verification record for the exact evidence, rejects the default branch,
-`main`, and `master`, requires the remote branch not to exist, and pushes
-exactly that commit to `refs/heads/<branch>` on `origin` with no force flag. It
-never force-pushes, merges, tags, deletes, or moves another ref, and publishes
-one branch per job.
-
-Canonical-checkout synchronization is a separate destructive call gated on the
-opt-in `sync_canonical_checkout` capability (which requires
-`repository_read`). The supplied `expected_current_head` and `target_commit`
-must match exactly; the bridge requires the canonical checkout to be clean and
-on the repository default branch, fetches `origin`, resolves the default
-branch, and requires `target_commit` to equal the current
-`refs/remotes/origin/<default>` tip. It advances the local default branch with
-`git merge --ff-only <target_commit>`, so it never pushes, forces, creates a
-merge commit, tags, deletes, or moves a remote ref. It refuses while a
-non-terminal job exists and warns about completed-uncommitted jobs that lose
-their verify/commit path after the base moves.
-
-## Self-managed bridge candidates
-
-A `self_managed` project may enable `claude_edit` because development now occurs
-in an isolated worktree. It may not enable direct `markdown_write` against the
-production checkout.
-
-After a successful self-managed Claude run, the bridge starts the candidate's
-`server.py` with `MCP_HOST=127.0.0.1` and `MCP_PORT=CANDIDATE_MCP_PORT`, connects
-through MCP, and verifies the lifecycle tool surface. The candidate process is
-then stopped and its worktree retained. Candidate startup receives a minimal
-allowlisted environment without tokens, certificates, ngrok settings, or
-arbitrary production environment variables. A healthy result is a startup
-check, not deterministic project verification, and never promotes or restarts
-production.
-
-## Limits
-
-| Setting | Default | Purpose |
-|---|---:|---|
-| `CLAUDE_TIMEOUT_SECONDS` | 1,800 | Maximum Claude run time |
-| `CLAUDE_MAX_TURNS` | 30 | Default per-slice Claude turn limit |
-| `CLAUDE_SOFT_TURNS` | 30 | Soft warn at this cumulative turn count |
-| `CLAUDE_EXTENSION_TURNS` | 30 | Turns granted per in-place extension slice |
-| `CLAUDE_MAX_EXTENSIONS` | 3 | Maximum in-place extensions before pausing |
-| `CLAUDE_HARD_TURNS` | 120 | Absolute bridge-enforced cumulative turn cap |
-| `CLAUDE_MAX_NO_PROGRESS_TURNS` | 6 | Pause when the changed-path set is unchanged for this many turns |
-| `CLAUDE_MAX_TOOL_FAILURES` | 5 | Terminate as `failed_infrastructure` above this many tool failures |
-| `CLAUDE_CHECKPOINT_INTERVAL_SECONDS` | 30 | Progress-sampler cadence (seconds, may be fractional) |
-| `CLAUDE_CHECKPOINT_MAX` | 500 | Checkpoint count that triggers compaction |
-| `CLAUDE_STREAM_JSON` | off | Drive Claude with `--output-format stream-json --verbose` for real turn/tool counts |
-| `MAX_INPUT_CHARS` | 100,000 | Maximum job instruction length |
-| `MAX_OUTPUT_BYTES` | 2,097,152 | Maximum Claude stdout |
-| `MAX_MARKDOWN_FILE_BYTES` | 1,048,576 | Maximum reader file size |
-| `MAX_MARKDOWN_LIST_RESULTS` | 500 | Maximum Markdown listing results |
-| `MAX_MARKDOWN_SEARCH_RESULTS` | 100 | Maximum search results |
-| `MAX_MARKDOWN_RANGE_LINES` | 1,000 | Maximum lines per range read |
-| `MAX_MARKDOWN_WRITE_BYTES` | 1,048,576 | Maximum Markdown write/current size |
-| `MAX_MARKDOWN_DIFF_BYTES` | 262,144 | Maximum returned writer diff |
-| `READER_INJECTION_DEFENSE` | off | Fence + delimit untrusted repo content the reader ingests (prompt-injection defense) |
-| `GIT_COMMAND_TIMEOUT_SECONDS` | 30 | Maximum fixed Git command time |
-| `CANDIDATE_HEALTH_TIMEOUT_SECONDS` | 30 | Candidate startup/probe deadline |
-| `VERIFICATION_COMMAND_TIMEOUT_SECONDS` | 600 | Per-command verification deadline |
-| `MAX_VERIFICATION_OUTPUT_BYTES` | 1,048,576 | Captured stdout/stderr per stream |
-| `MAX_COMMIT_MESSAGE_CHARS` | 500 | Maximum approved commit message length |
-
-`MCP_PORT` defaults to `8000`; `CANDIDATE_MCP_PORT` defaults to `8001` and must
-differ. `JOB_WORKTREE_ROOT` defaults to
-`~/.local/state/local-dev-mcp/worktrees`.
+---
 
 ## Install
+
+Requires Python ≥ 3.11 and `git` on PATH.
 
 ```bash
 python3 -m venv .venv
@@ -267,49 +113,170 @@ cp projects.example.json projects.json
 chmod 600 .env projects.json
 ```
 
-Keep the real ngrok token only in `.env`. Review `projects.json` before startup.
-Only exact IDs and capabilities from that file can be used through MCP. Ensure
-`JOB_WORKTREE_ROOT` is outside every configured project root.
+- Put the real ngrok authtoken only in `.env`.
+- Review `projects.json` before startup — only exact IDs and capabilities from
+  that file are usable through MCP.
+- Ensure `JOB_WORKTREE_ROOT` is **outside** every configured project root.
+
+See [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) for a full end-to-end
+walkthrough, including registering a new project.
 
 ## Run
-
-Single command — starts the MCP server and the ngrok tunnel together, with
-prefixed logs (`[server]` / `[tunnel]`) and clean shutdown on Ctrl+C:
 
 ```bash
 ./run.sh
 ```
 
 `run.sh` activates `.venv`, validates `.env`, `projects.json`, and the mTLS CA,
-then launches `server.py` and `tunnel.py` as child processes. When
-`NGROK_DOMAIN` is set in `.env` (e.g. `swivel-aide-overprice.ngrok-free.dev`)
-the tunnel binds to that reserved domain for a stable connector URL; otherwise
-ngrok issues an ephemeral URL that changes every run.
+then launches `server.py` (FastMCP on `MCP_HOST:MCP_PORT`, default
+`127.0.0.1:8000`) and `tunnel.py` (ngrok) as child processes with prefixed logs
+(`[server]` / `[tunnel]`) and clean shutdown on Ctrl+C. When `NGROK_DOMAIN` is
+set in `.env`, the tunnel binds to that reserved domain for a stable connector
+URL; otherwise ngrok issues an ephemeral URL that changes every run.
 
-The two can also be run separately in two terminals:
+The connector URL is `https://<ngrok-domain>/mcp`. The ngrok endpoint is
+protected by the OpenAI connector mTLS CA (`openai-connectors-mtls-ca.pem`);
+Ollama is never exposed directly.
 
+The two halves can also run separately in two terminals:
 ```bash
-python server.py
-```
-
-```bash
+python server.py   # or: .venv/bin/python server.py
 python tunnel.py
 ```
 
-The connector URL remains `https://<ngrok-domain>/mcp`. The ngrok endpoint is
-protected by the OpenAI connector mTLS CA; Ollama is never exposed directly.
-
 ## Test
 
-Core tests have no network, model, ngrok, Ollama, or real-repository dependency:
+Core tests have no network, model, ngrok, Ollama, or real-repository
+dependency:
 
 ```bash
-PYTHONPATH=src python -m unittest discover -s tests -v
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 ```
 
-After the server is running, the separate live smoke test lists tools, checks a
-project, starts an isolated no-edit job, and polls its result:
+Once the server is running, a live smoke test lists tools, checks a project,
+starts an isolated no-edit job, and polls its result:
 
 ```bash
-python test_client.py --project cairn-knowledge-store
+.venv/bin/python test_client.py --project <project_id>
 ```
+
+---
+
+## Security model (summary)
+
+- The local registry (`projects.json`) is the **only** authorization source of
+  truth. Enforce authorization and validation in server code; never rely on
+  model instructions for security.
+- Tool callers provide stable `project_id`s and relative paths — never
+  filesystem roots, raw session IDs, executables, argv, environment, cwd, or
+  timeouts. Every command uses a fixed argv vector with `shell=True` forbidden.
+- Reject hidden paths, protected paths, traversal, and symlink escapes.
+- Claude Code may use `acceptEdits` only within its fixed project worktree;
+  Bash, web, secondary MCP tools, slash commands, and `bypassPermissions` are
+  disabled.
+- No tool may silently commit, push, merge, tag, delete, restart production, or
+  broaden its own permissions. The only push surface is opt-in
+  `push_development_commit`; the only local-checkout update surface is opt-in
+  `sync_canonical_checkout` (fast-forward only).
+- `.env`, tokens, certificates, `.venv`, caches, and `projects.json` never enter
+  Git or milestone archives.
+
+See [docs/SECURITY.md](docs/SECURITY.md) for the full non-negotiable boundary
+list and the threat model.
+
+---
+
+## Durable state
+
+Job and verification records persist to a single local SQLite database so a
+server restart no longer amnesiates in-flight or completed work:
+
+```
+JOB_WORKTREE_ROOT/.state/bridge.db        (file 0o600, dir 0o700)
+```
+
+The database uses WAL journaling with `synchronous=FULL` (each state transition
+commits crash-safely). On startup every manager re-hydrates its records
+synchronously before the event loop starts. Reconciliation is honest, not
+magical: a non-terminal job that was in progress when the previous process died
+is reloaded as `failed` (its asyncio task and Claude process are gone); a
+non-terminal job **with** checkpoints reloads as `paused_interrupted`
+(resumable). Unparseable rows are skipped (fail-closed); a database whose stored
+schema version is newer than this code is refused on open. Run only one bridge
+process per `JOB_WORKTREE_ROOT`. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+for the full schema and reconciliation rules.
+
+---
+
+## Configuration
+
+Runtime knobs live in `.env` (see `.env.example` for the full list with
+defaults). Project authorization lives in `projects.json` (see
+`projects.example.json` and [docs/CAPABILITIES.md](docs/CAPABILITIES.md)). The
+`mcp-servers.json` at the repo root is a convenience catalog of the MCP servers
+used in this development environment (not consumed by the bridge itself).
+
+| Setting | Default | Purpose |
+|---|---:|---|
+| `MCP_PORT` | 8000 | FastMCP HTTP listen port |
+| `CANDIDATE_MCP_PORT` | 8001 | Self-managed candidate probe port (must differ) |
+| `JOB_WORKTREE_ROOT` | `~/.local/state/local-dev-mcp/worktrees` | Private root for detached worktrees + `.state` |
+| `CLAUDE_MODEL` | `glm-5.2:cloud` | Underlying model for Claude Code jobs |
+| `CLAUDE_TIMEOUT_SECONDS` | 1800 | Maximum Claude run time |
+| `CLAUDE_HARD_TURNS` | 120 | Absolute cumulative turn cap |
+| `MAX_INPUT_CHARS` | 100,000 | Maximum job instruction length |
+| `READER_INJECTION_DEFENSE` | off | Fence + delimit untrusted repo content the reader ingests |
+
+The complete limit table (verification, runtime verification, working-tree
+capture, Markdown I/O, budgets) is in [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md#limits).
+
+---
+
+## Documentation
+
+Authoritative, newcomer-oriented docs live in [`docs/`](docs/README.md):
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — components, request flow, lifecycle, durable state, module map, threat model
+- [docs/TOOLS.md](docs/TOOLS.md) — full 32-tool reference
+- [docs/CAPABILITIES.md](docs/CAPABILITIES.md) — capability model and `projects.json` schema
+- [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) — install, configure a project, run, test end-to-end
+- [docs/SECURITY.md](docs/SECURITY.md) — security boundaries and non-negotiable rules
+- [docs/README.md](docs/README.md) — index of the milestone decision records and briefs
+
+`AGENTS.md` is the entry point for AI agents working on this repository,
+including the rule that **any change after a capability addition must be
+committed**.
+
+> The root-level `DEVELOPMENT_GUIDE.md` and `MANUAL_INSTALLATION_GUIDE.md`
+> describe a separate, exploratory RAG-augmentation effort (LightRAG /
+> RAG-Anything / tokengate). They are **not** documentation for the bridge
+> itself; the files above are.
+
+---
+
+## Project layout
+
+```
+server.py, tunnel.py, run.sh       entry points (server / ngrok tunnel / launcher)
+src/local_dev_mcp/                 the bridge (26 modules, ~15k lines)
+  server.py                        FastMCP tool surface (32 tools)
+  registry.py, models.py           project registry + capability/policy models
+  config.py                        Settings (env-driven)
+  jobs.py, claude.py                development-job lifecycle + Claude executor
+  verification.py, review.py        verify / review / commit
+  pr.py, sync.py, evidence.py      publication, canonical sync, evidence bundle
+  runtime_verification.py           governed host-runtime checks (MCPB-011)
+  working_tree_capture.py           dirty-tree candidate capture (MCPB-012)
+  open_hands_action.py              governed disposable runtime action
+  introspection.py                  read-only introspection (M-AL-01)
+  store.py                          durable SQLite state (20 tables)
+  reader.py, writer.py             bounded Markdown read/write
+  git.py, worktrees.py, candidate.py   git helpers / worktree mgmt
+  authorization.py, requirement.py  durable authorizations / requirement traceability
+tests/                             340+ unittest tests, no network/model deps
+docs/                              milestone decision records + this documentation set
+```
+
+The `LightRAG/`, `RAG-Anything/`, and `tokengate/` directories are vendored
+clones related to the exploratory RAG work noted above; they are not part of
+the bridge and are not tracked by this repository.
