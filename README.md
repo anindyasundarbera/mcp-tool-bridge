@@ -93,6 +93,24 @@ Job states are `queued`, `preparing_worktree`, `running`, optionally
 SQLite database (see [Durable state](#durable-state)) so a server restart
 re-hydrates them instead of wiping them.
 
+Runtime verification (opt-in `runtime_verification`, which requires
+`repository_read`):
+
+- `run_runtime_verification` runs one **policy-named** runtime check against the
+  project's clean canonical checkout at an exact expected HEAD and returns
+  content-addressed PASS/FAIL evidence. The caller supplies only the project
+  ID, the check ID (selecting a check defined in trusted local policy), and the
+  expected 40-hex HEAD — never an executable, argv, environment, working
+  directory, or timeout. No shell is involved; commands run via
+  `asyncio.create_subprocess_exec` and the bridge's full process environment is
+  not inherited. It is evidence-only: it never stages, commits, pushes, merges,
+  tags, opens a PR, moves a ref, or grants commit authority (its `rtv_`-prefixed
+  IDs live in a separate namespace from candidate verification IDs). It binds to
+  a clean checkout at exactly the expected HEAD (on the default branch where
+  BridgeLab knows it), uses read-only git only, and rechecks repository
+  immutability after execution — any drift fails the run with no auto-restore.
+  Output is bounded and redacted; rows persist to an additive audit table.
+
 ## Isolation rules
 
 Before a new job starts, the configured checkout must be a clean Git top level,

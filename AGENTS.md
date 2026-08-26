@@ -67,6 +67,7 @@ conversation.
 | MCPB-008 — Bounded publication | Opt-in `push_development_commit` capability and `push_detached_development_commit` tool: push exactly the verified detached commit to a new non-trunk remote branch on `origin`; no force/merge/tag/ref-move; one branch per job; fingerprint re-derived from the commit object. |
 | MCPB-009 — Canonical checkout synchronization | Opt-in `sync_canonical_checkout` capability and tool: fast-forward the guarded canonical checkout to exactly the verified current tip of `origin/<default>`; clean + default-branch + exact-expected-head required; `git merge --ff-only`; no push/force/merge-commit/tag/ref-move; additive `syncs` audit table; refuses while a non-terminal job exists, warns about completed-uncommitted jobs that lose verify/commit. |
 | MCPB-010 — Continuity release | Internal turn-level mission state: durable `job_checkpoints`/`job_events`/`job_progress` tables (additive, `SCHEMA_VERSION` stays 1); a `paused_*` family of `JobStatus` (resumable) plus `failed_infrastructure`/`quarantined_provenance` (terminal, non-resumable); crash-with-checkpoints → `paused_interrupted` instead of `failed`; soft/multi-dimensional/progress-gated budgets (`CLAUDE_SOFT_TURNS`/`CLAUDE_EXTENSION_TURNS`/`CLAUDE_MAX_EXTENSIONS`/`CLAUDE_HARD_TURNS`/`CLAUDE_MAX_NO_PROGRESS_TURNS`/`CLAUDE_MAX_TOOL_FAILURES`); in-place `--resume <session_id>` extension slices; checkpoint compaction; opt-in `CLAUDE_STREAM_JSON` turn counting; structured terminal report in `get_development_job`. Zero new MCP tools, parameters, or permissions. |
+| MCPB-011 — Governed host runtime verification | Opt-in `runtime_verification` capability (requires `repository_read`) and `run_runtime_verification` tool: execute one policy-named runtime check against the clean canonical checkout at an exact expected HEAD, no shell (`asyncio.create_subprocess_exec`), caller supplies only `project_id`/`check_id`/`expected_head` (never executable/argv/env/cwd/timeout); clean + exact-HEAD + default-branch binding, read-only git only; repository immutability rechecked post-execution (mutation → FAIL, no auto-restore); content-addressed evidence with `rtv_`-prefixed IDs that cannot authorize a commit; bounded/redacted output; additive `runtime_verifications` audit table. Evidence-only: no commit/push/merge/tag/ref-move. |
 
 The detailed sections below refine how to implement and verify these accepted
 items. They do not expand the authority of a phase. Supporting tests,
@@ -350,6 +351,57 @@ The prepared package version is `0.10.0`; 167 core tests pass (143 prior + 11
 new `test_claude` + 13 new `test_checkpoints`). It has not been committed,
 pushed, installed, restarted, or exercised against a live repository.
 
+### MCPB-011 — Governed host runtime verification (implemented locally; pending acceptance)
+
+Read this file completely before review or further implementation:
+
+- `docs/MCPB-011.md`
+
+The prepared MCPB-011 source adds one opt-in capability and one MCP tool for
+running checks that need host-runtime access (Docker daemon, loopback
+networking, host-managed services) against the canonical checkout:
+
+- a new `runtime_verification` capability (requires `repository_read`, like
+  `sync_canonical_checkout` and `export_evidence_bundle`), dormant by default;
+- a `RuntimeVerificationCommand` policy model with a fixed `argv` (validated,
+  shell executables rejected, `{python}` only as `argv[0]`), a small validated
+  `environment` (interpreter/loader injection keys forbidden, `PATH` allowed),
+  `execution_mode: "host"`, and an optional bounded `timeout_seconds`;
+- one tool `run_runtime_verification(project_id, check_id, expected_head)` whose
+  schema exposes **only** those three parameters — the caller can never supply
+  an executable, argv, env, cwd, timeout, or shell text; `check_id` is a
+  pattern-anchored lookup key that is never executed;
+- execution via `asyncio.create_subprocess_exec` (no `shell=True`/`bash -c`),
+  `start_new_session=True`, in a new process group (timeout kills the group
+  `SIGTERM`→`SIGKILL`), with a minimal deterministic environment plus policy
+  overrides (the bridge's full process env is **not** inherited — no
+  token/cert leakage);
+- canonical binding with **read-only git only** (never fetch/pull/merge/
+  checkout/switch/stash/clean): clean working tree, `HEAD == expected_head`,
+  and on the default branch where BridgeLab knows it; binding failures fail
+  closed before any subprocess is spawned;
+- repository immutability rechecked after execution — any HEAD/working-tree/
+  branch drift makes the run `status="failed"` with `repository.mutated=true`,
+  no auto-restore, no PASS;
+- content-addressed evidence: `rtv_`-prefixed IDs (a separate namespace from the
+  candidate `verification_id` pattern, so a runtime ID can never authorize a
+  commit), a `policy_fingerprint` and a deterministic `evidence_fingerprint`,
+  bounded/redacted stdout/stderr with hashes over the redacted text (not a
+  secret-confirmation oracle), and `_redact` plus long-policy-env-value
+  redaction; the absolute project root never appears;
+- one additive `runtime_verifications` audit table in `bridge.db` (both PASS
+  and bounded FAIL rows persisted, re-hydrated on restart); `SCHEMA_VERSION`
+  stays 1, existing databases upgrade in place;
+- evidence-only: a successful runtime check never stages, commits, pushes,
+  merges, tags, opens a PR, moves a ref, modifies policy, or enables a
+  capability.
+
+The prepared source adds 26 new `test_runtime_verification` tests and bumps
+the tool-count canaries in `test_server`/`test_checkpoints`/`test_persistence`
+from 28 to 29; 312 tests pass. It has not been committed, pushed, installed,
+restarted, or exercised against a live Docker host (the unit suite uses
+self-contained `{python}` scripts so it runs without Docker).
+
 ## Non-negotiable security boundaries
 
 - OpenAI connector mTLS protects the public ngrok endpoint.
@@ -370,6 +422,13 @@ pushed, installed, restarted, or exercised against a live repository.
   `push_development_commit` capability: an explicit, human-approved,
   non-silent push of one verified detached commit to a new non-trunk branch on
   `origin`, never a force-push, merge, tag, trunk update, or ref move.
+- The opt-in `runtime_verification` capability is evidence-only: it runs one
+  policy-named check against the canonical checkout and never grants commit
+  authority. The MCP caller may supply only `project_id`, `check_id`, and
+  `expected_head` — never an executable, argv, environment, working directory,
+  timeout, or shell text; there is no `run_command`/`exec`/`shell`/`bash`
+  surface. Commands execute directly with `asyncio.create_subprocess_exec`
+  (no shell) and the bridge's full process environment is not inherited.
 - The running bridge must not directly edit its production checkout. Its own
   changes require the MCPB-004 candidate-worktree workflow.
 - `.env`, tokens, certificates, credentials, virtual environments, caches, and
