@@ -46,6 +46,30 @@ def policy(root: Path, **overrides: object) -> ProjectPolicy:
     return ProjectPolicy.model_validate(data)
 
 
+def policy_with_commands(
+    root: Path,
+    commands: list[dict[str, object]],
+) -> ProjectPolicy:
+    """Build a project with verification_commit + named verification commands.
+
+    Mirrors the project shape used by ``test_checkpoints.py``'s tool-surface
+    canary so the milestone acceptance-command branch can be exercised against
+    real ``_run_command`` invocations (``{python}`` → ``sys.executable``, no
+    network, no shell).
+    """
+    return policy(
+        root,
+        capabilities=[
+            "repository_read",
+            "claude_edit",
+            "verification_commit",
+        ],
+        commit_roots=["."],
+        verification_commands=commands,
+        protected_paths=[".git", ".env"],
+    )
+
+
 class BlockedInputExecutor:
     """Returns a structured 'input required' signal on its first call."""
 
@@ -224,6 +248,11 @@ class MCTJobTests(unittest.TestCase):
             )
             self.assertEqual(snapshot["milestones"][0]["closed"], True)
             self.assertIn("closed_at", snapshot["milestones"][0])
+            # M-CT-04: the terminal report partitions by closure.
+            self.assertEqual(len(snapshot["completed_milestones"]), 1)
+            self.assertEqual(snapshot["completed_milestones"][0]["id"], "m1")
+            self.assertTrue(snapshot["completed_milestones"][0]["closed"])
+            self.assertEqual(len(snapshot["remaining_milestones"]), 0)
 
         asyncio.run(exercise())
 
@@ -244,6 +273,139 @@ class MCTJobTests(unittest.TestCase):
                 manager, self.project, job_id, {"completed"}
             )
             self.assertNotIn("closed", snapshot["milestones"][0])
+            # M-CT-04: the unclosed milestone surfaces as remaining.
+            self.assertEqual(len(snapshot["remaining_milestones"]), 1)
+            self.assertEqual(snapshot["remaining_milestones"][0]["id"], "m1")
+            self.assertFalse(snapshot["remaining_milestones"][0]["closed"])
+            self.assertEqual(len(snapshot["completed_milestones"]), 0)
+
+        asyncio.run(exercise())
+
+    def test_milestone_closes_when_acceptance_command_passes(self) -> None:
+        """M-CT-04: a passing acceptance command closes the milestone and it
+        appears in ``completed_milestones`` (not ``remaining_milestones``)."""
+
+        async def exercise() -> None:
+            project = policy_with_commands(
+                self.root,
+                [
+                    {
+                        "id": "accept",
+                        "argv": ["{python}", "-c", "import sys; sys.exit(0)"],
+                    }
+                ],
+            )
+            executor = MilestoneExecutor("docs/feature.md")
+            manager = DevelopmentJobManager(
+                self.settings, self.locks, executor, projects=(project,)
+            )
+            milestone = {
+                "id": "m1",
+                "title": "Feature docs",
+                "acceptance_paths": ["docs/feature.md"],
+                "acceptance_command_id": "accept",
+            }
+            started = await manager.start(project, "work", "high")
+            job_id = str(started["job_id"])
+            manager._jobs[job_id].milestones = [milestone]
+            snapshot = await wait_for_status(
+                manager, project, job_id, {"completed"}
+            )
+            # The milestone closed and is partitioned into completed.
+            self.assertTrue(snapshot["milestones"][0].get("closed"))
+            self.assertEqual(len(snapshot["completed_milestones"]), 1)
+            self.assertEqual(snapshot["completed_milestones"][0]["id"], "m1")
+            self.assertTrue(snapshot["completed_milestones"][0]["closed"])
+            self.assertIn(
+                "closed_at", snapshot["completed_milestones"][0]
+            )
+            self.assertEqual(len(snapshot["remaining_milestones"]), 0)
+            # The redacted summary must not leak acceptance wiring.
+            self.assertNotIn(
+                "acceptance_paths", snapshot["completed_milestones"][0]
+            )
+            self.assertNotIn(
+                "acceptance_command_id", snapshot["completed_milestones"][0]
+            )
+
+        asyncio.run(exercise())
+
+    def test_milestone_stays_open_when_acceptance_command_fails(self) -> None:
+        """M-CT-04: a failing acceptance command leaves the milestone open and
+        it appears in ``remaining_milestones`` (not ``completed_milestones``)."""
+
+        async def exercise() -> None:
+            project = policy_with_commands(
+                self.root,
+                [
+                    {
+                        "id": "accept",
+                        "argv": ["{python}", "-c", "import sys; sys.exit(1)"],
+                    }
+                ],
+            )
+            executor = MilestoneExecutor("docs/feature.md")
+            manager = DevelopmentJobManager(
+                self.settings, self.locks, executor, projects=(project,)
+            )
+            milestone = {
+                "id": "m1",
+                "title": "Feature docs",
+                "acceptance_paths": ["docs/feature.md"],
+                "acceptance_command_id": "accept",
+            }
+            started = await manager.start(project, "work", "high")
+            job_id = str(started["job_id"])
+            manager._jobs[job_id].milestones = [milestone]
+            snapshot = await wait_for_status(
+                manager, project, job_id, {"completed"}
+            )
+            # The command failed, so the milestone did not close.
+            self.assertNotIn("closed", snapshot["milestones"][0])
+            self.assertEqual(len(snapshot["remaining_milestones"]), 1)
+            self.assertEqual(snapshot["remaining_milestones"][0]["id"], "m1")
+            self.assertFalse(snapshot["remaining_milestones"][0]["closed"])
+            self.assertEqual(len(snapshot["completed_milestones"]), 0)
+
+        asyncio.run(exercise())
+
+    def test_milestone_stays_open_when_acceptance_command_id_unknown(self) -> None:
+        """M-CT-04: an unknown ``acceptance_command_id`` leaves the milestone
+        open (no fabricated acceptance) and it appears in
+        ``remaining_milestones``."""
+
+        async def exercise() -> None:
+            project = policy_with_commands(
+                self.root,
+                [
+                    {
+                        "id": "accept",
+                        "argv": ["{python}", "-c", "import sys; sys.exit(0)"],
+                    }
+                ],
+            )
+            executor = MilestoneExecutor("docs/feature.md")
+            manager = DevelopmentJobManager(
+                self.settings, self.locks, executor, projects=(project,)
+            )
+            milestone = {
+                "id": "m1",
+                "title": "Feature docs",
+                "acceptance_paths": ["docs/feature.md"],
+                "acceptance_command_id": "nonexistent",
+            }
+            started = await manager.start(project, "work", "high")
+            job_id = str(started["job_id"])
+            manager._jobs[job_id].milestones = [milestone]
+            snapshot = await wait_for_status(
+                manager, project, job_id, {"completed"}
+            )
+            # The command id is unknown, so the milestone did not close.
+            self.assertNotIn("closed", snapshot["milestones"][0])
+            self.assertEqual(len(snapshot["remaining_milestones"]), 1)
+            self.assertEqual(snapshot["remaining_milestones"][0]["id"], "m1")
+            self.assertFalse(snapshot["remaining_milestones"][0]["closed"])
+            self.assertEqual(len(snapshot["completed_milestones"]), 0)
 
         asyncio.run(exercise())
 

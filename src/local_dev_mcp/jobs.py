@@ -153,6 +153,27 @@ def _redact(value: Any, paths: tuple[Path, ...]) -> Any:
     return value
 
 
+def _milestone_summary(milestone: dict[str, Any]) -> dict[str, Any]:
+    """Return a stable, redacted summary of one milestone (M-CT-04).
+
+    The terminal report partitions milestones by closure into
+    ``completed_milestones`` / ``remaining_milestones``. Each entry exposes only
+    the safe identity/closure fields (``id``, ``title``, ``closed`` and, when
+    closed, ``closed_at``) — never the ``acceptance_paths`` or
+    ``acceptance_command_id`` (which are policy/verification wiring, not report
+    data). The flat ``milestones`` field is kept for back-compat.
+    """
+    summary: dict[str, Any] = {
+        "id": milestone.get("id"),
+        "title": milestone.get("title"),
+        "closed": bool(milestone.get("closed")),
+    }
+    closed_at = milestone.get("closed_at")
+    if closed_at is not None:
+        summary["closed_at"] = closed_at
+    return summary
+
+
 @dataclass(slots=True)
 class DevelopmentJob:
     job_id: str
@@ -805,6 +826,22 @@ class DevelopmentJobManager:
             "checkpoint_count": store.checkpoint_count(self._db, job.job_id),
             "milestones": list(job.milestones) if job.milestones else [],
         }
+        # M-CT-04: partition milestones by closure for the terminal report.
+        # ``completed_milestones`` / ``remaining_milestones`` are additive to
+        # the flat ``milestones`` field (kept for back-compat) and surface only
+        # stable, redacted summaries (id/title/closed) — never acceptance paths
+        # or command ids. An empty milestone list yields empty partitions.
+        milestones = job.milestones or []
+        snapshot["completed_milestones"] = [
+            _milestone_summary(milestone)
+            for milestone in milestones
+            if milestone.get("closed")
+        ]
+        snapshot["remaining_milestones"] = [
+            _milestone_summary(milestone)
+            for milestone in milestones
+            if not milestone.get("closed")
+        ]
         if job.parent_job_id is not None:
             snapshot["parent_job_id"] = job.parent_job_id
         if job.delegation_mandate is not None:
