@@ -283,7 +283,7 @@ authoritative input to the implementation order in "Recommended next action".
 | M-EV-04 | Review content-addressing + revision→finding links | DONE | — (store.review_content sidecar with verdict_hash = SHA-256 over verdict + base_head + diff_fingerprint + sorted paths; store.revision_resolves_finding table; review.py compute_verdict_hash + ReviewRecord.verdict_hash + _persist_review/_reload_reviews wire the sidecar; jobs.py record_revision_resolves_findings records non-fatal revision→finding links; ReviewManager.get_review_closure_chain queryable chain; tests/test_review.py M-EV-04 cases) |
 | M-EV-05 | Source classifications + authority-behind-instructions | DONE | — (source_classifications + authority_records tables, seeded vocabulary, _record_event stamps authority_ref; tests) |
 | M-EV-06 | Portable evidence bundle export | DONE | — (NEW SURFACE shipped earlier: `ProjectCapability.EXPORT_EVIDENCE_BUNDLE` + `export_evidence_bundle` tool; this commit closes the audit gap: `RequirementManager` coverage section wired into `EvidenceBundleManager.export_bundle` via lazy `jobs._requirements_manager()`; explicit `.env`/`.venv`/token/cert/`.pem`/`.key`/secrets/`.aws`/`.ssh` exclude filter on changed_paths + diff detail with `sensitive_excluded_count`; non-fatal requirement section; tests/test_evidence_bundle.py SensitivePathFilterTests + coverage cases; zip serialization deferred as optional) |
-| M-EV-07 | Nondeterminism detection + deterministic replay | PARTIAL | Compute+persist env digest into `verifications` row (additive `env_digest` column + VerificationRecord field); (optional) per-command digests; replay tool deferred. |
+| M-EV-07 | Nondeterminism detection + deterministic replay | DONE | — (verification.py:verify runs each command `verification_deterministic_repetitions` times and labels divergence via `_commands_diverge` comparing status/exit_code/stderr → `nondeterminism_labeled` + `infrastructure_status=DEGRADED`; `compute_environment_digest` + per-command `command_digest` (M-EV-02) persisted; tests/test_verification.py M-EV-07 flaky + deterministic-control cases; `replay_verification` NEW-SURFACE tool intentionally deferred — no new surface shipped here) |
 | M-EV-08 | Artifact retention + GC policy | PARTIAL | Add `EVIDENCE_RETENTION_DAYS`/`CHECKPOINT_RETENTION` settings; `store.gc_artifacts` deletes non-promoted checkpoint+detail rows older than retention, never verifications/reviews/publications/syncs; tests. |
 | M-GV-01 | Durable authorization objects | PARTIAL | Wire `AuthorizationManager` into commit/push/review/export handlers (require unused unexpired project+capability+target authz, mark used in SAME ACID txn); opt-in Settings flag; handler-integration tests; confirm runtime instantiation. |
 | M-GV-02 | Named roles Planner / Evidence-officer / Supervisor | PARTIAL | Implement `build_planner_command`/`build_evidence_officer_command`/`build_supervisor_command` (read-only, Read/Glob/Grep only); wire as capability-gated invocations; tests/test_roles.py. |
@@ -600,17 +600,26 @@ capability are flagged **NEW SURFACE**.
   only when opted in.
 
 #### M-EV-07 Nondeterminism detection + deterministic replay
-- **Status:** PARTIAL. **Evidence:** fingerprints are deterministic
-  (`verification.py:_candidate_state`); no nondeterminism detection or replay.
+- **Status:** DONE. **Evidence:** `verification.py:verify` runs each
+  verification command `verification_deterministic_repetitions` times and
+  compares runs via `_commands_diverge` (status / exit_code / stderr); a
+  divergence sets `nondeterminism_labeled=True` and
+  `infrastructure_status="DEGRADED"` in the structured result. The deterministic
+  case (`infrastructure_status="HEALTHY"`, `nondeterminism_labeled=False`) is
+  covered at repetitions=1 (M-EV-02 test) and, with this milestone, at
+  repetitions=2 as the explicit deterministic control.
 - **Build:** `verification.py:verify` — run a command's declared deterministic
   subset `deterministic_repetitions` times (M-CC-09); if results diverge, set
   `infrastructure_status=DEGRADED` and `nondeterminism_labeled=True` in the
   structured result. Replay: persist enough (env digest + command digests +
   base commit) to re-run offline; a read-only `replay_verification` is **NEW
-  SURFACE** (defer unless needed).
-- **Tests:** `tests/test_verification.py` — a flaky command is labeled; a
-  deterministic one is not. **Acceptance:** nondeterministic verification is
-  honestly labeled in the structured result.
+  SURFACE** and remains intentionally deferred (not implemented in this
+  milestone; no new surface shipped).
+- **Tests:** `tests/test_verification.py` — `test_flaky_command_is_labeled_nondeterministic`
+  (stderr diverges across 2 runs → labeled + DEGRADED) and
+  `test_deterministic_command_not_labeled_at_repetitions_two` (identical runs at
+  repetitions=2 → not labeled + HEALTHY). **Acceptance:** nondeterministic
+  verification is honestly labeled in the structured result.
 
 #### M-EV-08 Artifact retention + GC policy
 - **Status:** PARTIAL. **Evidence:** `store.py:505-538` `compact_checkpoints`

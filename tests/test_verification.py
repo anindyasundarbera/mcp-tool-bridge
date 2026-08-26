@@ -638,6 +638,100 @@ class VerificationCommitTests(unittest.TestCase):
         self.assertEqual(result["infrastructure_status"], "HEALTHY")
         self.assertFalse(result["nondeterminism_labeled"])
 
+    # -- M-EV-07: nondeterminism detection ---------------------------------
+
+    def _settings_with_repetitions(self, repetitions: int) -> Settings:
+        return Settings.from_env(
+            {
+                "PROJECTS_CONFIG_PATH": str(self.base / "projects.json"),
+                "JOB_WORKTREE_ROOT": str(self.base / "jobs"),
+                "VERIFICATION_COMMAND_TIMEOUT_SECONDS": "2",
+                "MAX_VERIFICATION_OUTPUT_BYTES": "64",
+                "VERIFICATION_DETERMINISTIC_REPETITIONS": str(repetitions),
+            }
+        )
+
+    async def _verify_with_fake_runner(
+        self,
+        settings: Settings,
+        sequence: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Run verify() with ``_run_command`` patched to return the given
+        sequence of result dicts (cycled per call). No real subprocess runs."""
+        policy = project(self.root, ["{python}", "-c", "pass"])
+        locks = ProjectLockManager()
+        jobs = DevelopmentJobManager(
+            settings,
+            locks,
+            EditingExecutor(
+                lambda root: (root / "candidate.txt").write_text(
+                    "candidate", encoding="utf-8"
+                )
+            ),  # type: ignore[arg-type]
+            projects=(policy,),
+        )
+        manager = VerificationCommitManager(settings, locks, jobs, projects=(policy,))
+        started = await jobs.start(policy, "make candidate", "high")
+        completed = await wait_completed(jobs, policy, str(started["job_id"]))
+
+        calls = {"count": 0}
+
+        async def fake_run_command(
+            _settings: Settings, _worktree: Any, command: Any
+        ) -> dict[str, Any]:
+            result = dict(sequence[calls["count"] % len(sequence)])
+            result["command_id"] = command.id
+            calls["count"] += 1
+            return result
+
+        with patch.object(verification_module, "_run_command", new=fake_run_command):
+            return await manager.verify(
+                policy,
+                str(completed["job_id"]),
+                str(completed["base_head"]),
+            )
+
+    def test_flaky_command_is_labeled_nondeterministic(self) -> None:
+        """M-EV-07: a command whose stderr differs across repetitions is
+        labeled nondeterministic and degrades infrastructure_status.
+
+        ``_commands_diverge`` compares status, exit_code, and stderr text; we
+        diverge stderr (a real flake signal) while keeping both runs passing,
+        proving the labeling is independent of pass/fail status.
+        """
+        settings = self._settings_with_repetitions(2)
+        sequence = [
+            {"status": "passed", "exit_code": 0, "stdout": "ok", "stderr": "ok"},
+            {"status": "passed", "exit_code": 0, "stdout": "ok", "stderr": "boom"},
+        ]
+
+        async def exercise() -> dict[str, Any]:
+            return await self._verify_with_fake_runner(settings, sequence)
+
+        result = asyncio.run(exercise())
+        self.assertEqual(result["deterministic_repetitions"], 2)
+        self.assertTrue(result["nondeterminism_labeled"])
+        self.assertEqual(result["infrastructure_status"], "DEGRADED")
+
+    def test_deterministic_command_not_labeled_at_repetitions_two(self) -> None:
+        """M-EV-07: with repetitions >= 2, a command that returns identical
+        output every run is NOT labeled nondeterministic (HEALTHY). This is
+        the explicit deterministic control at the same repetition count as
+        the flaky case, so the contrast is proven."""
+        settings = self._settings_with_repetitions(2)
+        sequence = [
+            {"status": "passed", "exit_code": 0, "stdout": "ok", "stderr": "ok"},
+            {"status": "passed", "exit_code": 0, "stdout": "ok", "stderr": "ok"},
+        ]
+
+        async def exercise() -> dict[str, Any]:
+            return await self._verify_with_fake_runner(settings, sequence)
+
+        result = asyncio.run(exercise())
+        self.assertEqual(result["deterministic_repetitions"], 2)
+        self.assertFalse(result["nondeterminism_labeled"])
+        self.assertEqual(result["infrastructure_status"], "HEALTHY")
+
     def test_environment_digest_stable_across_identical_env_runs(self) -> None:
         """M-EV-02: the digest is stable across two identical-env runs."""
         async def exercise() -> tuple[str, str]:
