@@ -681,6 +681,7 @@ class CheckpointStoreTests(unittest.TestCase):
                 self.assertIn("tool_failures", columns)
                 self.assertIn("parent_job_id", columns)
                 self.assertIn("delegation_mandate_json", columns)
+                self.assertIn("wall_seconds_used", columns)
                 # The progress upsert that crashed on the live server now works.
                 upsert_progress_row(
                     connection,
@@ -693,6 +694,7 @@ class CheckpointStoreTests(unittest.TestCase):
                         "no_progress_turns": 0,
                         "tool_failures": 0,
                         "soft_warned": 0,
+                        "wall_seconds_used": 0.0,
                         "milestones_json": None,
                         "parent_job_id": None,
                         "delegation_mandate_json": None,
@@ -721,6 +723,7 @@ class CheckpointStoreTests(unittest.TestCase):
                         "no_progress_turns": 0,
                         "tool_failures": 1,
                         "soft_warned": 0,
+                        "wall_seconds_used": 1.5,
                         "milestones_json": None,
                         "parent_job_id": None,
                         "delegation_mandate_json": None,

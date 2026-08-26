@@ -410,5 +410,268 @@ class MCTJobTests(unittest.TestCase):
         asyncio.run(exercise())
 
 
+class WallTimeBudgetExecutor:
+    """Returns a max_turns slice with a large ``wall_seconds`` so the cumulative
+    wall-time ceiling trips across multiple slices.
+
+    Each call writes a new file so the progress-gated extension path keeps the
+    slice loop alive (the job must not pause on no-progress before the wall
+    ceiling fires). The executor reports ``wall_seconds`` directly so the test
+    is deterministic and does not depend on real elapsed time.
+    """
+
+    def __init__(self, wall_seconds: float, num_turns: int = 5) -> None:
+        self.wall_seconds = wall_seconds
+        self.num_turns = num_turns
+        self.calls: list[dict[str, Any]] = []
+
+    async def execute(
+        self,
+        project: ProjectPolicy,
+        specification: str,
+        effort: Effort,
+        *,
+        root: Path | None = None,
+        resume_session_id: str | None = None,
+        max_turns: int | None = None,
+    ) -> dict[str, Any]:
+        assert root is not None
+        n = len(self.calls) + 1
+        self.calls.append({"root": root, "resume_session_id": resume_session_id})
+        (root / f"step{n}.txt").write_text(f"step {n}\n", encoding="utf-8")
+        return {
+            "status": "failed",
+            "terminal_reason": "max_turns",
+            "num_turns": self.num_turns,
+            "session_id": "bridge-session-wall",
+            "result": f"slice {n}",
+            "wall_seconds": self.wall_seconds,
+        }
+
+
+class MonotonicWallExecutor:
+    """Sleeps briefly so the ``time.monotonic()`` fallback in ``_run`` measures
+    real elapsed wall-time (the executor reports NO ``wall_seconds``)."""
+
+    def __init__(self, delay: float, num_turns: int = 5) -> None:
+        self.delay = delay
+        self.num_turns = num_turns
+        self.calls: list[dict[str, Any]] = []
+
+    async def execute(
+        self,
+        project: ProjectPolicy,
+        specification: str,
+        effort: Effort,
+        *,
+        root: Path | None = None,
+        resume_session_id: str | None = None,
+        max_turns: int | None = None,
+    ) -> dict[str, Any]:
+        assert root is not None
+        n = len(self.calls) + 1
+        self.calls.append({"root": root, "resume_session_id": resume_session_id})
+        (root / f"step{n}.txt").write_text(f"step {n}\n", encoding="utf-8")
+        await asyncio.sleep(self.delay)
+        return {
+            "status": "failed",
+            "terminal_reason": "max_turns",
+            "num_turns": self.num_turns,
+            "session_id": "bridge-session-monotonic",
+            "result": f"slice {n}",
+        }
+
+
+def wall_settings(base: Path, **env: str) -> Settings:
+    payload = {
+        "PROJECTS_CONFIG_PATH": str(base / "projects.json"),
+        "JOB_WORKTREE_ROOT": str(base / "jobs"),
+        "CANDIDATE_MCP_PORT": "9101",
+    }
+    payload.update(env)
+    return Settings.from_env(payload)
+
+
+class MCT02WallTimeBudgetTests(unittest.TestCase):
+    """M-CT-02: cumulative wall-time budget + compute-proxy.
+
+    These tests exercise the cumulative wall-time ceiling with fake executors
+    (no real Claude, no network), mirroring the patterns in
+    ``test_checkpoints.py``.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        initialize_git_repository(self.root)
+        self.locks = ProjectLockManager()
+        self.project = policy(self.root)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_cumulative_wall_ceiling_pauses_with_wall_reason(self) -> None:
+        """A fake executor reporting large ``wall_seconds`` trips the
+        cumulative ceiling across multiple slices and pauses as
+        PAUSED_BUDGET_EXHAUSTED with the wall pause_reason."""
+
+        async def exercise() -> None:
+            # 60s per slice, 100s ceiling → after 2 slices (120s) the ceiling
+            # fires. Keep hard_turns/no-progress high so only the wall ceiling
+            # can terminate the run.
+            settings = wall_settings(
+                self.base,
+                CLAUDE_HARD_WALL_SECONDS="100",
+                CLAUDE_HARD_TURNS="1000",
+                CLAUDE_MAX_NO_PROGRESS_TURNS="100",
+                CLAUDE_MAX_EXTENSIONS="10",
+            )
+            executor = WallTimeBudgetExecutor(wall_seconds=60.0, num_turns=5)
+            manager = DevelopmentJobManager(
+                settings, self.locks, executor  # type: ignore[arg-type]
+            )
+            started = await manager.start(self.project, "work", "high")
+            job_id = str(started["job_id"])
+            paused = await wait_for_status(
+                manager,
+                self.project,
+                job_id,
+                {"paused_budget_exhausted"},
+            )
+            self.assertEqual(paused["status"], "paused_budget_exhausted")
+            self.assertEqual(
+                paused["pause_reason"], "cumulative_wall_budget_exhausted"
+            )
+            # Wall-time accumulated monotonically across slices.
+            self.assertGreaterEqual(
+                paused["budget"]["wall_seconds_used"], 100.0
+            )
+            self.assertEqual(paused["budget"]["hard_wall_seconds"], 100)
+            # At least two slices ran before the ceiling fired.
+            self.assertGreaterEqual(len(executor.calls), 2)
+
+        asyncio.run(exercise())
+
+    def test_wall_time_accumulates_monotonically_across_slices(self) -> None:
+        """A multi-slice run accumulates wall-time monotonically; the snapshot
+        exposes a non-decreasing ``wall_seconds_used`` that grows per slice."""
+
+        async def exercise() -> None:
+            # High ceiling so the job pauses on hard_turns (not wall), letting
+            # us observe accumulation across several slices.
+            settings = wall_settings(
+                self.base,
+                CLAUDE_HARD_WALL_SECONDS="100000",
+                CLAUDE_HARD_TURNS="40",
+                CLAUDE_MAX_NO_PROGRESS_TURNS="100",
+                CLAUDE_MAX_EXTENSIONS="10",
+            )
+            executor = WallTimeBudgetExecutor(wall_seconds=10.0, num_turns=20)
+            manager = DevelopmentJobManager(
+                settings, self.locks, executor  # type: ignore[arg-type]
+            )
+            started = await manager.start(self.project, "work", "high")
+            job_id = str(started["job_id"])
+            paused = await wait_for_status(
+                manager,
+                self.project,
+                job_id,
+                {"paused_budget_exhausted"},
+            )
+            # Multiple slices ran (extension-granted), wall-time grew.
+            self.assertGreaterEqual(len(executor.calls), 2)
+            self.assertGreaterEqual(
+                paused["budget"]["wall_seconds_used"], 20.0
+            )
+            # Each slice reported exactly 10s; cumulative is a whole multiple.
+            self.assertEqual(
+                paused["budget"]["wall_seconds_used"],
+                10.0 * len(executor.calls),
+            )
+
+        asyncio.run(exercise())
+
+    def test_disabled_ceiling_never_pauses_on_wall_time(self) -> None:
+        """A job under a zero/disabled ceiling never pauses on wall-time,
+        even when the executor reports large ``wall_seconds``. The default
+        (unset) ceiling is 0, so existing projects are unaffected."""
+
+        async def exercise() -> None:
+            # No CLAUDE_HARD_WALL_SECONDS → 0 (disabled). The job pauses on
+            # hard_turns, NOT on wall-time.
+            settings = wall_settings(
+                self.base,
+                CLAUDE_HARD_TURNS="40",
+                CLAUDE_MAX_NO_PROGRESS_TURNS="100",
+                CLAUDE_MAX_EXTENSIONS="10",
+            )
+            self.assertEqual(settings.claude_hard_wall_seconds, 0)
+            executor = WallTimeBudgetExecutor(
+                wall_seconds=99999.0, num_turns=20
+            )
+            manager = DevelopmentJobManager(
+                settings, self.locks, executor  # type: ignore[arg-type]
+            )
+            started = await manager.start(self.project, "work", "high")
+            job_id = str(started["job_id"])
+            paused = await wait_for_status(
+                manager,
+                self.project,
+                job_id,
+                {"paused_budget_exhausted"},
+            )
+            self.assertEqual(paused["status"], "paused_budget_exhausted")
+            # The pause reason is the hard-turn cap, NOT the wall ceiling.
+            self.assertIn("hard turn cap", str(paused["pause_reason"]))
+            self.assertNotEqual(
+                paused["pause_reason"], "cumulative_wall_budget_exhausted"
+            )
+            # Wall-time was still accumulated (just not ceiling-checked).
+            self.assertGreater(
+                paused["budget"]["wall_seconds_used"], 0.0
+            )
+            self.assertEqual(paused["budget"]["hard_wall_seconds"], 0)
+
+        asyncio.run(exercise())
+
+    def test_monotonic_fallback_measures_wall_time(self) -> None:
+        """An executor that reports NO ``wall_seconds`` still accumulates
+        wall-time via the ``time.monotonic()`` fallback in ``_run``."""
+
+        async def exercise() -> None:
+            # 0.6s per slice, 1s ceiling → after 2 slices (1.2s) the ceiling
+            # fires. Plenty of extension budget so the wall ceiling trips first.
+            settings = wall_settings(
+                self.base,
+                CLAUDE_HARD_WALL_SECONDS="1",
+                CLAUDE_HARD_TURNS="1000",
+                CLAUDE_MAX_NO_PROGRESS_TURNS="100",
+                CLAUDE_MAX_EXTENSIONS="100",
+            )
+            executor = MonotonicWallExecutor(delay=0.6, num_turns=5)
+            manager = DevelopmentJobManager(
+                settings, self.locks, executor  # type: ignore[arg-type]
+            )
+            started = await manager.start(self.project, "work", "high")
+            job_id = str(started["job_id"])
+            paused = await wait_for_status(
+                manager,
+                self.project,
+                job_id,
+                {"paused_budget_exhausted"},
+            )
+            self.assertEqual(paused["status"], "paused_budget_exhausted")
+            self.assertEqual(
+                paused["pause_reason"], "cumulative_wall_budget_exhausted"
+            )
+            # The monotonic fallback measured real elapsed time (> 0).
+            self.assertGreater(
+                paused["budget"]["wall_seconds_used"], 0.0
+            )
+
+        asyncio.run(exercise())
+
+
 if __name__ == "__main__":
     unittest.main()

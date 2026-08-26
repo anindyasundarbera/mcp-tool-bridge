@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import stat
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -215,6 +216,10 @@ class DevelopmentJob:
     no_progress_turns: int = 0
     tool_failures: int = 0
     soft_warned: bool = False
+    # M-CT-02: cumulative wall-time across all slices (seconds). Persisted in
+    # the ``job_progress`` sidecar (additive REAL column) so it round-trips
+    # across restart. Bounded by the ``claude_hard_wall_seconds`` ceiling.
+    wall_seconds_used: float = 0.0
     milestones: list[dict[str, Any]] | None = None
     # M-CT-01: an optional fetched/pinned base commit the worktree was created
     # from (``origin/<default>`` tip), rather than the local canonical HEAD.
@@ -458,6 +463,7 @@ class DevelopmentJobManager:
             "no_progress_turns": job.no_progress_turns,
             "tool_failures": job.tool_failures,
             "soft_warned": 1 if job.soft_warned else 0,
+            "wall_seconds_used": job.wall_seconds_used,
             "milestones_json": _json_dumps(job.milestones),
             "parent_job_id": job.parent_job_id,
             "delegation_mandate_json": _json_dumps(job.delegation_mandate),
@@ -480,6 +486,7 @@ class DevelopmentJobManager:
             job.extensions_granted = int(row.get("extensions_granted", 0))
             job.no_progress_turns = int(row.get("no_progress_turns", 0))
             job.tool_failures = int(row.get("tool_failures", 0))
+            job.wall_seconds_used = float(row.get("wall_seconds_used", 0.0) or 0.0)
         except (TypeError, ValueError):
             return
         job.soft_warned = bool(row.get("soft_warned", 0))
@@ -774,8 +781,32 @@ class DevelopmentJobManager:
         except asyncio.CancelledError:
             pass
 
-    def _absorb_result_budget(self, job: DevelopmentJob, result: dict[str, Any]) -> None:
-        """Accumulate one executor slice's turn/token/tool-failure counts."""
+    def _absorb_result_budget(
+        self,
+        job: DevelopmentJob,
+        result: dict[str, Any],
+        *,
+        slice_wall_seconds: float = 0.0,
+    ) -> None:
+        """Accumulate one executor slice's budget counters.
+
+        Turns, tokens, and tool-failures come from the executor result dict.
+        Wall-time is accumulated cumulatively across slices (M-CT-02). The
+        executor MAY report ``wall_seconds`` (a positive number) in its result;
+        when present and positive, that value is preferred (it is the most
+        accurate measurement the executor has). When absent or non-positive,
+        the caller passes ``slice_wall_seconds`` — the elapsed wall-time
+        around the executor call measured by ``time.monotonic()`` in ``_run``.
+        This is the robust approach: real executors do not report wall-time
+        today, so the monotonic fallback is the default path, but an executor
+        that gains a wall-time field is honored automatically.
+
+        Compute budget (M-CT-02): the executor contract exposes no compute
+        units (no ``compute_units`` / ``compute_seconds`` field). Rather than
+        fabricate a compute metric that is not measured, tokens (``tokens_used``)
+        serve as the compute proxy. This is documented here, not invented as a
+        new field, so no unmeasured metric enters the snapshot.
+        """
         num_turns = result.get("num_turns")
         if isinstance(num_turns, (int, float)) and num_turns > 0:
             job.turns_used += int(num_turns)
@@ -783,6 +814,13 @@ class DevelopmentJobManager:
         tool_failures = result.get("tool_failures")
         if isinstance(tool_failures, int) and tool_failures > 0:
             job.tool_failures += tool_failures
+        # M-CT-02: cumulative wall-time. Prefer executor-reported wall_seconds
+        # when present and positive; else use the monotonic fallback.
+        reported_wall = result.get("wall_seconds")
+        if isinstance(reported_wall, (int, float)) and reported_wall > 0:
+            job.wall_seconds_used += float(reported_wall)
+        elif slice_wall_seconds > 0:
+            job.wall_seconds_used += slice_wall_seconds
         if (
             not job.soft_warned
             and job.turns_used >= self.settings.claude_soft_turns > 0
@@ -905,6 +943,11 @@ class DevelopmentJobManager:
                 "hard_turns": self.settings.claude_hard_turns,
                 "max_no_progress_turns": self.settings.claude_max_no_progress_turns,
                 "soft_warned": job.soft_warned,
+                # M-CT-02: cumulative wall-time + ceiling. ``hard_wall_seconds``
+                # is 0 when disabled (the default). ``wall_seconds_used`` is the
+                # cumulative elapsed wall-time across all slices.
+                "wall_seconds_used": job.wall_seconds_used,
+                "hard_wall_seconds": self.settings.claude_hard_wall_seconds,
             },
             "checkpoint_count": store.checkpoint_count(self._db, job.job_id),
             "milestones": list(job.milestones) if job.milestones else [],
@@ -1762,9 +1805,15 @@ class DevelopmentJobManager:
                         )
                     )
                     sampler = asyncio.create_task(self._sampler_loop(job, exec_task))
+                    # M-CT-02: measure the slice wall-time around the executor
+                    # call as the robust fallback for wall-time accumulation.
+                    # ``time.monotonic()`` is not affected by system clock
+                    # adjustments and is the right clock for elapsed measurement.
+                    slice_start = time.monotonic()
                     try:
                         result = await exec_task
                     finally:
+                        slice_wall = time.monotonic() - slice_start
                         if not exec_task.done():
                             exec_task.cancel()
                         if not sampler.done():
@@ -1777,7 +1826,9 @@ class DevelopmentJobManager:
                     if job.cancel_requested:
                         raise asyncio.CancelledError
 
-                    self._absorb_result_budget(job, result)
+                    self._absorb_result_budget(
+                        job, result, slice_wall_seconds=slice_wall
+                    )
                     boundary_paths = await self._record_checkpoint(
                         job, "boundary", event={"slice": slice_index}
                     )
@@ -1930,6 +1981,19 @@ class DevelopmentJobManager:
                     if job.turns_used >= self.settings.claude_hard_turns:
                         job.pause_reason = (
                             f"hard turn cap reached ({job.turns_used})"
+                        )
+                        terminal = JobStatus.PAUSED_BUDGET_EXHAUSTED
+                        break
+                    # M-CT-02: cumulative wall-time ceiling. Only enforced when
+                    # ``claude_hard_wall_seconds`` is positive (opt-in); 0/unset
+                    # (the default) leaves existing projects unaffected.
+                    if (
+                        self.settings.claude_hard_wall_seconds > 0
+                        and job.wall_seconds_used
+                        >= self.settings.claude_hard_wall_seconds
+                    ):
+                        job.pause_reason = (
+                            "cumulative_wall_budget_exhausted"
                         )
                         terminal = JobStatus.PAUSED_BUDGET_EXHAUSTED
                         break

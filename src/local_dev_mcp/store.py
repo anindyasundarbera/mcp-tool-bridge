@@ -355,12 +355,12 @@ INSERT INTO job_events (
 _UPSERT_PROGRESS = """
 INSERT INTO job_progress (
     job_id, pause_reason, turns_used, tokens_used, extensions_granted,
-    no_progress_turns, tool_failures, soft_warned, milestones_json,
-    parent_job_id, delegation_mandate_json, updated_at
+    no_progress_turns, tool_failures, soft_warned, wall_seconds_used,
+    milestones_json, parent_job_id, delegation_mandate_json, updated_at
 ) VALUES (
     :job_id, :pause_reason, :turns_used, :tokens_used, :extensions_granted,
-    :no_progress_turns, :tool_failures, :soft_warned, :milestones_json,
-    :parent_job_id, :delegation_mandate_json, :updated_at
+    :no_progress_turns, :tool_failures, :soft_warned, :wall_seconds_used,
+    :milestones_json, :parent_job_id, :delegation_mandate_json, :updated_at
 )
 ON CONFLICT(job_id) DO UPDATE SET
     pause_reason = excluded.pause_reason,
@@ -370,6 +370,7 @@ ON CONFLICT(job_id) DO UPDATE SET
     no_progress_turns = excluded.no_progress_turns,
     tool_failures = excluded.tool_failures,
     soft_warned = excluded.soft_warned,
+    wall_seconds_used = excluded.wall_seconds_used,
     milestones_json = excluded.milestones_json,
     parent_job_id = excluded.parent_job_id,
     delegation_mandate_json = excluded.delegation_mandate_json,
@@ -432,6 +433,9 @@ _ADDITIVE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("tool_failures", "INTEGER NOT NULL DEFAULT 0"),
         ("parent_job_id", "TEXT"),
         ("delegation_mandate_json", "TEXT"),
+        # M-CT-02: cumulative wall-time across all slices (seconds). REAL so a
+        # float accumulates precisely; NOT NULL DEFAULT 0 keeps old rows valid.
+        ("wall_seconds_used", "REAL NOT NULL DEFAULT 0"),
     ),
     # M-EV-01: additive columns on the requirements + requirement_links tables
     # so the full matrix semantics (kind, status, deferred_authority,

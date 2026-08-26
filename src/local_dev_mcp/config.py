@@ -20,6 +20,22 @@ def _positive_int(environment: Mapping[str, str], name: str, default: int) -> in
     return value
 
 
+def _non_negative_int(environment: Mapping[str, str], name: str, default: int) -> int:
+    """Parse a non-negative integer (>= 0). 0/unset means disabled.
+
+    Used for ceilings that are opt-in: a value of 0 disables the ceiling so
+    existing projects are unaffected (the disabled path is the default).
+    """
+    raw = environment.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if value < 0:
+        raise RuntimeError(f"{name} must be greater than or equal to zero")
+    return value
+
+
 def _positive_float(environment: Mapping[str, str], name: str, default: float) -> float:
     raw = environment.get(name, str(default))
     try:
@@ -168,6 +184,9 @@ class Settings:
     claude_hard_turns: int
     claude_max_no_progress_turns: int
     claude_max_tool_failures: int
+    # M-CT-02: cumulative wall-time ceiling across all slices of a job. 0 means
+    # disabled (the default). Distinct from the per-slice ``claude_timeout_seconds``.
+    claude_hard_wall_seconds: int
     claude_checkpoint_interval_seconds: float
     claude_checkpoint_max: int
     claude_stream_json: bool
@@ -274,6 +293,9 @@ class Settings:
             ),
             claude_max_tool_failures=_positive_int(
                 env, "CLAUDE_MAX_TOOL_FAILURES", 5
+            ),
+            claude_hard_wall_seconds=_non_negative_int(
+                env, "CLAUDE_HARD_WALL_SECONDS", 0
             ),
             claude_checkpoint_interval_seconds=_positive_float(
                 env, "CLAUDE_CHECKPOINT_INTERVAL_SECONDS", 30
