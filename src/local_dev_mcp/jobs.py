@@ -1323,6 +1323,35 @@ class DevelopmentJobManager:
                     )
         return mandate
 
+    def _enforce_apex_grounding_for_genesis(self, project: ProjectPolicy) -> None:
+        """M-GV-03: the first job on a project requires an unchanged apex ref.
+
+        The genesis job — the first job ever created for a project — anchors
+        the project's apex authority and must be externally grounded: the
+        policy must declare an ``apex_authority_ref`` and that ref must be
+        unchanged since registration (the durable registration ledger must
+        still match). A project that never declared grounding is unaffected
+        (nothing to enforce); a grounded project whose ref changed without
+        re-confirmation is rejected here so runtime work can never begin under
+        a drifting authority. The registry records the ref at registration;
+        this check is the runtime half of the invariant.
+        """
+        if project.apex_authority_ref is None:
+            return
+        if store.count_job_rows_for_project(self._db, project.id) > 0:
+            # Not the genesis job: the apex anchor was already established.
+            return
+        recorded = store.load_registered_apex_authority(self._db, project.id)
+        if (
+            recorded is None
+            or recorded["apex_authority_ref"] != project.apex_authority_ref
+        ):
+            raise DevelopmentJobError(
+                "genesis job requires apex_authority_ref present and unchanged "
+                "since registration; re-confirm the apex authority before "
+                "creating the first job on this project"
+            )
+
     def _new_job_id(self) -> str:
         for _ in range(10):
             candidate = secrets.token_hex(16)
@@ -1769,6 +1798,10 @@ class DevelopmentJobManager:
     ) -> dict[str, Any]:
         effort = resolve_effort(project, effort, self.settings)
         specification = self._validate_input(project, text, effort)
+        # M-GV-03: the first job on the project (its genesis job) anchors the
+        # project's apex authority and requires the external grounding ref to
+        # be present and unchanged since registration.
+        self._enforce_apex_grounding_for_genesis(project)
         # M-EV-01: scan the project's canonical spec for normative requirement
         # IDs and persist them (idempotent) so the coverage matrix is available
         # before any edit. Failures are non-fatal: a project with no parseable

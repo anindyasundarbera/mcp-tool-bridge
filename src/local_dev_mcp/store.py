@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -301,6 +302,15 @@ CREATE TABLE IF NOT EXISTS revision_resolves_finding (
 -- only; ``SCHEMA_VERSION`` stays 1.
 CREATE INDEX IF NOT EXISTS idx_job_checkpoints_recorded_at
     ON job_checkpoints(recorded_at);
+-- M-GV-03: durable registration ledger for external apex grounding. Records
+-- the ``apex_authority_ref`` a project registered with so the registry and the
+-- genesis-job path can reject a ref that changed without re-confirmation.
+-- Additive ``CREATE TABLE IF NOT EXISTS`` only; ``SCHEMA_VERSION`` stays 1.
+CREATE TABLE IF NOT EXISTS registered_apex_authority (
+    project_id TEXT PRIMARY KEY,
+    apex_authority_ref TEXT NOT NULL,
+    confirmed_at TEXT NOT NULL
+);
 """
 
 _UPSERT_JOB = """
@@ -601,6 +611,67 @@ def open_state_db(db_path: Path) -> sqlite3.Connection:
 def load_job_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     """Return every persisted job row as a dict."""
     return [dict(row) for row in connection.execute("SELECT * FROM jobs").fetchall()]
+
+
+def count_job_rows_for_project(
+    connection: sqlite3.Connection, project_id: str
+) -> int:
+    """Return the number of persisted job rows for one project (M-GV-03).
+
+    Used to identify the genesis job: the first job created for a project (zero
+    prior rows) is the genesis job, which carries the apex-grounding burden.
+    """
+    row = connection.execute(
+        "SELECT COUNT(*) AS count FROM jobs WHERE project_id = ?",
+        (project_id,),
+    ).fetchone()
+    return int(row["count"]) if row is not None else 0
+
+
+def load_registered_apex_authority(
+    connection: sqlite3.Connection, project_id: str
+) -> dict[str, str] | None:
+    """Return the registered apex-authority ref for a project, or None (M-GV-03).
+
+    The registration ledger records the ``apex_authority_ref`` a project
+    registered with. A loaded policy whose ref differs from this recorded value
+    is a change without re-confirmation and must be rejected.
+    """
+    row = connection.execute(
+        "SELECT apex_authority_ref, confirmed_at FROM registered_apex_authority "
+        "WHERE project_id = ?",
+        (project_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "apex_authority_ref": row["apex_authority_ref"],
+        "confirmed_at": row["confirmed_at"],
+    }
+
+
+def upsert_registered_apex_authority(
+    connection: sqlite3.Connection,
+    project_id: str,
+    apex_authority_ref: str,
+    confirmed_at: str | None = None,
+) -> None:
+    """Record or re-confirm a project's apex-authority ref (M-GV-03).
+
+    Inserting a row for the first time is the registration moment; overwriting
+    it is the explicit re-confirmation path (``ProjectRegistry.confirm_apex_authority``).
+    """
+    if confirmed_at is None:
+        confirmed_at = datetime.now(UTC).isoformat()
+    with connection:
+        connection.execute(
+            "INSERT INTO registered_apex_authority(project_id, apex_authority_ref, confirmed_at) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(project_id) DO UPDATE SET "
+            "apex_authority_ref = excluded.apex_authority_ref, "
+            "confirmed_at = excluded.confirmed_at",
+            (project_id, apex_authority_ref, confirmed_at),
+        )
 
 
 def load_record_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:

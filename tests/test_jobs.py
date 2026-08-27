@@ -307,6 +307,44 @@ class DevelopmentJobManagerTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_genesis_job_requires_unchanged_apex_ref(self) -> None:
+        # M-GV-03: the first job on a grounded project requires the external
+        # apex ref to be present and unchanged since registration.
+        async def exercise() -> None:
+            executor = ImmediateExecutor()
+            manager = DevelopmentJobManager(
+                self.settings,
+                ProjectLockManager(),
+                executor,  # type: ignore[arg-type]
+            )
+            ref = f"docs/spec.md@{'a' * 40}"
+            # Register the ref in the durable ledger exactly as the registry
+            # does at load time (same DB the job manager uses).
+            store.upsert_registered_apex_authority(
+                manager._db, self.project.id, ref
+            )
+            grounded = policy(self.root, apex_authority_ref=ref)
+
+            # A matching genesis job is accepted.
+            started = await manager.start(grounded, "genesis work", "high")
+            self.assertEqual(started["status"], "queued")
+
+            # A drifted project's genesis job (ref changed, no re-confirmation)
+            # is rejected before any runtime work begins.
+            other_root = self.base / "other"
+            initialize_git_repository(other_root)
+            drifted = policy(
+                other_root,
+                project_id="other-project",
+                apex_authority_ref=f"docs/spec.md@{'b' * 40}",
+            )
+            with self.assertRaisesRegex(
+                DevelopmentJobError, "unchanged since registration"
+            ):
+                await manager.start(drifted, "drifted genesis", "high")
+
+        asyncio.run(exercise())
+
     def test_self_managed_job_requires_candidate_health(self) -> None:
         async def exercise(status: str) -> dict[str, Any]:
             executor = ImmediateExecutor()

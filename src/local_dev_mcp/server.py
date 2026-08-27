@@ -30,6 +30,8 @@ from .working_tree_capture import (
 )
 from .authorization import AuthorizationManager
 from .open_hands_action import OpenHandsActionManager
+from . import store
+from .worktrees import GitWorktreeManager
 
 
 def create_server(
@@ -52,9 +54,23 @@ def create_server(
     requirements: Any = None,
 ) -> FastMCP:
     active_settings = settings or Settings.from_env()
-    active_registry = registry or ProjectRegistry.load(
-        active_settings.projects_config_path
-    )
+    if registry is not None:
+        active_registry = registry
+    else:
+        # M-GV-03: load the registry against the same durable state DB the job
+        # manager uses, so the external-apex-grounding registration ledger is
+        # enforced at load time (a grounded project whose apex ref changed
+        # without re-confirmation fails closed at startup). WAL allows the
+        # registry and the job manager to hold concurrent connections to the
+        # same file.
+        active_state_db = store.open_state_db(
+            GitWorktreeManager(active_settings, ()).ensure_state_root() / "bridge.db"
+        )
+        active_registry = ProjectRegistry.load(
+            active_settings.projects_config_path,
+            require_apex_grounding=active_settings.require_apex_grounding,
+            state_db=active_state_db,
+        )
     active_locks = locks or ProjectLockManager()
     active_executor = executor or ClaudeExecutor(active_settings)
     active_reader = reader or RepositoryReader(active_settings)

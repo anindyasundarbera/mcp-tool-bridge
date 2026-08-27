@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from local_dev_mcp import store
 from local_dev_mcp.models import ProjectCapability
 from local_dev_mcp.registry import ProjectRegistry, ProjectRegistryError
 
@@ -251,6 +252,129 @@ class ProjectRegistryTests(unittest.TestCase):
                 write_registry(config, [payload])
                 with self.assertRaisesRegex(ProjectRegistryError, expected):
                     ProjectRegistry.load(config)
+
+    # ------------------------------------------------------------------
+    # M-GV-03: external grounding for genesis/apex authority.
+    # ------------------------------------------------------------------
+
+    def test_grounded_policy_registers(self) -> None:
+        repository = self.root / "repo"
+        initialize_git_repository(repository)
+        config = self.root / "projects.json"
+        ref = f"docs/spec.md@{'a' * 40}"
+        write_registry(
+            config,
+            [
+                project_payload(
+                    repository,
+                    apex_authority_ref=ref,
+                    require_apex_grounding=True,
+                )
+            ],
+        )
+        registry = ProjectRegistry.load(
+            config, require_apex_grounding=True
+        )
+        self.assertEqual(
+            registry.resolve("test-project").apex_authority_ref, ref
+        )
+
+    def test_url_apex_ref_is_accepted(self) -> None:
+        repository = self.root / "repo"
+        initialize_git_repository(repository)
+        config = self.root / "projects.json"
+        write_registry(
+            config,
+            [
+                project_payload(
+                    repository,
+                    apex_authority_ref="https://example.com/specs/apex@v1",
+                )
+            ],
+        )
+        registry = ProjectRegistry.load(config)
+        self.assertEqual(
+            registry.resolve("test-project").apex_authority_ref,
+            "https://example.com/specs/apex@v1",
+        )
+
+    def test_ungrounded_policy_is_rejected_when_flag_is_set(self) -> None:
+        repository = self.root / "repo"
+        initialize_git_repository(repository)
+        config = self.root / "projects.json"
+        write_registry(config, [project_payload(repository)])
+        with self.assertRaisesRegex(
+            ProjectRegistryError, "requires apex_authority_ref"
+        ):
+            ProjectRegistry.load(config, require_apex_grounding=True)
+        # Without the flag the same policy still loads (opt-in).
+        ProjectRegistry.load(config)
+
+    def test_per_policy_grounding_flag_requires_a_ref(self) -> None:
+        repository = self.root / "repo"
+        initialize_git_repository(repository)
+        config = self.root / "projects.json"
+        write_registry(
+            config,
+            [project_payload(repository, require_apex_grounding=True)],
+        )
+        with self.assertRaisesRegex(
+            ProjectRegistryError, "requires apex_authority_ref"
+        ):
+            ProjectRegistry.load(config)
+
+    def test_rejects_invalid_apex_ref_shapes(self) -> None:
+        repository = self.root / "repo"
+        initialize_git_repository(repository)
+        config = self.root / "projects.json"
+        for ref, expected in (
+            ("", "must not be empty"),
+            ("docs/spec.md", "URL or a '<repo-path>@<git-sha>'"),
+            ("docs/spec.md@not-a-sha", "7-40 character git SHA"),
+            ("../escape@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "repo path"),
+            ("http://", "scheme and a target"),
+        ):
+            with self.subTest(ref=ref):
+                write_registry(
+                    config,
+                    [project_payload(repository, apex_authority_ref=ref)],
+                )
+                with self.assertRaisesRegex(ProjectRegistryError, expected):
+                    ProjectRegistry.load(config)
+
+    def test_changing_apex_ref_without_reconfirmation_is_rejected(self) -> None:
+        repository = self.root / "repo"
+        initialize_git_repository(repository)
+        config = self.root / "projects.json"
+        state_dir = self.root / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state_db = store.open_state_db(state_dir / "bridge.db")
+        ref_a = f"docs/spec.md@{'a' * 40}"
+        write_registry(
+            config,
+            [project_payload(repository, apex_authority_ref=ref_a)],
+        )
+        # First load registers the ref.
+        registry = ProjectRegistry.load(config, state_db=state_db)
+        self.assertEqual(
+            registry.resolve("test-project").apex_authority_ref, ref_a
+        )
+
+        # Changing the ref in projects.json without re-confirmation is rejected.
+        ref_b = f"docs/spec.md@{'b' * 40}"
+        write_registry(
+            config,
+            [project_payload(repository, apex_authority_ref=ref_b)],
+        )
+        with self.assertRaisesRegex(ProjectRegistryError, "changed without"):
+            ProjectRegistry.load(config, state_db=state_db)
+
+        # Explicit re-confirmation accepts the new ref durably.
+        registry.confirm_apex_authority("test-project", ref_b)
+        reloaded = ProjectRegistry.load(config, state_db=state_db)
+        self.assertEqual(
+            reloaded.resolve("test-project").apex_authority_ref, ref_b
+        )
 
 
 if __name__ == "__main__":

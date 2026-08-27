@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
@@ -50,6 +51,53 @@ def _policy_path(value: str) -> str:
     if not normalized or path.is_absolute() or ".." in path.parts:
         raise ValueError("policy paths must be non-empty relative paths without '..'")
     return path.as_posix()
+
+
+def _validate_apex_authority_ref(value: object) -> str | None:
+    """Validate an optional ``ProjectPolicy.apex_authority_ref`` (M-GV-03).
+
+    The external grounding reference for apex authority is either a URL
+    (``scheme://target``) or a repo-local pin (``<relative-path>@<git-sha>``,
+    a path in the repo plus the commit SHA the authority is grounded at).
+    The ref must be non-empty, NUL/control-free, at most 512 characters, and
+    must not smuggle an absolute or traversal path in the repo-path form. A
+    URL scheme must look like a real scheme and the remainder must be
+    whitespace-free.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        raise ValueError("apex_authority_ref must not be empty")
+    if len(text) > 512:
+        raise ValueError("apex_authority_ref must be at most 512 characters")
+    if "\x00" in text or any(ord(character) < 32 for character in text):
+        raise ValueError("apex_authority_ref must not contain control characters")
+    if "://" in text:
+        scheme, _, remainder = text.partition("://")
+        if not scheme or not remainder:
+            raise ValueError(
+                "apex_authority_ref URL must include a scheme and a target"
+            )
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*", scheme):
+            raise ValueError("apex_authority_ref URL scheme is invalid")
+        if any(character.isspace() for character in remainder):
+            raise ValueError("apex_authority_ref URL must not contain whitespace")
+        return text
+    path_part, at, sha_part = text.rpartition("@")
+    if not at or not path_part or not sha_part:
+        raise ValueError(
+            "apex_authority_ref must be a URL or a '<repo-path>@<git-sha>' ref"
+        )
+    try:
+        _policy_path(path_part)
+    except ValueError as exc:
+        raise ValueError("apex_authority_ref repo path is invalid") from exc
+    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", sha_part):
+        raise ValueError(
+            "apex_authority_ref commit must be a 7-40 character git SHA"
+        )
+    return text
 
 
 # Names of interpreter/library loader variables a policy-configured command must
@@ -352,6 +400,15 @@ class ProjectPolicy(BaseModel):
     allow_bridge_reviewer: bool = False
     claude_model: str | None = None
     claude_max_turns: int | None = Field(default=None, ge=1, le=200)
+    # M-GV-03: external grounding for genesis/apex authority. An optional
+    # reference (a URL, or a repo path + commit SHA) to the external spec the
+    # project's apex authority is grounded in. When ``require_apex_grounding``
+    # is set (per policy, or globally via REQUIRE_APEX_GROUNDING), a policy
+    # without an ``apex_authority_ref`` is rejected, and the first job on the
+    # project (its genesis job) requires the ref to be present and unchanged
+    # since registration.
+    apex_authority_ref: str | None = None
+    require_apex_grounding: bool = False
 
     @field_validator("root", mode="before")
     @classmethod
@@ -380,6 +437,11 @@ class ProjectPolicy(BaseModel):
             raise ValueError("claude_model must not be empty")
         return stripped
 
+    @field_validator("apex_authority_ref", mode="before")
+    @classmethod
+    def validate_apex_authority_ref(cls, value: object) -> str | None:
+        return _validate_apex_authority_ref(value)
+
     @model_validator(mode="after")
     def validate_policy(self) -> "ProjectPolicy":
         if self.default_effort == "ultracode" and not self.allow_ultracode:
@@ -388,6 +450,14 @@ class ProjectPolicy(BaseModel):
             raise ValueError(
                 "self-managed projects cannot use direct markdown_write against the "
                 "production checkout"
+            )
+        # M-GV-03: a project that opts into apex grounding must declare its
+        # external authority reference; an ungrounded apex authority is exactly
+        # the configuration the flag exists to forbid.
+        if self.require_apex_grounding and self.apex_authority_ref is None:
+            raise ValueError(
+                "require_apex_grounding requires apex_authority_ref "
+                "(external grounding for apex authority)"
             )
         if (
             ProjectCapability.CANDIDATE_REVIEW in self.capabilities

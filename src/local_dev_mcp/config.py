@@ -238,6 +238,10 @@ class Settings:
     enable_durable_authz: bool
     max_delegations_per_job: int
     reader_injection_defense: bool
+    # M-GV-03: when set, the registry rejects any enabled project policy whose
+    # ``apex_authority_ref`` is missing. Capability-less opt-in flag: projects
+    # that do not use external grounding are unaffected (default off).
+    require_apex_grounding: bool
     claude_launch_command: tuple[str, ...]
     claude_review_launch_command: tuple[str, ...]
     claude_default_effort: Effort
@@ -374,6 +378,7 @@ class Settings:
                 env, "MAX_DELEGATIONS_PER_JOB", 3
             ),
             reader_injection_defense=_truthy(env, "READER_INJECTION_DEFENSE"),
+            require_apex_grounding=_truthy(env, "REQUIRE_APEX_GROUNDING"),
             claude_launch_command=_launch_command(
                 env, "CLAUDE_LAUNCH_COMMAND", _DEFAULT_LAUNCH_COMMAND
             ),

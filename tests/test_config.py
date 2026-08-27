@@ -57,6 +57,20 @@ class SettingsTests(unittest.TestCase):
     def test_rejects_non_positive_limits(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "greater than zero"):
             Settings.from_env({"CLAUDE_MAX_TURNS": "0"})
+
+    def test_require_apex_grounding_flag(self) -> None:
+        # M-GV-03: the global REQUIRE_APEX_GROUNDING opt-in flag defaults off
+        # and is set by a truthy env var.
+        self.assertFalse(Settings.from_env({}).require_apex_grounding)
+        self.assertTrue(
+            Settings.from_env({"REQUIRE_APEX_GROUNDING": "1"}).require_apex_grounding
+        )
+        self.assertTrue(
+            Settings.from_env({"REQUIRE_APEX_GROUNDING": "true"}).require_apex_grounding
+        )
+        self.assertFalse(
+            Settings.from_env({"REQUIRE_APEX_GROUNDING": "0"}).require_apex_grounding
+        )
         with self.assertRaisesRegex(RuntimeError, "MAX_MARKDOWN_WRITE_BYTES"):
             Settings.from_env({"MAX_MARKDOWN_WRITE_BYTES": "not-an-integer"})
         with self.assertRaisesRegex(RuntimeError, "greater than zero"):

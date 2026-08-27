@@ -4,10 +4,17 @@ import asyncio
 import json
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from pydantic import ValidationError
 
-from .models import ProjectCapability, ProjectPolicy, ProjectRegistryDocument
+from . import store
+from .models import (
+    ProjectCapability,
+    ProjectPolicy,
+    ProjectRegistryDocument,
+    _validate_apex_authority_ref,
+)
 
 
 class ProjectRegistryError(RuntimeError):
@@ -29,11 +36,26 @@ def _git_root(root: Path) -> Path:
 
 
 class ProjectRegistry:
-    def __init__(self, projects: dict[str, ProjectPolicy]):
+    def __init__(
+        self,
+        projects: dict[str, ProjectPolicy],
+        state_db: Any | None = None,
+    ):
         self._projects = projects
+        # M-GV-03: the durable registration ledger for external apex grounding.
+        # When provided, the registry records each grounded project's
+        # ``apex_authority_ref`` at load and rejects a ref that changed without
+        # an explicit re-confirmation.
+        self._state_db = state_db
 
     @classmethod
-    def load(cls, config_path: Path) -> ProjectRegistry:
+    def load(
+        cls,
+        config_path: Path,
+        *,
+        require_apex_grounding: bool = False,
+        state_db: Any | None = None,
+    ) -> ProjectRegistry:
         try:
             payload = json.loads(config_path.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
@@ -51,6 +73,16 @@ class ProjectRegistry:
         for configured in document.projects:
             if not configured.enabled:
                 continue
+            # M-GV-03: when the global REQUIRE_APEX_GROUNDING flag is set, every
+            # enabled policy must declare its external apex authority reference.
+            # This is a capability-less, opt-in flag: projects that do not use
+            # grounding are untouched when it is off.
+            if require_apex_grounding and configured.apex_authority_ref is None:
+                raise ProjectRegistryError(
+                    f"project {configured.id!r} requires apex_authority_ref when "
+                    "REQUIRE_APEX_GROUNDING is set (external grounding for apex "
+                    "authority)"
+                )
             try:
                 resolved_root = configured.root.resolve(strict=True)
             except FileNotFoundError as exc:
@@ -73,7 +105,57 @@ class ProjectRegistry:
 
         if not projects:
             raise ProjectRegistryError("project registry has no enabled projects")
-        return cls(projects)
+
+        # M-GV-03: enforce the registration invariant durably. A grounded
+        # project's ``apex_authority_ref`` must be unchanged since registration;
+        # a loaded policy whose ref differs from the ledger is a change without
+        # re-confirmation and fails closed. The first sight of a grounded
+        # project records (registers) its ref.
+        if state_db is not None:
+            for project_id, project in projects.items():
+                if project.apex_authority_ref is None:
+                    continue
+                recorded = store.load_registered_apex_authority(state_db, project_id)
+                if (
+                    recorded is not None
+                    and recorded["apex_authority_ref"] != project.apex_authority_ref
+                ):
+                    raise ProjectRegistryError(
+                        f"project {project_id!r} apex_authority_ref changed without "
+                        "re-confirmation; call confirm_apex_authority to accept the "
+                        "new external grounding ref"
+                    )
+                if recorded is None:
+                    store.upsert_registered_apex_authority(
+                        state_db, project_id, project.apex_authority_ref
+                    )
+
+        return cls(projects, state_db=state_db)
+
+    def confirm_apex_authority(self, project_id: str, apex_authority_ref: str) -> str:
+        """Re-confirm a project's apex authority reference (M-GV-03).
+
+        Updating the external grounding ref for a project is a governance
+        change: the registry rejects a new ref until it is explicitly
+        re-confirmed here. The new ref is validated with the same rules as the
+        policy field, then recorded in the durable registration ledger so the
+        next ``load`` accepts it. Requires the project to exist in this
+        registry and a durable ledger (``state_db``) to write to.
+        """
+        if project_id not in self._projects:
+            raise ProjectRegistryError(f"unknown project_id: {project_id!r}")
+        if self._state_db is None:
+            raise ProjectRegistryError(
+                "confirm_apex_authority requires the registry to be loaded with "
+                "a durable state database"
+            )
+        validated = _validate_apex_authority_ref(apex_authority_ref)
+        if validated is None:
+            raise ProjectRegistryError("apex_authority_ref must not be empty")
+        store.upsert_registered_apex_authority(
+            self._state_db, project_id, validated
+        )
+        return validated
 
     def list_public(self) -> list[dict[str, object]]:
         return [
