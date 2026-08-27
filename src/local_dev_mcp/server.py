@@ -28,7 +28,7 @@ from .working_tree_capture import (
     WorkingTreeCaptureError,
     WorkingTreeCaptureManager,
 )
-from .open_hands_action import OpenHandsActionManager
+from .authorization import AuthorizationManager
 
 
 def create_server(
@@ -87,12 +87,16 @@ def create_server(
         active_jobs,
         projects=active_registry.projects(),
     )
+    # Sync manager for canonical checkout synchronization
     active_sync = sync or SyncManager(
         active_settings,
         active_locks,
         active_jobs,
         projects=active_registry.projects(),
     )
+    # Authorization manager for durable capability checks
+    active_authorization = AuthorizationManager(active_settings)
+
     active_evidence = evidence or EvidenceBundleManager(
         active_settings,
         active_locks,
@@ -910,6 +914,10 @@ def create_server(
                 pattern=r"^[0-9a-f]{32}$",
             ),
         ] = None,
+        authorization_id: Annotated[
+            str | None,
+            Field(description="Durable authorization ID for commit.", pattern=r"^[0-9a-f]{32}$")
+        ] = None,
     ) -> dict[str, Any]:
         project = active_registry.resolve(
             project_id, ProjectCapability.VERIFICATION_COMMIT
@@ -927,6 +935,14 @@ def create_server(
                 expected_head,
                 expected_diff_fingerprint,
                 paths,
+            )
+        # Durable authorization check, if enabled and auth ID provided
+        if active_settings.enable_durable_authz and authorization_id is not None:
+            active_authorization.check_and_consume(
+                authorization_id,
+                project_id=project.id,
+                capability=ProjectCapability.VERIFICATION_COMMIT,
+                target=verification_id,
             )
         committed = await active_verification.commit(
             project,
@@ -1021,10 +1037,22 @@ def create_server(
                 pattern=r"^[0-9a-f]{64}$",
             ),
         ],
+        authorization_id: Annotated[
+            str | None,
+            Field(description="Durable authorization ID for push.", pattern=r"^[0-9a-f]{32}$")
+        ] = None,
     ) -> dict[str, Any]:
         project = active_registry.resolve(
             project_id, ProjectCapability.PUSH_DEVELOPMENT_COMMIT
         )
+        # Durable authorization check for push, if enabled and auth ID provided
+        if active_settings.enable_durable_authz and authorization_id is not None:
+            active_authorization.check_and_consume(
+                authorization_id,
+                project_id=project.id,
+                capability=ProjectCapability.PUSH_DEVELOPMENT_COMMIT,
+                target=branch_name,
+            )
         return await active_publication.publish(
             project,
             job_id,
