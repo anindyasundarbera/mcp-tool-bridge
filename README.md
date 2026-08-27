@@ -75,7 +75,7 @@ Job states: `queued` → `preparing_worktree` → `running` → optionally
 
 ---
 
-## The MCP tool surface (32 tools)
+## The MCP tool surface (39 tools)
 
 Every tool takes an exact `project_id` (and an opaque `job_id` where relevant),
 never a raw path or session ID. Capability gates are listed in
@@ -87,9 +87,10 @@ never a raw path or session ID. Capability gates are listed in
 | **Markdown write** | `write_project_markdown` |
 | **Development lifecycle** | `send_to_local_dev`, `get_development_job`, `resume_development_job`, `cancel_development_job` |
 | **Candidate review** | `list_candidate_changes`, `read_candidate_file`, `record_candidate_review`, `run_independent_review`, `get_candidate_review` |
-| **Verification & commit** | `verify_development_job`, `commit_verified_development_job` |
+| **Verification & commit** | `verify_development_job`, `replay_verification`, `commit_verified_development_job` |
 | **Publication & sync** | `push_detached_development_commit`, `sync_canonical_checkout`, `prepare_canonical_for_work` |
 | **Evidence & PR** | `export_evidence_bundle`, `open_pull_request` |
+| **Human controls (dormant)** | `pause_development_job`, `extend_budget`, `narrow_scope`, `replace_worker`, `discard_candidate`, `revoke_authorization` |
 | **Introspection (dormant)** | `list_development_jobs`, `get_effective_project_policy`, `resolve_candidate_canonicalization` |
 | **Host runtime verification (dormant)** | `run_runtime_verification` |
 | **Working-tree capture (dormant)** | `preflight_working_tree_capture`, `working_tree_candidate_capture` |
@@ -285,7 +286,7 @@ committed**.
 ```
 server.py, tunnel.py, run.sh       entry points (server / ngrok tunnel / launcher)
 src/local_dev_mcp/                 the bridge (26 modules, ~15k lines)
-  server.py                        FastMCP tool surface (32 tools)
+  server.py                        FastMCP tool surface (39 tools)
   registry.py, models.py           project registry + capability/policy models
   config.py                        Settings (env-driven)
   jobs.py, claude.py                development-job lifecycle + Claude executor

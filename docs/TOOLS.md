@@ -1,6 +1,6 @@
 # MCP tool reference
 
-The bridge exposes **32 MCP tools** via FastMCP. Every tool takes an exact
+The bridge exposes **39 MCP tools** via FastMCP. Every tool takes an exact
 `project_id` (and an opaque `job_id` where relevant); none ever accepts a
 filesystem root, worktree path, raw session ID, executable, argv, environment,
 working directory, or timeout. Capability gates are enforced in `server.py`
@@ -164,7 +164,22 @@ changed paths, and candidate fingerprint. The caller cannot supply a command,
 argument, environment, or path.
 - **Params**: `project_id`, `job_id`, `expected_head` (40-hex; the retained job's base HEAD)
 - **Annotations**: **destructive**, not idempotent, open-world
-- **Returns** a single-use `verification_id`, the ordered changed paths, and the fingerprint.
+- **Returns** a single-use `verification_id`, the ordered changed paths, and the fingerprint. Each `commands[]` entry carries its test `kind` (`unit | integration | property | mutation | ad_hoc`); `property` commands ran under a deterministic seed and `mutation` commands may carry advisory `mutation_stats`. When a project opts into static analysis, the response also carries `static_analysis` findings and a `static_analysis_summary`.
+
+### `replay_verification` — `replay_verification` (requires `verification_commit`)
+Read-only deterministic replay of a recorded verification. Re-runs the recorded
+verification commands through the same hermetic runner against a fresh read-only
+checkout at the recorded base HEAD and recomputes the environment + per-command
+digests. Reports whether the persisted evidence envelope still reproduces. Never
+writes canonical, candidate, or publication state; a command whose definition
+changed since the verification is surfaced as a digest mismatch, never silently
+re-run. Dormant by default.
+- **Params**: `project_id`, `verification_id` (32-hex)
+- **Annotations**: read-only, idempotent, closed-world
+- **Returns** `reproducible` (true only when the environment digest, every
+  command digest, and every replayed outcome match), per-command
+  `reconstructed` / `digest_match` / `result_match` / `replayed_status` /
+  `replayed_exit_code`, and `notes`.
 
 ### `commit_verified_development_job`
 After separate human approval, create one detached commit from the exact
@@ -242,6 +257,61 @@ the remote branch and PR state. Never merges. Requires the job to have been
 published.
 - **Params**: `project_id`, `job_id`, `base_head` (40-hex), `fingerprint` (64-hex), `title` (1–200 chars), `draft` (default `true`)
 - **Annotations**: **destructive**, idempotent, open-world
+
+---
+
+## Human controls (dormant) — M-CC-08
+
+Each of the six control tools is registered but off by default; a project opts
+in by listing the matching capability in `projects.json`. Every control records
+a durable audit event.
+
+### `pause_development_job` — `pause_development_job` (requires `claude_edit`)
+Pause a running job at the next safe boundary, preserving the candidate worktree
+and session so it can be resumed from the last checkpoint. Idempotent: pausing
+an already-paused or terminal job is a no-op.
+- **Params**: `project_id`, `job_id` (32-hex)
+- **Annotations**: non-destructive, idempotent, closed-world
+
+### `extend_budget` — `extend_budget` (requires `claude_edit`)
+Grant manual budget-extension slices to a job paused at budget exhaustion,
+recording a durable budget-extension authorization. Bounded by
+`claude_max_manual_extensions` per call and the combined
+`claude_max_extensions` + `claude_max_manual_extensions` ceiling; a call with
+nothing left to grant is a no-op success.
+- **Params**: `project_id`, `job_id` (32-hex), `slices` (≥1, default 1), `reason?` (≤2000 chars)
+- **Annotations**: non-destructive, idempotent, closed-world
+
+### `narrow_scope` — `narrow_scope` (requires `claude_edit`)
+Reduce a job's allowed changed-path set to the given relative, non-traversal
+paths. Monotonic: when a scope is already in force the allowed set becomes the
+intersection, so repeated calls can only shrink it. Paths must not name hidden,
+protected, or parent-directory entries.
+- **Params**: `project_id`, `job_id` (32-hex), `paths` (relative paths), `reason?` (≤2000 chars)
+- **Annotations**: non-destructive, idempotent, closed-world
+
+### `replace_worker` — `replace_worker` (requires `claude_edit`)
+Re-spawn the drafter for a terminal (for example paused) job: a brand-new Claude
+session resumes the same retained worktree and candidate seed with a fresh slice
+budget. The previous worker's session is discarded, not resumed.
+- **Params**: `project_id`, `job_id` (32-hex), `text` (direction), `effort?` (`high` | `ultracode`)
+- **Annotations**: non-destructive, not idempotent, closed-world
+
+### `discard_candidate` — `discard_candidate` (requires `claude_edit`)
+Permanently remove a job's candidate worktree and clear its session so the
+candidate can never be resumed, verified, or promoted. Refuses committed and
+running jobs. Idempotent: discarding a job with no retained worktree is a no-op
+success.
+- **Params**: `project_id`, `job_id` (32-hex), `reason?` (≤2000 chars)
+- **Annotations**: **destructive**, idempotent, closed-world
+
+### `revoke_authorization` — `revoke_authorization` (requires `verification_commit`)
+Revoke a previously granted authorization by marking it consumed, so it can no
+longer be checked or used for its capability and target. Refuses unknown ids and
+authorizations belonging to a different project. Idempotent: revoking an
+already-used authorization is a no-op success.
+- **Params**: `project_id`, `authorization_id` (32-hex), `reason?` (≤2000 chars)
+- **Annotations**: non-destructive, idempotent, closed-world
 
 ---
 

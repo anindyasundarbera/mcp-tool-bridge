@@ -162,7 +162,7 @@ All bridge code lives in `src/local_dev_mcp/`. Dependency direction is one-way:
 ### Bridge modules
 | Module | Role |
 |---|---|
-| `server.py` | `create_server()` — assembles all managers and registers the 32 MCP tools with FastMCP `ToolAnnotations` |
+| `server.py` | `create_server()` — assembles all managers and registers the 39 MCP tools with FastMCP `ToolAnnotations` |
 | `config.py` | `Settings.from_env()` — every tunable limit, validated as positive int/float/port |
 | `models.py` | `ProjectCapability` enum, `ProjectPolicy` / `ProjectRegistryDocument` Pydantic models, command validators, capability-dependency rules |
 | `registry.py` | `ProjectRegistry.load()` (validates JSON, resolves roots, dedups, requires git) and `ProjectLockManager` (per-project `asyncio.Lock`) |

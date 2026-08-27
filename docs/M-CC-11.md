@@ -70,8 +70,8 @@ style): `signed_manifests` and `sensitivity_policy` both require
 - `src/local_dev_mcp/introspection.py` — `effective_policy_view` exposes the new
   policies.
 - `tests/test_security.py` (**new**, 16 tests) — see below.
-- `pyproject.toml` — `0.10.1` → `0.11.0` (capability addition; `__init__.py` is
-  stale at `0.8.0` and intentionally not kept in sync).
+- `pyproject.toml` — `0.10.1` → `0.11.0` (capability addition; both
+  `pyproject.toml` and `src/local_dev_mcp/__init__.py` are at `0.11.0`).
 
 ## Tests
 

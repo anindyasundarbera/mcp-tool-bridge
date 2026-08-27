@@ -87,7 +87,12 @@ and `capabilities`. Example with verification + commit + push:
   "commit_roots": ["src", "tests"],
   "protected_paths": [".git", ".env"],
   "verification_commands": [
-    { "id": "pytest", "argv": ["{python}", "-m", "pytest", "-q"], "python_path": ["src"] }
+    {
+      "id": "pytest",
+      "argv": ["{python}", "-m", "pytest", "-q"],
+      "python_path": ["src"],
+      "kind": "unit"
+    }
   ],
   "default_effort": "high",
   "allow_ultracode": true,
@@ -103,6 +108,13 @@ Rules worth knowing now:
   first use (see [CAPABILITIES.md](CAPABILITIES.md) for the full rules).
 - `{python}` in a command argv expands to the interpreter running the bridge;
   a shell executable is rejected.
+- A `VerificationCommand` may declare a test `kind` (`unit` default |
+  `integration` | `property` | `mutation` | `ad_hoc`). `property` commands run
+  under a deterministic `PROPERTY_TEST_SEED` (derived from the base HEAD +
+  command id) so property runs are reproducible; `mutation` output parses
+  best-effort into advisory `mutation_stats`. An optional `static_analysis`
+  block runs declared analyzers + stdlib schema checks read-only at verify time
+  (advisory by default; `fail_on: "error"` opts in to failing verification).
 
 Validate the file before starting:
 ```bash
@@ -229,11 +241,19 @@ positive int/float/port by `Settings.from_env()`.
 | `CLAUDE_SOFT_TURNS` | 30 | soft warn at this cumulative turn count |
 | `CLAUDE_EXTENSION_TURNS` | 30 | turns granted per in-place extension slice |
 | `CLAUDE_MAX_EXTENSIONS` | 3 | max in-place extensions before pausing |
+| `CLAUDE_MAX_MANUAL_EXTENSIONS` | 5 | budget-extension slices `extend_budget` may grant per job |
 | `CLAUDE_HARD_TURNS` | 120 | absolute cumulative turn cap |
 | `CLAUDE_MAX_NO_PROGRESS_TURNS` | 6 | pause when changed-path set is unchanged for this many turns |
 | `CLAUDE_MAX_TOOL_FAILURES` | 5 | terminate as `failed_infrastructure` above this many tool failures |
+| `CLAUDE_TOOL_FAILURE_RETRIES` | 2 | retries per failing slice (fresh executor) before the cumulative tool-failure ceiling classifies the job; 0 disables retry |
+| `CLAUDE_HARD_WALL_SECONDS` | 0 | cumulative wall-time cap across all slices; 0 disables |
 | `CLAUDE_CHECKPOINT_INTERVAL_SECONDS` | 30 | progress-sampler cadence (may be fractional) |
 | `CLAUDE_CHECKPOINT_MAX` | 500 | checkpoint count that triggers compaction |
+| `CLAUDE_OSCILLATION_WINDOW` | 4 | consecutive checkpoints compared for the oscillating-edits trigger |
+| `CLAUDE_OSCILLATION_ALTERNATIONS` | 2 | content alternations within the window that flag oscillation |
+| `CLAUDE_SCOPE_GROWTH_FACTOR` | 0.0 | changed-path growth factor before progress is discounted; 0.0 disables |
+| `CLAUDE_PROGRESS_INTEL_WINDOW` | 8 | cap on recent checkpoints loaded for progress intelligence |
+| `CHECKPOINT_RETENTION_DAYS` | 0 | time-based GC of non-promoted checkpoint rows; 0 disables |
 | `CLAUDE_STREAM_JSON` | off | drive Claude with `--output-format stream-json --verbose` for real counts |
 | `MAX_INPUT_CHARS` | 100000 | maximum job instruction length |
 | `MAX_OUTPUT_BYTES` | 2097152 | maximum Claude stdout |
@@ -255,3 +275,6 @@ positive int/float/port by `Settings.from_env()`.
 | `VERIFICATION_DETERMINISTIC_REPETITIONS` | 1 | deterministic repeat count for verification |
 | `MAX_DELEGATIONS_PER_JOB` | 3 | bounded sub-agent delegations per job |
 | `MAX_COMMIT_MESSAGE_CHARS` | 500 | maximum approved commit message length |
+| `EVIDENCE_RETENTION_DAYS` | 0 | policy ceiling for evidence rows (verifications/reviews/publications/syncs); GC never deletes promoted evidence; 0 disables |
+| `ENABLE_DURABLE_AUTHZ` | off | persist authorization objects to the `authorizations` table |
+| `REQUIRE_APEX_GROUNDING` | off | when set, reject any enabled project whose `apex_authority_ref` is missing (M-GV-03) |

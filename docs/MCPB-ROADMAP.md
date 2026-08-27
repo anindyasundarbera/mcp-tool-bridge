@@ -7,11 +7,13 @@
 >
 > Audit method: 12 parallel read-only agents verified all 149 capability items
 > against the source (file:symbol evidence below). The verdict-summary table is
-> reconciled against merged `main` as of the 2026-08-27 integration: **136 DONE,
-> 3 PARTIAL, 10 MISSING** (the ten MISSING are all P3 items deferred as the
-> M-IN-01 non-goal). The three PARTIAL items — deterministic replay, test-kind
-> coverage, and static analysis/schema validation — are named in the table with
-> their precise gaps. The 2026-08-26 true status audit below is the
+> reconciled against merged `main` as of the 2026-08-28 release integration:
+> **139 DONE, 0 PARTIAL, 10 MISSING** (the ten MISSING are all P3 items
+> deferred as the M-IN-01 non-goal). The three former PARTIAL items —
+> deterministic replay, test-kind coverage, and static analysis/schema
+> validation — were closed on 2026-08-28 (`replay_verification` tool,
+> `VerificationCommand.kind`, and the internal `static_analysis` block) and are
+> now DONE in the table. The 2026-08-26 true status audit below is the
 > authoritative milestone-by-milestone record.
 >
 > Per-phase decision records live in `docs/MCPB-0NN.md` +
@@ -75,13 +77,35 @@
 > `ProjectCapability` (requiring its dependency capability), register a tool
 > with `ToolAnnotations`, and ship off by default.
 
-## Current state (2026-08-27) — supersedes the audit rows below
+## Current state (2026-08-28) — supersedes the audit rows below
 
-Verified against the source on 2026-08-27 (grep/symbol evidence, not just
+Verified against the source on 2026-08-27/28 (grep/symbol evidence, not just
 commit messages). **All R1 Continuity, R2 Evidence, R3 Governance, and the
-cross-cutting M-CC set are now DONE.** The 2026-08-27 integration re-landed
-the full capability set onto `main` (22 cherry-picked commits, full suite
-green: **572 tests**), closing every item in the prior "definitive open set":
+cross-cutting M-CC set are now DONE, including the three former PARTIAL rows
+closed on 2026-08-28.** The 2026-08-27 integration re-landed the full
+capability set onto `main` (22 cherry-picked commits, full suite green: **572
+tests**), closing every item in the prior "definitive open set". The 2026-08-28
+PARTIAL-closure tail then added three more DONE items — full suite green:
+**591 tests**:
+
+- **Deterministic replay (NEW SURFACE):** read-only `replay_verification` tool
+  + `REPLAY_VERIFICATION` capability (requires `verification_commit`, dormant
+  by default) — re-runs recorded commands in the hermetic lab against a
+  read-only detached checkout at the recorded `base_head`, recomputes env +
+  per-command digests, and surfaces digest/result mismatches honestly
+  (`tests/test_replay.py`). Tool surface **38 → 39**.
+- **Test-kind coverage:** `VerificationCommand.kind`
+  (`unit|integration|property|mutation|ad_hoc`, default `unit`); property
+  commands run under a deterministic seed derived from `base_head`+`command.id`;
+  mutation output parses best-effort into `mutation_stats`; kind folds into
+  digests only when non-unit (`tests/test_verification.py` TestKindTests).
+- **Static analysis / schema validation (internal):** `ProjectPolicy.
+  static_analysis` block — declared analyzers over the candidate via the
+  hermetic runner with structured findings, stdlib-only schema checks, and
+  opt-in `fail_on="error"`; persisted in the `verification_static_analysis`
+  sidecar (`tests/test_verification.py` StaticAnalysisTests).
+
+Below, the 2026-08-27 integration details (unchanged, still accurate):
 
 - **M-CT-02 … M-CT-07 all DONE** — `CLAUDE_HARD_WALL_SECONDS` +
   compute-proxy (`config.py`), `job_checkpoint_detail` sidecar (`store.py`),
@@ -110,7 +134,7 @@ green: **572 tests**), closing every item in the prior "definitive open set":
   + `ratifications` sidecar (Option A, merge stays prohibited); `unexpected_paths`
   commit-gate detection; `recover_completed_worktree` read-only re-attach
   (`worktrees.py:672`); the full M-CC-08 control surface (6 new controls, each
-  `ProjectCapability`-gated, dormant by default — schema locked at 38 tools);
+  `ProjectCapability`-gated, dormant by default — schema locked at 39 tools);
   hermetic verification lab (`PIN_TOOLCHAIN` / `DEPS_CACHE_DIR` /
   `NETWORK_POLICY`); failure-recovery hardening (`reset_worktree_to_base`,
   `recreate_detached`, `remove`, `tests/test_recovery.py`); security hardening
@@ -150,9 +174,11 @@ follow-on hardening, not new capability gaps.
 ## Verdict summary — all 149 ChatGPT capability items
 
 The original point-in-time audit (2026-08-07), reconciled against merged `main`
-as of the 2026-08-27 integration (22 capability commits, 572 tests green). Every
-P0/P1/P2 item is delivered except the three PARTIAL items noted below; the ten P3
-items remain deferred as the M-IN-01 non-goal. Status legend: **DONE** = delivered;
+as of the 2026-08-28 release integration (22 capability commits + the PARTIAL
+closure tail, 591 tests green). Every P0/P1/P2 item is delivered — the three
+former PARTIAL items (deterministic replay, test-kind coverage, static analysis)
+were closed on 2026-08-28; the ten P3 items remain deferred as the M-IN-01
+non-goal. Status legend: **DONE** = delivered;
 **PARTIAL** = some exists, a named piece is missing; **MISSING** = nothing delivers it.
 
 | Section | Capability | Status | Evidence |
@@ -191,7 +217,7 @@ items remain deferred as the M-IN-01 non-goal. Status legend: **DONE** = deliver
 | P1 | Link revisions to the review findings they resolve | DONE | M-EV-04 · revision_resolves_finding table + closure chain |
 | P1 | Automatically invalidate prior attestations whenever the cand… | DONE | verification.commit recomputes attestations on candidate change |
 | P1 | Export a portable evidence bundle suitable for offline audit | DONE | M-EV-06 · export_evidence_bundle (requirement coverage + sensitive-path filter) |
-| P1 | Support deterministic replay where feasible | PARTIAL | env/command/base digests persisted for offline replay; the replay_verification tool is deferred as NEW SURFACE |
+| P1 | Support deterministic replay where feasible | DONE | 2026-08-28 · NEW SURFACE `replay_verification` read-only tool (REPLAY_VERIFICATION cap, requires `verification_commit`, dormant by default): re-runs the recorded commands in the hermetic lab against a read-only detached checkout at the recorded `base_head`, recomputes env + per-command digests, surfaces digest/result mismatches honestly (tests/test_replay.py) |
 | P1 | Detect nondeterministic verification and label it honestly | DONE | M-EV-07 · deterministic repetitions → nondeterminism_labeled + DEGRADED |
 | P1 | Provide artifact retention and garbage-collection policies wi… | DONE | M-EV-08 · gc_artifacts (promoted-evidence-safe, retention days) |
 | P1 | Track: files inspected and changed; requirements covered; tes… | DONE | checkpoints (changed_paths) + requirements_covered + test evidence |
@@ -287,8 +313,8 @@ items remain deferred as the M-IN-01 non-goal. Status legend: **DONE** = deliver
 | P2 | Cached dependencies without contaminating results | DONE | M-CC-09 · DEPS_CACHE_DIR bound read-only |
 | P2 | Network policy per validation | DONE | M-CC-09 · NETWORK_POLICY none\|allowlist enforced in sandbox |
 | P2 | Deterministic clock, locale, timezone, randomness, filesystem… | DONE | TZ=UTC / SOURCE_DATE_EPOCH / PYTHONHASHSEED / LANG=C.UTF-8 |
-| P2 | Test-kind coverage: unit, integration, property, mutation, ad… | PARTIAL | verification_commands are fixed-argv declared commands (unit/integration via runner); property/mutation/ad-hoc harness not built in |
-| P2 | Static analysis and schema validation | PARTIAL | bridge validates its own config via pydantic; repo static analysis only via declared verification commands |
+| P2 | Test-kind coverage: unit, integration, property, mutation, ad… | DONE | 2026-08-28 · `VerificationCommand.kind` (`unit|integration|property|mutation|ad_hoc`, default `unit` keeps existing projects unchanged); property commands run under a deterministic seed derived from `base_head`+`command.id` (repetition-suffixed); mutation output parses best-effort into `mutation_stats`; kind folds into command/env digests only when non-unit (tests/test_verification.py TestKindTests) |
+| P2 | Static analysis and schema validation | DONE | 2026-08-28 · internal `ProjectPolicy.static_analysis` block (no new tool/capability): declared analyzers run read-only via the same hermetic runner, output parsed into structured findings; stdlib-only `schema_checks` (json/yaml-as-TOML/xml) over changed files; `fail_on="error"` (opt-in) flips the conclusion to FAIL, default `"never"` stays advisory; results persist in the `verification_static_analysis` sidecar (tests/test_verification.py StaticAnalysisTests) |
 | P2 | Performance and resource ceilings | DONE | wall-clock timeout in _run_exec + config ceilings (turns/tokens/wall/tool-failures) |
 | P2 | Flaky-test detection (deterministic repetitions) | DONE | M-EV-07 · verification_deterministic_repetitions labels divergence |
 | P2 | Baseline comparison | DONE | M-CC-09 · baseline_fingerprint + baseline_matches vs last green verification |
@@ -349,7 +375,7 @@ authoritative input to the implementation order in "Recommended next action".
 | M-CC-05 | Branch/PR race-safe idempotency | DONE | — (concurrency test: two `open_pull_request` via asyncio.gather under shared manager + mocked `_gh` → exactly one create + one edit; tests/test_pr.py) |
 | M-CC-06 | Unexpected-files / generated-artifact / submodule detection | DONE | — (configurable `unexpected_paths` policy; flag + reject at commit gate; tests/test_verification.py) |
 | M-CC-07 | Read-only completed-worktree recovery | DONE | — (`worktrees.recover_completed_worktree` re-attaches the vanished completed worktree as a detached checkout at `committed_sha`, re-derives + verifies the candidate fingerprint via `committed_state`, returns `JobWorktree(read_only=True)`; tests) |
-| M-CC-08 | Human control surface | DONE | — (`authorities_in_force` dashboard surface; 6 control tools `pause_development_job`/`extend_budget`/`narrow_scope`/`replace_worker`/`discard_candidate`/`revoke_authorization`, each ProjectCapability-gated, dormant by default; schema locked at 38 tools; tests/test_controls.py + test_server.py/test_checkpoints.py/test_persistence.py canaries) |
+| M-CC-08 | Human control surface | DONE | — (`authorities_in_force` dashboard surface; 6 control tools `pause_development_job`/`extend_budget`/`narrow_scope`/`replace_worker`/`discard_candidate`/`revoke_authorization`, each ProjectCapability-gated, dormant by default; schema locked at 39 tools after the 2026-08-28 `replay_verification` addition; tests/test_controls.py + test_server.py/test_checkpoints.py/test_persistence.py canaries) |
 | M-CC-09 | Verification-lab determinism | DONE | — (hermetic `_run_command`: `PIN_TOOLCHAIN` pinned venv, `DEPS_CACHE_DIR` read-only deps cache, `NETWORK_POLICY` none\|allowlist; TZ=UTC/SOURCE_DATE_EPOCH/PYTHONHASHSEED; `verification_deterministic_repetitions` flaky labeling + baseline; tests/test_verification.py) |
 | M-CC-10 | Failure-recovery hardening | DONE | — (`reset_worktree_to_base` corruption rollback, `recreate_detached` lost-worktree reconstruction at `base_head`, `remove` discard; tool-failure retry→isolate as FAILED_INFRASTRUCTURE; quarantine machinery; `job_worktree_meta` table; tests/test_recovery.py) |
 | M-CC-11 | Security hardening | DONE | — (`security.py` filesystem/credential policies, signed manifests, sensitivity classification; bwrap sandbox; supply_chain_scans pre-commit; reader_injection_defense; tests/test_security.py) |
@@ -1053,27 +1079,29 @@ milestones — PARTIAL), M-CT-05 (the two dormant states — PARTIAL,
 PARTIAL, not wired in). M-CT-01 is now DONE. Everything else is hardening or
 vision.
 
-## Recommended next action (2026-08-27)
+## Recommended next action (2026-08-28)
 
-1. **The entire roadmap R1–R3 + Cross-cutting is now DONE.** MCPB-001 → 012,
-   M-AL-01, all R1 (M-CT-02…07), all R2 (M-EV-01…08), all R3 (M-GV-01…07),
-   and all M-CC-01…11 shipped. The 2026-08-27 integration cherry-picked all 22
-   capability commits onto `main` in dependency order; the full suite is green
-   (**572 tests**). The CKS-002B blockers (M-CT-04, M-CT-05, M-EV-01) are all
-   closed.
-2. **No capability gaps remain to close.** Future work is optional hardening:
+1. **The entire roadmap R1–R3 + Cross-cutting is now DONE, including the three
+   former PARTIAL rows.** MCPB-001 → 012, M-AL-01, all R1 (M-CT-02…07), all R2
+   (M-EV-01…08), all R3 (M-GV-01…07), and all M-CC-01…11 shipped. The 2026-08-27
+   integration cherry-picked all 22 capability commits onto `main` in
+   dependency order; the 2026-08-28 PARTIAL-closure tail added the
+   `replay_verification` read-only tool (39 tools, 22 capabilities),
+   `VerificationCommand.kind` test-kind coverage, and the internal
+   `static_analysis` block; the full suite is green (**591 tests**).
+2. **Release.** Version stays **0.11.0** (the release commit `aa1b7b0` was never
+   pushed). The remaining work is release mechanics: merge `origin/main`,
+   push, tag `v0.11.0`, and a GitHub release — each step is an explicit
+   user-authorization action.
+3. **No capability gaps remain to close.** Future work is optional hardening:
    - **M-IN-01 (P3)** stays a non-goal (explicitly deferred).
-   - Optional: run a fresh audit (the 149-item table's P1/P2 rows were
-     verified against pre-integration code; re-verify a few against the merged
-     `main` if new gaps are suspected).
-   - Release/versioning: bump the version (currently `0.10.4` at HEAD through
-     all cherry-picks) to the next appropriate release, per the user's
-     versioning choice.
-3. The build discipline recorded here is now historical: implement → run the
+   - Optional: run a fresh audit of the 149-item table against the merged
+     `main` if new gaps are suspected.
+4. The build discipline recorded here is now historical: implement → run the
    full core suite (`PYTHONPATH=src .venv/bin/python -m unittest discover -s
    tests -v`) → inspect → commit (AGENTS.md §3); NEW SURFACE milestones add a
    `ProjectCapability` + `ToolAnnotations`, dormant by default, and bump the
-   tool-count canary (now 38).
+   tool-count canary (now 39).
 
 ## Non-goals (explicitly out of scope for the unblock)
 

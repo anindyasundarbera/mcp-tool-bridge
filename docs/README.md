@@ -11,8 +11,8 @@ the milestone record.
 | Document | What it covers |
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Components, request flow, governed lifecycle, durable state, isolation/locking, module map, threat model |
-| [TOOLS.md](TOOLS.md) | Full reference for all 32 MCP tools — params, capability gates, annotations, what each refuses |
-| [CAPABILITIES.md](CAPABILITIES.md) | The 15 capabilities, their dependency graph, the `projects.json` schema, opt-in discipline |
+| [TOOLS.md](TOOLS.md) | Full reference for all 39 MCP tools — params, capability gates, annotations, what each refuses |
+| [CAPABILITIES.md](CAPABILITIES.md) | The 22 capabilities, their dependency graph, the `projects.json` schema, opt-in discipline |
 | [GETTING-STARTED.md](GETTING-STARTED.md) | Install, register a project, run, run a full governed job end-to-end, full limits table |
 | [SECURITY.md](SECURITY.md) | Non-negotiable security boundaries, the two mutation surfaces, the threat model, hardening checklist |
 
@@ -41,6 +41,15 @@ state**.
 | MCPB-011 | [MCPB-011.md](MCPB-011.md) | — | Governed host runtime verification: one policy-named check, no shell, immutability recheck |
 | MCPB-012 | [MCPB-012.md](MCPB-012.md) | — | Working-tree candidate capture: capture approved dirty-tree changes without touching the source |
 | M-AL-01 | [M-AL-01.md](M-AL-01.md) | — | Read-only introspection: `list_development_jobs`, `get_effective_project_policy`, `resolve_candidate_canonicalization` |
+| M-GV-03 | [M-GV-03.md](M-GV-03.md) | — | External grounding for genesis/apex authority (`apex_authority_ref` + `REQUIRE_APEX_GROUNDING`) |
+| M-GV-04 | [M-GV-04.md](M-GV-04.md) | — | Spec-gated runtime under a ratified spec commit (`ratified_spec_commit`) |
+| M-GV-05 | [M-GV-05.md](M-GV-05.md) | — | Self-certification prevention (`drafter_id` guard) |
+| M-GV-06 | [M-GV-06.md](M-GV-06.md) | — | Capability-subset runtime enforcement for delegated children |
+| M-GV-07 | [M-GV-07.md](M-GV-07.md) | — | Parallel verify + independent review with conflict reconciliation |
+| M-CC-03 | [M-CC-03.md](M-CC-03.md) | — | Successor job from an immutable completed candidate |
+| M-CC-04 | [M-CC-04.md](M-CC-04.md) | — | Merge-vs-ratification (Option A: ratify, never merge/tag/release/deploy) |
+| M-CC-09 | [M-CC-09.md](M-CC-09.md) | — | The hermetic verification lab (PIN_TOOLCHAIN / DEPS_CACHE_DIR / NETWORK_POLICY) |
+| M-CC-11 | [M-CC-11.md](M-CC-11.md) | — | Security hardening tail (filesystem/credential policies, signed manifests, bwrap sandbox) |
 
 ---
 

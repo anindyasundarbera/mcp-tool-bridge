@@ -7,13 +7,13 @@ anything. Capabilities are validated at startup, so an invalid or
 self-contradictory `projects.json` fails the server before it can serve a
 request.
 
-This document describes the 15 capabilities, their dependency graph, the
+This document describes the 22 capabilities, their dependency graph, the
 `projects.json` schema, and the opt-in discipline (dormant-by-default) that
 governs every new surface.
 
 ---
 
-## The 15 capabilities
+## The 22 capabilities
 
 Defined in `src/local_dev_mcp/models.py` (`ProjectCapability`, a `StrEnum`).
 
@@ -34,6 +34,13 @@ Defined in `src/local_dev_mcp/models.py` (`ProjectCapability`, a `StrEnum`).
 | `runtime_verification` | `run_runtime_verification` | `repository_read` + ≥1 `runtime_verification_commands` | dormant (MCPB-011) |
 | `working_tree_candidate_capture` | `preflight_working_tree_capture`, `working_tree_candidate_capture` | `repository_read` + pinned `working_tree_capture_scope` | dormant (MCPB-012) |
 | `governed_disposable_runtime_action_execution` | `standalone_openhands_action` | — | dormant (OH) |
+| `replay_verification` | `replay_verification` | `verification_commit` | dormant (M-ROADMAP) |
+| `pause_development_job` | `pause_development_job` | `claude_edit` | dormant (M-CC-08) |
+| `extend_budget` | `extend_budget` | `claude_edit` | dormant (M-CC-08) |
+| `narrow_scope` | `narrow_scope` | `claude_edit` | dormant (M-CC-08) |
+| `replace_worker` | `replace_worker` | `claude_edit` | dormant (M-CC-08) |
+| `discard_candidate` | `discard_candidate` | `claude_edit` | dormant (M-CC-08) |
+| `revoke_authorization` | `revoke_authorization` | `verification_commit` | dormant (M-CC-08) |
 
 "Base" means a project may list the capability directly; "opt-in" and
 "dormant" mean the same thing in practice — **off by default**; a project
@@ -47,8 +54,15 @@ prerequisites) in `projects.json`.
 ```
 repository_read ─┬─ markdown_write (independent)
                  ├─ claude_edit ─┬─ verification_commit ─┬─ push_development_commit ─ open_pull_request
-                 │               │                       └─ candidate_review
-                 │               └─ candidate_review
+                 │               │                       ├─ candidate_review
+                 │               │                       └─ replay_verification      (M-ROADMAP, read-only replay)
+                 │               ├─ candidate_review
+                 │               ├─ pause_development_job   (M-CC-08)
+                 │               ├─ extend_budget           (M-CC-08)
+                 │               ├─ narrow_scope            (M-CC-08)
+                 │               ├─ replace_worker          (M-CC-08)
+                 │               └─ discard_candidate       (M-CC-08)
+                 ├─ verification_commit ─ revoke_authorization (M-CC-08)
                  ├─ sync_canonical_checkout
                  ├─ export_evidence_bundle
                  ├─ job_introspection        (M-AL-01, also requires claude_edit)
@@ -74,6 +88,14 @@ misleading authority, so the validator fail-closes.
 - `verification_commit` requires `claude_edit` + a non-empty `commit_roots` + ≥1 `verification_commands`.
 - `push_development_commit` requires `verification_commit`.
 - `open_pull_request` requires `push_development_commit`.
+- `replay_verification` requires `verification_commit` (read-only replay never
+  widens the authorization boundary beyond the project's existing verification
+  grant).
+- `pause_development_job`, `extend_budget`, `narrow_scope`, `replace_worker`,
+  `discard_candidate` each require `claude_edit` (they steer an active job's
+  lifecycle and need the job-running grant).
+- `revoke_authorization` requires `verification_commit` (it steers the durable
+  authorization ledger that gates commit/push/review/export).
 - `sync_canonical_checkout`, `export_evidence_bundle`, `policy_introspection`,
   `canonical_history_read`, `runtime_verification`,
   `working_tree_candidate_capture` all require `repository_read`.
@@ -122,6 +144,7 @@ Top level (a `ProjectRegistryDocument`, Pydantic, `extra="forbid"`):
 | `commit_roots` | list of relative paths | required when `verification_commit` is granted; `.` does not authorize hidden paths |
 | `protected_paths` | list of relative paths (default `[".git",".env"]`) | never readable/writable/committable |
 | `verification_commands` | list of `VerificationCommand` | fixed argv; see below |
+| `static_analysis` | `StaticAnalysis` or null (default null) | optional read-only analyzers + stdlib schema checks; see below |
 | `supply_chain_scans` | list of `SupplyChainCommand` | severity-gated commit-time scans |
 | `runtime_verification_commands` | list of `RuntimeVerificationCommand` | host-runtime checks |
 | `working_tree_capture_scope` | `WorkingTreeCaptureScope` or null | pinned include/protected-exclude scope |
@@ -147,10 +170,32 @@ verify time:
   "id": "core-tests",
   "argv": ["{python}", "-m", "unittest", "discover", "-s", "tests", "-v"],
   "python_path": ["src"],
-  "sandbox": false
+  "sandbox": false,
+  "kind": "unit"
 }
 ```
-`id` is `^[a-z][a-z0-9_-]{0,63}$`; `python_path` is ≤16 relative dirs → confined `PYTHONPATH`; `sandbox` (M-CC-11) runs repo-controlled verification scripts hermetically.
+`id` is `^[a-z][a-z0-9_-]{0,63}$`; `python_path` is ≤16 relative dirs → confined `PYTHONPATH`; `sandbox` (M-CC-11) runs repo-controlled verification scripts hermetically; `kind` is an optional test kind — `unit` (default) | `integration` | `property` | `mutation` | `ad_hoc`. `property` commands receive a deterministic `PROPERTY_TEST_SEED` (derived from the base HEAD + command id) so property runs are reproducible; `mutation` command output is parsed best-effort into advisory `mutation_stats` (unparseable output yields `mutation_stats: null`, never a hard failure).
+
+**`StaticAnalysis`** — optional, **advisory by default**. Declared analyzers
+(`commands`) run read-only over the candidate at verify time through the same
+hermetic runner; structured findings are parsed from their output (ruff, mypy,
+check-jsonschema style lines). `schema_checks` validate changed files against
+matching globs using the stdlib only (`json` / `tomllib` / `xml.etree`); full
+JSON-Schema engines run via a declared `commands` entry instead.
+`fail_on` is `"never"` (default) or `"error"` — only `"error"` flips an
+otherwise-passing verification to FAIL. No new dependency; no new tool or
+capability (gated by the existing `verification_commit` path).
+```json
+{
+  "commands": [
+    { "id": "ruff", "argv": ["ruff", "check", "."], "kind": "ad_hoc" }
+  ],
+  "fail_on": "never",
+  "schema_checks": [
+    { "path_glob": "**/*.json", "schema_kind": "json" }
+  ]
+}
+```
 
 **`SupplyChainCommand`** — runs at commit time; a non-zero exit rejects the
 commit (exactly how `grype --fail-on=high` surfaces a finding):
