@@ -849,6 +849,54 @@ def create_server(
         )
 
     @mcp.tool(
+        name="revoke_authorization",
+        description=(
+            "Revoke a previously granted authorization by marking it consumed, "
+            "so it can no longer be checked or used for its capability and "
+            "target. Refuses unknown ids and authorizations belonging to a "
+            "different project. Idempotent: revoking an already-used "
+            "authorization is a no-op success. Records a "
+            "control_revoke_authorization audit event. Opt-in via the "
+            "revoke_authorization project capability."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
+    async def revoke_authorization(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        authorization_id: Annotated[
+            str,
+            Field(
+                description=(
+                    "Opaque authorization ID from the dashboard "
+                    "authorities_in_force surface or an extend_budget grant."
+                ),
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+        reason: Annotated[
+            str | None,
+            Field(
+                description="Optional free-text justification for the audit record.",
+                max_length=2000,
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.REVOKE_AUTHORIZATION
+        )
+        return await active_jobs.revoke_authorization(
+            project, authorization_id, reason=reason
+        )
+
+    @mcp.tool(
         name="verify_development_job",
         description=(
             "Run only the fixed verification commands configured for a completed "

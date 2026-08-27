@@ -841,6 +841,24 @@ class DevelopmentJobManager:
         *,
         authority: dict[str, Any] | None = None,
     ) -> None:
+        """Append one row to the append-only audit ledger for a job."""
+        self._record_audit_event(
+            job.project_id,
+            job.job_id,
+            event_type,
+            detail,
+            authority=authority,
+        )
+
+    def _record_audit_event(
+        self,
+        project_id: str,
+        job_id: str,
+        event_type: str,
+        detail: dict[str, Any] | None = None,
+        *,
+        authority: dict[str, Any] | None = None,
+    ) -> None:
         """Append one row to the append-only audit ledger.
 
         M-EV-05: governance-changing events (status / extension / pause /
@@ -848,7 +866,9 @@ class DevelopmentJobManager:
         authority source, scope, and source classification. The ``authority_id``
         is embedded in the event's ``detail_json`` and the full record is
         persisted to the sidecar ``authority_records`` table so the authority
-        behind every governance instruction is durable and queryable.
+        behind every governance instruction is durable and queryable. M-CC-08:
+        ``job_id`` is the job the event belongs to; a project-scoped event (for
+        example revoking a project-level authorization) uses an empty sentinel.
         """
         detail = dict(detail or {})
         if authority is not None:
@@ -858,7 +878,7 @@ class DevelopmentJobManager:
                 self._db,
                 {
                     "authority_id": authority_id,
-                    "job_id": job.job_id,
+                    "job_id": job_id,
                     "event_id": None,
                     "actor": authority.get("actor", "bridge"),
                     "authority_source": authority.get("authority_source", "bridge_internal"),
@@ -871,8 +891,8 @@ class DevelopmentJobManager:
         store.insert_event_row(
             self._db,
             {
-                "job_id": job.job_id,
-                "project_id": job.project_id,
+                "job_id": job_id,
+                "project_id": project_id,
                 "occurred_at": _timestamp(),
                 "event_type": event_type,
                 "detail_json": _json_dumps(detail),
@@ -2988,6 +3008,77 @@ class DevelopmentJobManager:
                 "path": str(discarded_path),
                 "reason": reason or None,
             },
+        }
+
+    async def revoke_authorization(
+        self,
+        project: ProjectPolicy,
+        authorization_id: str,
+        *,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """M-CC-08: revoke a previously granted authorization.
+
+        Marks the authorization consumed (used) so it can no longer be checked
+        or consumed for its capability/target, and records a
+        ``control_revoke_authorization`` audit event. Refuses unknown ids and
+        authorizations belonging to a different project. Idempotent: revoking
+        an already-used authorization is a no-op success (no duplicate audit
+        event).
+        """
+        reason = (reason or "").strip()
+        if len(reason) > 2000:
+            raise DevelopmentJobError("reason must be at most 2000 characters")
+        async with self._state_lock:
+            authorization_manager = self._authorization_manager()
+            existing = authorization_manager.get(authorization_id)
+            if existing is None:
+                raise DevelopmentJobError(
+                    f"unknown authorization_id {authorization_id!r}"
+                )
+            if existing.project_id != project.id:
+                raise DevelopmentJobError(
+                    "authorization belongs to a different project"
+                )
+            already_revoked = existing.used
+            if already_revoked:
+                return {
+                    "revoked": False,
+                    "authorization_id": authorization_id,
+                    "capability": existing.capability,
+                    "reason": reason or None,
+                }
+            revoked = authorization_manager.revoke(authorization_id)
+            if revoked is None:
+                raise DevelopmentJobError(
+                    "authorization could not be revoked (concurrent use)"
+                )
+            self._record_audit_event(
+                project.id,
+                existing.job_id if existing.job_id else "",
+                "control_revoke_authorization",
+                {
+                    "authorization_id": authorization_id,
+                    "capability": existing.capability,
+                    "target": existing.target,
+                    "job_id": existing.job_id,
+                    "revoked": True,
+                    "reason": reason or None,
+                },
+                authority={
+                    "actor": "ChatGPT",
+                    "authority_source": "chatgpt_confirmation",
+                    "scope": "revoke_authorization",
+                    "classification": "canonical",
+                },
+            )
+        return {
+            "revoked": True,
+            "authorization_id": authorization_id,
+            "capability": existing.capability,
+            "target": existing.target,
+            "job_id": existing.job_id,
+            "reason": reason or None,
         }
 
     async def verification_worktree(

@@ -332,7 +332,7 @@ class PersistenceTests(unittest.TestCase):
         # Persistence is internal; it must not add any MCP tool. The count is the
         # current tool surface (33 after the M-CC-08 human control surface added
         # pause_development_job); persistence itself adds none.
-        self.assertEqual(len(tools), 37)
+        self.assertEqual(len(tools), 38)
         for leaked in ("persist_job", "reload_jobs"):
             self.assertNotIn(leaked, tools)
         # resume still takes job_id, never session_id.

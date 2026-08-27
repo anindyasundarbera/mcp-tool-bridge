@@ -709,6 +709,123 @@ class DiscardCandidateTests(unittest.TestCase):
         asyncio.run(exercise())
 
 
+class RevokeAuthorizationTests(unittest.TestCase):
+    """revoke_authorization: mark used, idempotent, audit event."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        initialize_git_repository(self.root)
+        self.settings = control_settings(self.base)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_revoke_marks_authorization_used_and_records_event(self) -> None:
+        async def exercise() -> None:
+            from local_dev_mcp.authorization import AuthorizationError
+
+            policy = project(self.root, ["{python}", "-c", "print('ok')"])
+            jobs, authorization = job_managers(self.settings, policy)
+            completed = await start_completed(jobs, policy)
+            job_id = str(completed["job_id"])
+            issued = authorization.issue(policy.id, "commit", job_id, job_id=job_id)
+            auth_id = issued.authorization_id
+
+            revoked = await jobs.revoke_authorization(
+                policy, auth_id, reason="superseded"
+            )
+            self.assertTrue(revoked["revoked"])
+            self.assertEqual(revoked["authorization_id"], auth_id)
+            self.assertEqual(revoked["capability"], "commit")
+            self.assertEqual(revoked["job_id"], job_id)
+            self.assertEqual(revoked["reason"], "superseded")
+
+            # No longer in force and cannot be consumed.
+            in_force = authorization.list_active_for(policy.id, job_id=job_id)
+            self.assertNotIn("commit", {entry.capability for entry in in_force})
+            with self.assertRaises(AuthorizationError):
+                authorization.consume(auth_id)
+
+            # Audit event recorded against the authorization's job.
+            events = event_types(jobs._db, job_id)
+            self.assertEqual(events.count("control_revoke_authorization"), 1)
+
+        asyncio.run(exercise())
+
+    def test_revoke_is_idempotent_and_scoped(self) -> None:
+        async def exercise() -> None:
+            policy = project(self.root, ["{python}", "-c", "print('ok')"])
+            jobs, authorization = job_managers(self.settings, policy)
+            completed = await start_completed(jobs, policy)
+            job_id = str(completed["job_id"])
+            issued = authorization.issue(policy.id, "commit", job_id, job_id=job_id)
+            auth_id = issued.authorization_id
+
+            first = await jobs.revoke_authorization(policy, auth_id)
+            self.assertTrue(first["revoked"])
+            # Idempotent: revoking an already-used authorization is a no-op with
+            # no duplicate audit event.
+            again = await jobs.revoke_authorization(policy, auth_id)
+            self.assertFalse(again["revoked"])
+            self.assertEqual(
+                event_types(jobs._db, job_id).count("control_revoke_authorization"), 1
+            )
+
+            # Unknown ids and cross-project revocations are refused.
+            with self.assertRaises(DevelopmentJobError):
+                await jobs.revoke_authorization(policy, "0" * 32)
+            other = project(
+                self.root, ["{python}", "-c", "print('ok')"], id="other-project"
+            )
+            jobs2, _ = job_managers(self.settings, other)
+            other_auth = authorization.issue(
+                other.id, "commit", "some-job", job_id="some-job"
+            )
+            with self.assertRaises(DevelopmentJobError):
+                await jobs.revoke_authorization(policy, other_auth.authorization_id)
+
+        asyncio.run(exercise())
+
+    def test_revoke_is_capability_gated_via_server(self) -> None:
+        async def exercise() -> None:
+            from fastmcp.exceptions import ToolError
+
+            policy = project(
+                self.root,
+                ["{python}", "-c", "print('ok')"],
+                capabilities=["repository_read", "claude_edit", "verification_commit"],
+            )
+            server = server_for(self.base, policy)
+            with self.assertRaises(ToolError):
+                await server.call_tool(
+                    "revoke_authorization",
+                    {"project_id": "test-project", "authorization_id": "0" * 32},
+                )
+
+        asyncio.run(exercise())
+
+    def test_revoke_capability_requires_verification_commit_in_policy(self) -> None:
+        async def exercise() -> None:
+            with self.assertRaises(ValueError):
+                ProjectPolicy.model_validate(
+                    {
+                        "id": "test-project",
+                        "display_name": "T",
+                        "description": "T",
+                        "root": str(self.root),
+                        "capabilities": [
+                            "repository_read",
+                            "claude_edit",
+                            ProjectCapability.REVOKE_AUTHORIZATION.value,
+                        ],
+                    }
+                )
+
+        asyncio.run(exercise())
+
+
 class PauseDevelopmentJobTests(unittest.TestCase):
     """pause_development_job: capability-gated, idempotent, audit event."""
 

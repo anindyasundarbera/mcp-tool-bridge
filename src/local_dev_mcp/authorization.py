@@ -262,3 +262,23 @@ class AuthorizationManager:
                     continue
             active.append(authorization)
         return active
+
+    def revoke(self, authorization_id: str) -> Authorization | None:
+        """Atomically mark an authorization as revoked (used).
+
+        M-CC-08: the revoke_authorization human control marks a previously
+        granted authorization consumed so it can no longer be used, regardless
+        of whether it was job-scoped or project-scoped. Idempotent and
+        repeat-safe: revoking an unknown or already-used authorization is a
+        no-op returning ``None``. Returns the authorization only when it was
+        newly revoked by this call.
+        """
+        row = store.load_authorization_row(self._db, authorization_id)
+        if row is None:
+            return None
+        authorization = authorization_from_row(row)
+        if authorization is None or authorization.used:
+            return None
+        if not store.mark_authorization_used(self._db, authorization_id):
+            return None
+        return authorization
