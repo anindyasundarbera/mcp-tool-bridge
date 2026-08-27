@@ -123,6 +123,7 @@ CREATE TABLE IF NOT EXISTS job_progress (
     milestones_json TEXT,
     parent_job_id TEXT,
     delegation_mandate_json TEXT,
+    drafter_id TEXT,
     updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS delegations (
@@ -423,11 +424,13 @@ _UPSERT_PROGRESS = """
 INSERT INTO job_progress (
     job_id, pause_reason, turns_used, tokens_used, extensions_granted,
     no_progress_turns, tool_failures, soft_warned, wall_seconds_used,
-    milestones_json, parent_job_id, delegation_mandate_json, updated_at
+    milestones_json, parent_job_id, delegation_mandate_json, drafter_id,
+    updated_at
 ) VALUES (
     :job_id, :pause_reason, :turns_used, :tokens_used, :extensions_granted,
     :no_progress_turns, :tool_failures, :soft_warned, :wall_seconds_used,
-    :milestones_json, :parent_job_id, :delegation_mandate_json, :updated_at
+    :milestones_json, :parent_job_id, :delegation_mandate_json, :drafter_id,
+    :updated_at
 )
 ON CONFLICT(job_id) DO UPDATE SET
     pause_reason = excluded.pause_reason,
@@ -441,6 +444,7 @@ ON CONFLICT(job_id) DO UPDATE SET
     milestones_json = excluded.milestones_json,
     parent_job_id = excluded.parent_job_id,
     delegation_mandate_json = excluded.delegation_mandate_json,
+    drafter_id = excluded.drafter_id,
     updated_at = excluded.updated_at
 """
 
@@ -500,6 +504,9 @@ _ADDITIVE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("tool_failures", "INTEGER NOT NULL DEFAULT 0"),
         ("parent_job_id", "TEXT"),
         ("delegation_mandate_json", "TEXT"),
+        # M-GV-05: identity of the agent that drafted the candidate, so a
+        # later review can reject reviewer_id == drafter (self-certification).
+        ("drafter_id", "TEXT"),
         # M-CT-02: cumulative wall-time across all slices (seconds). REAL so a
         # float accumulates precisely; NOT NULL DEFAULT 0 keeps old rows valid.
         ("wall_seconds_used", "REAL NOT NULL DEFAULT 0"),
@@ -1599,7 +1606,10 @@ def upsert_progress_row(connection: sqlite3.Connection, row: dict[str, Any]) -> 
     SCHEMA_VERSION 1. Re-hydrated synchronously in ``DevelopmentJobManager``.
     """
     with connection:
-        connection.execute(_UPSERT_PROGRESS, row)
+        # Backwards-compatible: callers that build a progress row without the
+        # additive M-GV-05 drafter_id key still bind it (as NULL) instead of
+        # tripping sqlite's "did not supply a value for binding parameter".
+        connection.execute(_UPSERT_PROGRESS, {**row, "drafter_id": row.get("drafter_id")})
 
 
 def load_progress_row(

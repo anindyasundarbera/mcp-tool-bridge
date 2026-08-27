@@ -696,11 +696,13 @@ class ReviewManager:
         Trust boundary: the bridge records the verdict the caller passes and
         binds it to the candidate state, but it does **not** attest *who*
         reviewed — any client with ``CANDIDATE_REVIEW`` can call this, including
-        the drafting agent, so a drafter could self-review and satisfy a
-        ``requires_review`` gate. This tool is the route for an *external*
-        (human or out-of-band) reviewer to lodge a verdict through the bridge;
-        the strong, attested guarantee of an independent reviewer is
-        ``run_independent_review``, which the bridge spawns itself.
+        the drafting agent. The strong, attested guarantee of an independent
+        reviewer is ``run_independent_review``, which the bridge spawns itself.
+
+        M-GV-05: self-certification prevention. The job records its drafting
+        identity (``drafter_id``); if the supplied ``reviewer_id`` equals the
+        drafter, the review is rejected so no agent can certify its own draft.
+        The guard is inert when the job has no recorded drafter (legacy rows).
 
         M-EV-03: stamps ``reviewer_independence_class`` on the review binding —
         ``human`` by default, or ``external`` when the caller signals it via
@@ -711,6 +713,14 @@ class ReviewManager:
         """
         coerced = _coerce_verdict(verdict)
         reviewer = _validate_reviewer_id(reviewer_id)
+        # M-GV-05: reject a review by the job's own drafter (self-certification).
+        drafter_id = self._jobs.drafter_id_for(project, job_id)
+        if reviewer is not None and drafter_id is not None and reviewer == drafter_id:
+            raise ReviewError(
+                "self-certification is not allowed: reviewer_id matches the "
+                "job's drafter identity; an independent reviewer must certify "
+                "the candidate"
+            )
         independence_class = (
             REVIEWER_INDEPENDENCE_EXTERNAL
             if external

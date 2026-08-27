@@ -1570,5 +1570,150 @@ class ReviewReconciliationTests(unittest.TestCase):
         asyncio.run(exercise())
 
 
+class SelfCertificationTests(unittest.TestCase):
+    """M-GV-05: record_candidate_review rejects a review by the job's drafter.
+
+    A job records its drafting identity (``drafter_id``, persisted in the
+    ``job_progress`` sidecar). Recording a review with ``reviewer_id ==
+    drafter`` is a self-certification and must be rejected; an independent
+    human review (distinct ``reviewer_id``) is recorded normally. The guard
+    is inert when the job has no recorded drafter (legacy rows).
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        initialize_git_repository(self.root)
+        self.settings = Settings.from_env(
+            {
+                "PROJECTS_CONFIG_PATH": str(self.base / "projects.json"),
+                "JOB_WORKTREE_ROOT": str(self.base / "jobs"),
+                "VERIFICATION_COMMAND_TIMEOUT_SECONDS": "2",
+                "MAX_VERIFICATION_OUTPUT_BYTES": "64",
+            }
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _managers(
+        self, project: ProjectPolicy, edit: Any
+    ) -> tuple[ProjectLockManager, DevelopmentJobManager, ReviewManager]:
+        locks = ProjectLockManager()
+        jobs = DevelopmentJobManager(
+            self.settings, locks, EditingExecutor(edit), projects=(project,)
+        )
+        review = ReviewManager(
+            self.settings, locks, jobs, ReviewExecutor(), projects=(project,)
+        )
+        return locks, jobs, review
+
+    async def _completed_job(
+        self, jobs: DevelopmentJobManager, project: ProjectPolicy, edit: Any,
+        drafter_id: str | None = "human:drafter-alice",
+    ) -> dict[str, Any]:
+        started = await jobs.start(
+            project, "make candidate", "high", drafter_id=drafter_id
+        )
+        completed = await wait_completed(jobs, project, str(started["job_id"]))
+        assert completed["status"] == "completed"
+        return completed
+
+    def test_self_review_is_rejected(self) -> None:
+        async def exercise() -> None:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            _, jobs, review = self._managers(project, edit)
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+            # The drafter identity is recorded on the job and surfaced.
+            self.assertEqual(jobs.drafter_id_for(project, job_id), "human:drafter-alice")
+            self.assertEqual(completed["drafter_id"], "human:drafter-alice")
+
+            # A review by the job's own drafter is a self-certification.
+            with self.assertRaisesRegex(ReviewError, "self-certification"):
+                await review.record_candidate_review(
+                    project, job_id,
+                    {"summary": "ok", "issues": [], "recommendation": "approve"},
+                    reviewer_id="human:drafter-alice",
+                )
+
+        asyncio.run(exercise())
+
+    def test_independent_human_review_is_recorded(self) -> None:
+        async def exercise() -> None:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            _, jobs, review = self._managers(project, edit)
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+
+            # A distinct reviewer records normally.
+            recorded = await review.record_candidate_review(
+                project, job_id,
+                {"summary": "ok", "issues": [], "recommendation": "approve"},
+                reviewer_id="human:reviewer-bob",
+            )
+            self.assertEqual(recorded["reviewer_id"], "human:reviewer-bob")
+            self.assertEqual(recorded["reviewer_independence_class"], "human")
+            # The review survives a manager reload.
+            _, _, review_b = self._managers(project, lambda root: None)
+            fetched = await review_b.get_candidate_review(
+                project, job_id, recorded["review_id"]
+            )
+            self.assertEqual(fetched["reviewer_id"], "human:reviewer-bob")
+
+        asyncio.run(exercise())
+
+    def test_guard_is_inert_without_recorded_drafter(self) -> None:
+        async def exercise() -> None:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            _, jobs, review = self._managers(project, edit)
+            completed = await self._completed_job(jobs, project, edit, drafter_id=None)
+            job_id = str(completed["job_id"])
+            self.assertIsNone(jobs.drafter_id_for(project, job_id))
+
+            # No drafter recorded (legacy row): any reviewer id is accepted.
+            recorded = await review.record_candidate_review(
+                project, job_id,
+                {"summary": "ok", "issues": [], "recommendation": "approve"},
+                reviewer_id="human:alice",
+            )
+            self.assertEqual(recorded["reviewer_id"], "human:alice")
+
+        asyncio.run(exercise())
+
+    def test_drafter_survives_restart(self) -> None:
+        async def exercise() -> None:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            locks, jobs, _ = self._managers(project, edit)
+            completed = await self._completed_job(jobs, project, edit)
+            job_id = str(completed["job_id"])
+            # Reload a fresh manager from the same durable state.
+            jobs_b = DevelopmentJobManager(
+                self.settings, locks, EditingExecutor(edit), projects=(project,)
+            )
+            self.assertEqual(
+                jobs_b.drafter_id_for(project, job_id), "human:drafter-alice"
+            )
+
+        asyncio.run(exercise())
+
+
 if __name__ == "__main__":
     unittest.main()

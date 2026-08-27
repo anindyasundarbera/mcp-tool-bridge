@@ -491,7 +491,12 @@ def create_server(
         ] = None,
     ) -> dict[str, Any]:
         project = active_registry.resolve(project_id, ProjectCapability.CLAUDE_EDIT)
-        return await active_jobs.start(project, text, effort, requested_base)
+        # M-GV-05: record the drafting identity on the job so a later
+        # record_candidate_review with the same reviewer_id is rejected
+        # (self-certification prevention).
+        return await active_jobs.start(
+            project, text, effort, requested_base, drafter_id="ChatGPT"
+        )
 
     @mcp.tool(
         name="get_development_job",

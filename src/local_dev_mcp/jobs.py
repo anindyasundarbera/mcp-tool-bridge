@@ -324,6 +324,12 @@ class DevelopmentJob:
     # sidecar (additive) so the ``jobs`` schema is untouched.
     parent_job_id: str | None = None
     delegation_mandate: dict[str, Any] | None = None
+    # M-GV-05: identity of the agent that drafted this candidate (e.g.
+    # ``"ChatGPT"`` for a bridge-created job, inherited by delegated children).
+    # Recorded on the job so ``record_candidate_review`` can reject a
+    # self-review (``reviewer_id == drafter``). Persisted in the
+    # ``job_progress`` sidecar (additive).
+    drafter_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -619,6 +625,7 @@ class DevelopmentJobManager:
             "milestones_json": _json_dumps(job.milestones),
             "parent_job_id": job.parent_job_id,
             "delegation_mandate_json": _json_dumps(job.delegation_mandate),
+            "drafter_id": job.drafter_id,
             "updated_at": _timestamp(),
         }
 
@@ -649,6 +656,7 @@ class DevelopmentJobManager:
         mandate = _json_loads(row.get("delegation_mandate_json"))
         if isinstance(mandate, dict):
             job.delegation_mandate = mandate
+        job.drafter_id = row.get("drafter_id")
 
     def _record_event(
         self,
@@ -1459,6 +1467,8 @@ class DevelopmentJobManager:
             snapshot["parent_job_id"] = job.parent_job_id
         if job.delegation_mandate is not None:
             snapshot["delegation_mandate"] = job.delegation_mandate
+        if job.drafter_id is not None:
+            snapshot["drafter_id"] = job.drafter_id
         # M-GV-06: surface the parent/child delegation tree (children of this
         # job, from the delegations ledger) so an orchestrator can query it.
         children = store.load_delegation_rows_for_parent(self._db, job.job_id)
@@ -1742,6 +1752,48 @@ class DevelopmentJobManager:
             )
         return job
 
+    @staticmethod
+    def _clean_drafter_id(drafter_id: str | None) -> str | None:
+        """Validate + normalize a drafter identity (bounded, printable)."""
+        if drafter_id is None:
+            return None
+        if not isinstance(drafter_id, str):
+            raise DevelopmentJobError("drafter_id must be a string")
+        cleaned = drafter_id.strip()
+        if not cleaned:
+            raise DevelopmentJobError("drafter_id must not be empty")
+        if len(cleaned) > 200:
+            raise DevelopmentJobError("drafter_id must be at most 200 characters")
+        if any(not (char.isprintable() or char.isspace()) for char in cleaned):
+            raise DevelopmentJobError(
+                "drafter_id must contain only printable characters"
+            )
+        return cleaned
+
+    def drafter_id_for(self, project: ProjectPolicy, job_id: str) -> str | None:
+        """M-GV-05: return the job's recorded drafting identity (or None)."""
+        return self._require_job(project, job_id).drafter_id
+
+    async def set_drafter(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        drafter_id: str,
+    ) -> None:
+        """M-GV-05: record the drafting identity on an existing job (additive).
+
+        Persisted in the ``job_progress`` sidecar so it round-trips across a
+        restart. The self-certification guard in ``record_candidate_review``
+        is inert until a drafter is recorded on the job.
+        """
+        cleaned = self._clean_drafter_id(drafter_id)
+        async with self._state_lock:
+            job = self._require_job(project, job_id)
+            job.drafter_id = cleaned
+            job.updated_at = _timestamp()
+            self._persist_job(job)
+            self._persist_progress(job)
+
     def new_job_id(self) -> str:
         """Allocate a unique job ID without starting a Claude run (MCPB-012).
 
@@ -1820,9 +1872,12 @@ class DevelopmentJobManager:
         text: str,
         effort: Effort | None = None,
         requested_base: str | None = None,
+        *,
+        drafter_id: str | None = None,
     ) -> dict[str, Any]:
         effort = resolve_effort(project, effort, self.settings)
         specification = self._validate_input(project, text, effort)
+        drafter_id = self._clean_drafter_id(drafter_id)
         # M-GV-03: the first job on the project (its genesis job) anchors the
         # project's apex authority and requires the external grounding ref to
         # be present and unchanged since registration.
@@ -1845,6 +1900,7 @@ class DevelopmentJobManager:
                 project_id=project.id,
                 effort=effort,
                 requested_base=requested_base,
+                drafter_id=drafter_id,
             )
             self._jobs[job.job_id] = job
             self._persist_progress(job)
@@ -1874,6 +1930,7 @@ class DevelopmentJobManager:
         effort: Effort | None = None,
         *,
         mandate: dict[str, Any],
+        drafter_id: str | None = None,
     ) -> dict[str, Any]:
         """M-GV-06: spawn a bounded child job delegated from a parent job.
 
@@ -1886,6 +1943,10 @@ class DevelopmentJobManager:
         ``delegation_mandate`` are persisted on its ``job_progress`` sidecar.
         Internal-first: no new MCP tool; a parent job spawns children via this
         manager method.
+
+        M-GV-05: the child inherits the parent's ``drafter_id`` unless an
+        explicit one is supplied, so the self-certification guard sees the
+        same drafting identity on both.
         """
         effort = resolve_effort(project, effort, self.settings)
         specification = self._validate_input(project, text, effort)
@@ -1893,6 +1954,7 @@ class DevelopmentJobManager:
         # project's ratified spec commit when one is set.
         self._validate_spec_pinned(project, specification)
         mandate = self._validate_mandate(mandate)
+        drafter_id = self._clean_drafter_id(drafter_id)
         async with self._state_lock:
             parent = self._require_job(project, parent_job_id)
             # M-GV-06 depth bound: a child may not itself delegate, so the
@@ -1914,6 +1976,12 @@ class DevelopmentJobManager:
                 effort=effort,
                 parent_job_id=parent_job_id,
                 delegation_mandate=mandate,
+                # M-GV-05: the child's drafting identity defaults to the
+                # parent's, so the same agent cannot later self-certify the
+                # child's candidate under a different job ID.
+                drafter_id=(
+                    drafter_id if drafter_id is not None else parent.drafter_id
+                ),
             )
             self._jobs[child.job_id] = child
             self._persist_progress(child)
