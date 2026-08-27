@@ -1922,6 +1922,27 @@ def load_authorization_row(
     return dict(row) if row is not None else None
 
 
+def load_authorization_rows_for(
+    connection: sqlite3.Connection,
+    project_id: str,
+) -> list[dict[str, Any]]:
+    """Return a project's unused authorization rows as dicts, oldest first.
+
+    M-CC-08: the dashboard enrichment surfaces the project's in-force
+    (unused) authorizations. Expiry filtering is left to the caller
+    (``AuthorizationManager.list_active_for``) so this store reader stays a
+    plain, dependency-free projection.
+    """
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM authorizations WHERE project_id = ? AND used = 0 "
+            "ORDER BY issued_at ASC, authorization_id ASC",
+            (project_id,),
+        ).fetchall()
+    ]
+
+
 def mark_authorization_used(
     connection: sqlite3.Connection, authorization_id: str
 ) -> bool:

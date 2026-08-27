@@ -555,6 +555,10 @@ class DevelopmentJobManager:
         # never opens the extra DB connections or imports the managers.
         self._verification: Any = None
         self._review: Any = None
+        # M-CC-08: authorization manager for the dashboard's
+        # ``authorities_in_force`` surface. Lazily constructed (mirrors
+        # ``_requirements``) and shares this manager's state root / DB.
+        self._authorizations: Any = None
         self._reload_jobs()
 
     def _reload_jobs(self) -> None:
@@ -702,6 +706,26 @@ class DevelopmentJobManager:
     def _project_policies(self) -> tuple[ProjectPolicy, ...]:
         """Return the project policies this manager was constructed with."""
         return self._projects
+
+    def _authorization_manager(self) -> Any:
+        """Return the AuthorizationManager, lazily constructing it if needed.
+
+        M-CC-08: the dashboard's ``authorities_in_force`` surface reads the
+        durable authorizations ledger. Mirrors ``_requirements_manager``: the
+        manager shares this job manager's state root (and therefore the same
+        ``bridge.db``) so there is a single write path and no second WAL-lock
+        competitor. Uses a lazy import to avoid a module-load-time dependency.
+        """
+        if self._authorizations is not None:
+            return self._authorizations
+        from .authorization import AuthorizationManager
+
+        self._authorizations = AuthorizationManager(
+            self.settings,
+            worktrees=self._worktrees,
+            projects=self._projects,
+        )
+        return self._authorizations
 
     def _progress_to_row(self, job: DevelopmentJob) -> dict[str, Any]:
         return {
@@ -1728,6 +1752,35 @@ class DevelopmentJobManager:
                 }
                 for row in authority_records
             ]
+        # M-CC-08: surface the project's in-force durable authorizations
+        # (unused + unexpired), scoped to this job when the authorization is
+        # job-scoped and this job's row otherwise. Read-only projection of the
+        # M-GV-01 authorizations ledger so a human operator can see exactly
+        # which grants remain available. Non-fatal: a project with no durable
+        # authorization path yields an empty list.
+        try:
+            active_authorizations = self._authorization_manager().list_active_for(
+                job.project_id, job_id=job.job_id
+            )
+            if active_authorizations:
+                snapshot["authorities_in_force"] = [
+                    {
+                        "authorization_id": item.authorization_id,
+                        "job_id": item.job_id,
+                        "actor": item.actor,
+                        "authority_source": item.authority_source,
+                        "capability": item.capability,
+                        "target": item.target,
+                        "issued_at": item.issued_at,
+                        "expires_at": item.expires_at,
+                        "single_use": item.single_use,
+                        "used": item.used,
+                        "detail": item.detail,
+                    }
+                    for item in active_authorizations
+                ]
+        except Exception:
+            pass
         # M-EV-01: surface a bounded requirements_covered summary so an
         # orchestrator can see covered/uncovered/deferred/contradictory counts
         # and the list of uncovered normative IDs. Non-fatal: a project with

@@ -224,3 +224,41 @@ class AuthorizationManager:
         """Return an authorization record, or None if it does not exist."""
         row = store.load_authorization_row(self._db, authorization_id)
         return authorization_from_row(row) if row is not None else None
+
+    def list_active_for(
+        self,
+        project_id: str,
+        job_id: str | None = None,
+    ) -> list[Authorization]:
+        """Return a project's in-force authorizations (unused + unexpired).
+
+        M-CC-08: the dashboard enrichment surfaces the authorizations a human
+        has granted that are still available to be consumed. ``used`` is
+        filtered at the store layer; expiry is filtered here with the same
+        semantics as ``check`` (a ``NULL`` ``expires_at`` never expires, and a
+        corrupt expiry is treated as not in force). Optionally narrowed to one
+        job. Read-only — never consumes or mutates.
+        """
+        active: list[Authorization] = []
+        now = datetime.now(UTC)
+        for row in store.load_authorization_rows_for(self._db, project_id):
+            authorization = authorization_from_row(row)
+            if authorization is None:
+                continue
+            # A job-scoped query also surfaces project-scoped grants
+            # (``job_id`` NULL), which apply to any job in the project.
+            if (
+                job_id is not None
+                and authorization.job_id is not None
+                and authorization.job_id != job_id
+            ):
+                continue
+            if authorization.expires_at is not None:
+                try:
+                    expires = datetime.fromisoformat(authorization.expires_at)
+                except ValueError:
+                    continue
+                if now > expires:
+                    continue
+            active.append(authorization)
+        return active
