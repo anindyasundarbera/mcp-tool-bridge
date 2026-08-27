@@ -10,6 +10,7 @@ import secrets
 import signal
 import stat
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -102,6 +103,98 @@ def compute_environment_digest(
         digest.update(_frame(b"toolchain"))
         digest.update(_frame(toolchain_pin_digest.encode("ascii")))
     return digest.hexdigest()
+
+
+def _toolchain_python(pin: str) -> str:
+    """Resolve the pinned interpreter for a toolchain pin (M-CC-09).
+
+    A pin may name either a venv directory (whose interpreter lives at
+    ``<pin>/bin/python``) or an interpreter/executable file directly. The
+    resolved path replaces ``{python}`` when the project opts into a pinned
+    toolchain, so verification commands run against the operator-pinned
+    interpreter instead of the bridge's own.
+    """
+    path = Path(pin)
+    if path.is_dir():
+        return str(path / "bin" / "python")
+    return pin
+
+
+def _toolchain_pin_digest(pin: str) -> str:
+    """SHA-256 over the canonical toolchain-pin path (M-CC-09).
+
+    The pin is already canonicalized (absolute, resolved) by the model
+    validator, so the digest is stable across runs and changes only when the
+    operator changes the pin. It feeds ``compute_environment_digest`` so a
+    pinned-toolchain verification carries a stable toolchain fingerprint.
+    """
+    digest = hashlib.sha256()
+    digest.update(b"local-dev-mcp-toolchain-pin-v1\0")
+    digest.update(_frame(os.path.abspath(pin).encode("utf-8")))
+    return digest.hexdigest()
+
+
+def _network_failed(command_id: str, error: str) -> dict[str, Any]:
+    """A fail-closed verification result for a network-isolation violation.
+
+    M-CC-09: when a project's network policy requires isolation the sandbox
+    cannot deliver for this command, the command must not run unsandboxed —
+    it returns a failed result (exit code None, no authority), which fails the
+    whole verification closed.
+    """
+    return {
+        "command_id": command_id,
+        "status": "failed",
+        "exit_code": None,
+        "error": error,
+    }
+
+
+def _write_network_hosts_file(allowlist: tuple[str, ...]) -> str:
+    """Write the allowlist hosts file for a network-policy sandbox (M-CC-09).
+
+    The generated file pins every host to loopback: ``localhost`` plus each
+    allowlisted hostname (reachable only via the project's loopback proxy).
+    Combined with an empty ``/etc/resolv.conf`` bound into the sandbox, DNS
+    resolution for any host NOT in the allowlist fails closed, so a sandboxed
+    command can only ever reach the allowlisted loopback endpoints. Returns the
+    path of the generated file (the caller removes it after the run).
+    """
+    descriptor, path = tempfile.mkstemp(prefix="bridge-hosts-", suffix=".conf")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write("127.0.0.1 localhost\n")
+            for host in allowlist:
+                handle.write(f"127.0.0.1 {host}\n")
+        os.chmod(path, 0o600)
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _write_empty_resolv_conf() -> str:
+    """Write an empty resolv.conf for a network-policy sandbox (M-CC-09).
+
+    Binding this at ``/etc/resolv.conf`` inside the sandbox makes every DNS
+    query fail, so only hostnames present in the allowlist hosts file (pinned
+    to loopback) are reachable — everything else fails closed.
+    """
+    descriptor, path = tempfile.mkstemp(prefix="bridge-resolv-", suffix=".conf")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8"):
+            pass
+        os.chmod(path, 0o600)
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return path
 
 
 def _stderr_text(result: dict[str, Any]) -> str:
@@ -1113,27 +1206,44 @@ async def _run_exec(
     }
 
 
-def _sandbox_argv(worktree: JobWorktree, argv: list[str]) -> list[str]:
+def _sandbox_argv(
+    worktree: JobWorktree,
+    argv: list[str],
+    *,
+    hosts_file: str | None = None,
+    resolv_conf: str | None = None,
+    deps_cache_dir: str | None = None,
+) -> list[str]:
     """Wrap a fixed-argv command in a bubblewrap (bwrap) syscall sandbox.
 
     M-CC-11: repo-controlled verification scripts run under a lightweight
     sandbox rather than with the bridge's privilege. The bridge invokes the
     sandbox runner (bwrap) with a fixed argument vector — never the sandbox
-    script directly — with ``--unshare-net`` (network none), a read-only root
-    bind, and a frozen clock (``SOURCE_DATE_EPOCH``). The candidate worktree is
-    bound read-only so a repo-controlled script cannot modify the candidate
-    state it is supposed to verify. ``--die-with-parent`` ties the sandbox's
-    lifetime to the bridge so a killed bridge cannot orphan a sandboxed process.
+    script directly — with ``--unshare-net`` (network none, unless an allowlist
+    hosts file is supplied), a read-only root bind, and a frozen clock
+    (``SOURCE_DATE_EPOCH``). The candidate worktree is bound read-only so a
+    repo-controlled script cannot modify the candidate state it is supposed to
+    verify. ``--die-with-parent`` ties the sandbox's lifetime to the bridge so a
+    killed bridge cannot orphan a sandboxed process.
 
     Only the candidate worktree and the minimal interpreter runtime (``/usr``,
     ``/lib``, ``/lib64``, ``/bin``, ``/etc/alternatives``) are bound read-only —
     never the whole host root — so a malicious repo-controlled script cannot
     read host secrets (``/etc/shadow``, ``.env``, project config, ``/home``).
     ``/dev/null`` is the only device exposed.
+
+    M-CC-09 hermetic-lab options (opt-in per project):
+    - ``deps_cache_dir``: bound read-only so a command may read the cached deps
+      but can never write to them.
+    - ``hosts_file`` (allowlist mode): an allowlist hosts file bound read-only at
+      ``/etc/hosts`` together with ``resolv_conf`` (an empty file bound at
+      ``/etc/resolv.conf``), so DNS for any non-allowlisted host fails closed.
+      In this mode ``--unshare-net`` is omitted (the sandbox needs a real
+      network namespace to reach the allowlisted loopback proxy). The caller
+      owns both temp files and removes them after the run.
     """
-    return [
+    arguments: list[str] = [
         "bwrap",
-        "--unshare-net",
         "--unshare-ipc",
         "--unshare-pid",
         "--ro-bind",
@@ -1154,39 +1264,130 @@ def _sandbox_argv(worktree: JobWorktree, argv: list[str]) -> list[str]:
         "--ro-bind",
         "/etc/alternatives",
         "/etc/alternatives",
-        "--proc",
-        "/proc",
-        "--dev-bind",
-        "/dev/null",
-        "/dev/null",
-        "--tmpfs",
-        "/tmp",
-        "--setenv",
-        "SOURCE_DATE_EPOCH",
-        "0",
-        "--die-with-parent",
-        *argv,
     ]
+    if hosts_file is None:
+        # Default sandbox network policy: no network namespace.
+        arguments.append("--unshare-net")
+    else:
+        # Allowlist mode: pin DNS to the allowlist hosts file + empty resolv.conf.
+        arguments.extend(
+            [
+                "--ro-bind",
+                hosts_file,
+                "/etc/hosts",
+                "--ro-bind",
+                resolv_conf,
+                "/etc/resolv.conf",
+            ]
+        )
+    if deps_cache_dir is not None:
+        arguments.extend(["--ro-bind", deps_cache_dir, deps_cache_dir])
+    arguments.extend(
+        [
+            "--proc",
+            "/proc",
+            "--dev-bind",
+            "/dev/null",
+            "/dev/null",
+            "--tmpfs",
+            "/tmp",
+            "--setenv",
+            "SOURCE_DATE_EPOCH",
+            "0",
+            "--die-with-parent",
+            *argv,
+        ]
+    )
+    return arguments
 
 
 async def _run_command(
     settings: Settings,
     worktree: JobWorktree,
     command: VerificationCommand,
+    *,
+    project: ProjectPolicy | None = None,
 ) -> dict[str, Any]:
+    """Run one verification command under the hermetic lab, opt-in per project.
+
+    M-CC-09 additions (all opt-in on ``project``):
+    - ``toolchain_pin`` replaces ``{python}`` with the pinned interpreter.
+    - ``deps_cache_dir`` is exposed as ``DEPS_CACHE_DIR`` and, for sandboxed
+      commands, bound read-only so it can be read but never written; a
+      non-sandboxed command cannot guarantee read-only, so it fails closed.
+    - ``network_policy`` "none" runs the command with no network namespace and
+      fails closed when the command is not sandboxed; "allowlist" pins DNS to a
+      generated allowlist hosts file + empty resolv.conf and likewise requires
+      the sandbox.
+    The fail-closed cases return a failed command result (no exit code), which
+    fails the whole verification without granting any commit authority.
+    """
     python_path = _python_paths(worktree.path, command.python_path)
-    extra_env = {"PYTHONPATH": python_path} if python_path is not None else None
-    argv = list(command.argv)
-    if command.sandbox:
-        argv = _sandbox_argv(worktree, argv)
-    return await _run_exec(
-        settings,
-        worktree,
-        command_id=command.id,
-        argv=argv,
-        extra_env=extra_env,
-        start_error_prefix="verification executable could not start",
+    extra_env: dict[str, str] | None = (
+        {"PYTHONPATH": python_path} if python_path is not None else None
     )
+    argv = list(command.argv)
+
+    hosts_file: str | None = None
+    resolv_conf: str | None = None
+    try:
+        if project is not None:
+            if project.toolchain_pin is not None and argv[0] == "{python}":
+                argv[0] = _toolchain_python(project.toolchain_pin)
+            if project.deps_cache_dir is not None:
+                if not command.sandbox:
+                    return _network_failed(
+                        command.id,
+                        "deps_cache_dir requires a sandboxed verification command",
+                    )
+                merged = dict(extra_env) if extra_env is not None else {}
+                merged["DEPS_CACHE_DIR"] = project.deps_cache_dir
+                extra_env = merged
+            if project.network_policy == "none":
+                if not command.sandbox:
+                    return _network_failed(
+                        command.id,
+                        "network_policy=none requires a sandboxed verification "
+                        "command (no network namespace available)",
+                    )
+            elif project.network_policy == "allowlist":
+                if not command.sandbox:
+                    return _network_failed(
+                        command.id,
+                        "network_policy=allowlist requires a sandboxed "
+                        "verification command (DNS allowlist not enforceable)",
+                    )
+                hosts_file = _write_network_hosts_file(project.network_allowlist)
+                resolv_conf = _write_empty_resolv_conf()
+        if command.sandbox:
+            argv = _sandbox_argv(
+                worktree,
+                argv,
+                hosts_file=hosts_file,
+                resolv_conf=resolv_conf,
+                deps_cache_dir=(
+                    project.deps_cache_dir if project is not None else None
+                ),
+            )
+        return await _run_exec(
+            settings,
+            worktree,
+            command_id=command.id,
+            argv=argv,
+            extra_env=extra_env,
+            start_error_prefix="verification executable could not start",
+        )
+    finally:
+        if hosts_file is not None:
+            try:
+                os.unlink(hosts_file)
+            except OSError:
+                pass
+        if resolv_conf is not None:
+            try:
+                os.unlink(resolv_conf)
+            except OSError:
+                pass
 
 
 async def _run_supply_chain_scan(
@@ -1358,7 +1559,9 @@ class VerificationCommitManager:
                     # degrade the infrastructure status.
                     first: dict[str, Any] | None = None
                     for _ in range(repetitions):
-                        result = await _run_command(self.settings, worktree, command)
+                        result = await _run_command(
+                            self.settings, worktree, command, project=project
+                        )
                         bounded = _bound_redacted_output(
                             _redact(result, redacted_paths),
                             self.settings.max_verification_output_bytes,
@@ -1386,8 +1589,17 @@ class VerificationCommitManager:
             # Python interpreter version + the allowlisted deterministic env
             # keys + the verification command argv). Stable across identical-env
             # runs; changes when the declared argv changes.
+            # M-CC-09: when the project pins a toolchain, the pin's digest is
+            # folded in so a pinned-toolchain run carries a stable toolchain
+            # fingerprint that changes only when the pin changes.
+            toolchain_pin_digest = (
+                _toolchain_pin_digest(project.toolchain_pin)
+                if project.toolchain_pin is not None
+                else None
+            )
             environment_digest = compute_environment_digest(
-                project.verification_commands
+                project.verification_commands,
+                toolchain_pin_digest=toolchain_pin_digest,
             )
             response: dict[str, Any] = {
                 "status": "passed" if passed else "failed",
@@ -1403,6 +1615,11 @@ class VerificationCommitManager:
                 "infrastructure_status": "DEGRADED"
                 if nondeterminism_labeled
                 else "HEALTHY",
+                # M-CC-09 hermetic-lab response fields (additive, path-free):
+                # the toolchain-pin digest (a hash, never the pin path) and the
+                # network policy label.
+                "toolchain_pin_digest": toolchain_pin_digest,
+                "network_policy": project.network_policy,
                 # M-EV-02: structured verification result schema (additive
                 # aliases/fields; existing fields are preserved).
                 "candidate_fingerprint": before.fingerprint,

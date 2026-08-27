@@ -444,6 +444,23 @@ class ProjectPolicy(BaseModel):
     # commit-gate check, which only ever fails closed when the policy declares
     # patterns.
     unexpected_paths: tuple[str, ...] = ()
+    # M-CC-09: the hermetic verification lab, all opt-in per project so existing
+    # projects keep the pre-M-CC-09 behavior until they opt in.
+    # ``toolchain_pin``: absolute path to a pinned toolchain (a venv directory
+    # or interpreter) used to run this project's verification commands instead
+    # of the bridge's own interpreter.
+    # ``deps_cache_dir``: absolute path to a read-only dependency cache the
+    # project's verification commands may read (never write); enforced with a
+    # sandbox read-only bind, so commands must be ``sandbox: true`` to use it.
+    # ``network_policy``: "none" (commands get no network namespace — fail
+    # closed) or "allowlist" (commands may reach only ``network_allowlist``
+    # hostnames via the project's loopback proxy; all other DNS fails closed).
+    # Both modes require ``sandbox: true`` commands because only the sandbox
+    # can guarantee the isolation.
+    toolchain_pin: str | None = None
+    deps_cache_dir: str | None = None
+    network_policy: Literal["none", "allowlist"] | None = None
+    network_allowlist: tuple[str, ...] = ()
     # ``None`` means "inherit the global ``CLAUDE_DEFAULT_EFFORT``" rather than
     # pinning a per-project default, so a bridge-wide default actually takes
     # effect for projects that do not opt out of it.
@@ -525,6 +542,63 @@ class ProjectPolicy(BaseModel):
     @classmethod
     def validate_ratified_spec_commit(cls, value: object) -> str | None:
         return _validate_ratified_spec_commit(value)
+
+    @field_validator("toolchain_pin", "deps_cache_dir", mode="before")
+    @classmethod
+    def validate_absolute_opt_in_path(cls, value: object) -> str | None:
+        """Validate an absolute opt-in host path (M-CC-09).
+
+        ``toolchain_pin`` and ``deps_cache_dir`` are host-side operator paths
+        (a venv/interpreter and a dependency cache). They must be absolute and
+        must not traverse ``..``; the value is canonicalized with
+        ``Path.resolve()`` so the toolchain-pin digest is stable across runs.
+        An empty string is treated as unset (None).
+        """
+        if value is None or value == "":
+            return None
+        path = Path(str(value)).expanduser()
+        if not path.is_absolute():
+            raise ValueError(
+                "toolchain_pin and deps_cache_dir must be absolute paths"
+            )
+        normalized = path.resolve()
+        if any(part == ".." for part in normalized.parts):
+            raise ValueError(
+                "toolchain_pin and deps_cache_dir must not traverse '..'"
+            )
+        return str(normalized)
+
+    @field_validator("network_allowlist", mode="before")
+    @classmethod
+    def validate_network_allowlist(cls, value: object) -> tuple[str, ...]:
+        """Validate a network-allowlist host set (M-CC-09).
+
+        Entries are lowercase hostnames (letters, digits, ``-``, ``.``), each
+        1-253 characters, de-duplicated. They are pinned in trusted policy —
+        never caller-supplied.
+        """
+        if value is None:
+            return ()
+        entries = tuple(str(item).strip().lower() for item in value)
+        if len(entries) != len(set(entries)):
+            raise ValueError("network_allowlist must not contain duplicates")
+        for entry in entries:
+            if not entry or len(entry) > 253:
+                raise ValueError(
+                    "network_allowlist hosts must be non-empty and at most "
+                    "253 characters"
+                )
+            if not all(character.isalnum() or character in "-." for character in entry):
+                raise ValueError(
+                    "network_allowlist hosts may contain only letters, digits, "
+                    "'-' and '.'"
+                )
+            if any(
+                not part or part.startswith("-") or part.endswith("-")
+                for part in entry.split(".")
+            ):
+                raise ValueError("network_allowlist hosts must be valid hostnames")
+        return entries
 
     @model_validator(mode="after")
     def validate_policy(self) -> "ProjectPolicy":
@@ -673,6 +747,21 @@ class ProjectPolicy(BaseModel):
         if len(runtime_ids) != len(set(runtime_ids)):
             raise ValueError(
                 "runtime verification command IDs must be unique per project"
+            )
+        # M-CC-09: the hermetic verification lab is a coherent opt-in — an
+        # allowlist is meaningless without the allowlist mode, and the "none"
+        # mode must not smuggle a host allowlist. Fail closed on inconsistency.
+        if self.network_policy == "allowlist" and not self.network_allowlist:
+            raise ValueError(
+                "network_policy 'allowlist' requires a non-empty network_allowlist"
+            )
+        if self.network_policy == "none" and self.network_allowlist:
+            raise ValueError(
+                "network_policy 'none' must not configure a network_allowlist"
+            )
+        if self.network_policy is None and self.network_allowlist:
+            raise ValueError(
+                "network_allowlist requires network_policy 'allowlist'"
             )
         return self
 

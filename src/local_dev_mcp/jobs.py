@@ -1237,7 +1237,9 @@ class DevelopmentJobManager:
                 from .verification import _run_command
 
                 try:
-                    outcome = await _run_command(self.settings, job.worktree, command)
+                    outcome = await _run_command(
+                        self.settings, job.worktree, command, project=project
+                    )
                 except Exception:
                     # A transient acceptance-command failure must not fail the
                     # whole job; leave the milestone open and continue.

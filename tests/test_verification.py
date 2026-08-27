@@ -773,7 +773,10 @@ class VerificationCommitTests(unittest.TestCase):
         calls = {"count": 0}
 
         async def fake_run_command(
-            _settings: Settings, _worktree: Any, command: Any
+            _settings: Settings,
+            _worktree: Any,
+            command: Any,
+            **kwargs: Any,
         ) -> dict[str, Any]:
             result = dict(sequence[calls["count"] % len(sequence)])
             result["command_id"] = command.id

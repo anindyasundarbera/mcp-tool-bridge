@@ -6,11 +6,14 @@ verification, with fake executors and real local commands (no network).
 """
 
 import asyncio
+import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from local_dev_mcp.config import Settings
 from local_dev_mcp.jobs import DevelopmentJobManager
@@ -182,6 +185,329 @@ class VerificationLabDeterminismTests(unittest.TestCase):
             self.assertEqual(verified2["baseline_matches"], False)
 
         asyncio.run(exercise())
+
+    def test_baseline_matches_on_identical_candidate_repeat(self) -> None:
+        """M-CC-09: an identical candidate against the last green verification
+        is flagged as a baseline match (no false-positive mismatch)."""
+        async def exercise() -> None:
+            command = ["{python}", "-c", "print('ok')"]
+            policy = project(self.root, command)
+
+            def edit(root: Path) -> None:
+                (root / "README.md").write_text("# Candidate\n", encoding="utf-8")
+
+            jobs, manager, completed = await self.prepare(policy, edit)
+            first = await manager.verify(
+                policy, str(completed["job_id"]), str(completed["base_head"])
+            )
+            self.assertEqual(first["status"], "passed", first)
+            self.assertIsNone(first["baseline_fingerprint"])
+
+            # An identical second candidate (same edit) is a deterministic
+            # repeat: the baseline exists and matches the current fingerprint.
+            jobs2, manager2, completed2 = await self.prepare(policy, edit)
+            second = await manager2.verify(
+                policy, str(completed2["job_id"]), str(completed2["base_head"])
+            )
+            self.assertEqual(second["status"], "passed", second)
+            self.assertEqual(second["baseline_fingerprint"], first["diff_fingerprint"])
+            self.assertTrue(second["baseline_matches"])
+
+        asyncio.run(exercise())
+
+    # -- M-CC-09 hermetic lab: pinned toolchain -----------------------------
+
+    def test_pinned_toolchain_is_used(self) -> None:
+        """M-CC-09: a pinned toolchain's interpreter runs the verification
+        command instead of the bridge's interpreter."""
+        async def exercise() -> None:
+            pinned = self.base / "pinned-venv"
+            (pinned / "bin").mkdir(parents=True)
+            fake_python = pinned / "bin" / "python"
+            fake_python.write_text(
+                "#!/bin/sh\nexec {} -c \"print('PINNED-TOOLCHAIN')\"\n".format(
+                    shlex.quote(sys.executable)
+                ),
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            policy = project(
+                self.root,
+                ["{python}", "-c", "print('UNUSED')"],
+                toolchain_pin=str(pinned),
+            )
+
+            def edit(root: Path) -> None:
+                (root / "README.md").write_text("# Candidate\n", encoding="utf-8")
+
+            jobs, manager, completed = await self.prepare(policy, edit)
+            verified = await manager.verify(
+                policy, str(completed["job_id"]), str(completed["base_head"])
+            )
+            self.assertEqual(verified["status"], "passed", verified)
+            # The pinned interpreter printed the marker, not the declared
+            # ``-c`` body, proving the pin replaced ``{python}``.
+            self.assertEqual(
+                verified["commands"][0]["stdout"]["text"], "PINNED-TOOLCHAIN\n"
+            )
+            # The toolchain-pin digest is a stable SHA-256 and never leaks the
+            # pin path itself.
+            self.assertRegex(str(verified["toolchain_pin_digest"]), r"^[0-9a-f]{64}$")
+            self.assertNotIn(str(pinned), str(verified))
+
+        asyncio.run(exercise())
+
+    # -- M-CC-09 hermetic lab: network policy -------------------------------
+
+    def test_network_policy_none_fails_closed_for_unsandboxed_command(self) -> None:
+        """M-CC-09: with ``network_policy=none`` a command that cannot be
+        given a no-network namespace (sandbox: false) fails closed — no
+        verification authority is granted."""
+        async def exercise() -> None:
+            policy = project(
+                self.root,
+                ["{python}", "-c", "pass"],
+                network_policy="none",
+            )
+
+            def edit(root: Path) -> None:
+                (root / "README.md").write_text("# Candidate\n", encoding="utf-8")
+
+            jobs, manager, completed = await self.prepare(policy, edit)
+            verified = await manager.verify(
+                policy, str(completed["job_id"]), str(completed["base_head"])
+            )
+            self.assertEqual(verified["status"], "failed")
+            self.assertNotIn("verification_id", verified)
+            self.assertEqual(verified["commands"][0]["status"], "failed")
+            self.assertIn(
+                "network_policy=none", str(verified["commands"][0]["error"])
+            )
+            self.assertEqual(verified["network_policy"], "none")
+
+        asyncio.run(exercise())
+
+    def test_network_policy_none_sandboxed_command_is_network_isolated(self) -> None:
+        """M-CC-09: with ``network_policy=none`` a sandboxed command runs
+        inside bwrap with ``--unshare-net`` (no network namespace)."""
+        async def exercise() -> None:
+            command = ["{python}", "-c", "pass"]
+            policy = project(
+                self.root,
+                command,
+                network_policy="none",
+                verification_commands=[
+                    {
+                        "id": "core",
+                        "argv": command,
+                        "python_path": ["src"],
+                        "sandbox": True,
+                    }
+                ],
+            )
+            captured: dict[str, Any] = {}
+
+            async def fake_run_exec(settings: Settings, worktree: Any, **kwargs: Any) -> dict[str, Any]:
+                captured["argv"] = kwargs["argv"]
+                return {
+                    "command_id": kwargs["command_id"],
+                    "status": "passed",
+                    "exit_code": 0,
+                    "stdout": {"text": "", "bytes": 0, "sha256": "", "truncated": False},
+                    "stderr": {"text": "", "bytes": 0, "sha256": "", "truncated": False},
+                }
+
+            def edit(root: Path) -> None:
+                (root / "README.md").write_text("# Candidate\n", encoding="utf-8")
+
+            jobs, manager, completed = await self.prepare(policy, edit)
+            with patch("local_dev_mcp.verification._run_exec", new=fake_run_exec):
+                verified = await manager.verify(
+                    policy, str(completed["job_id"]), str(completed["base_head"])
+                )
+            self.assertEqual(verified["status"], "passed", verified)
+            self.assertEqual(captured["argv"][0], "bwrap")
+            self.assertIn("--unshare-net", captured["argv"])
+
+        asyncio.run(exercise())
+
+    def test_network_policy_allowlist_pins_dns_to_allowlisted_hosts(self) -> None:
+        """M-CC-09: with ``network_policy=allowlist`` a sandboxed command gets
+        a generated hosts file that pins only the allowlisted hosts to loopback
+        and an empty resolv.conf, so DNS for any other host fails closed."""
+        async def exercise() -> None:
+            command = ["{python}", "-c", "pass"]
+            policy = project(
+                self.root,
+                command,
+                network_policy="allowlist",
+                network_allowlist=["cache.internal"],
+                verification_commands=[
+                    {
+                        "id": "core",
+                        "argv": command,
+                        "python_path": ["src"],
+                        "sandbox": True,
+                    }
+                ],
+            )
+            captured: dict[str, Any] = {}
+
+            async def fake_run_exec(settings: Settings, worktree: Any, **kwargs: Any) -> dict[str, Any]:
+                argv = kwargs["argv"]
+                captured["argv"] = argv
+                for index, token in enumerate(argv):
+                    if token == "/etc/hosts":
+                        hosts_path = argv[index - 1]
+                        captured["hosts"] = Path(hosts_path).read_text()
+                        break
+                return {
+                    "command_id": kwargs["command_id"],
+                    "status": "passed",
+                    "exit_code": 0,
+                    "stdout": {"text": "", "bytes": 0, "sha256": "", "truncated": False},
+                    "stderr": {"text": "", "bytes": 0, "sha256": "", "truncated": False},
+                }
+
+            def edit(root: Path) -> None:
+                (root / "README.md").write_text("# Candidate\n", encoding="utf-8")
+
+            jobs, manager, completed = await self.prepare(policy, edit)
+            with patch("local_dev_mcp.verification._run_exec", new=fake_run_exec):
+                verified = await manager.verify(
+                    policy, str(completed["job_id"]), str(completed["base_head"])
+                )
+            self.assertEqual(verified["status"], "passed", verified)
+            self.assertEqual(captured["argv"][0], "bwrap")
+            # Allowlist mode: the network namespace is SHARED (no --unshare-net)
+            # so the loopback proxy is reachable, but DNS is pinned.
+            self.assertNotIn("--unshare-net", captured["argv"])
+            self.assertIn("/etc/hosts", captured["argv"])
+            self.assertIn("/etc/resolv.conf", captured["argv"])
+            self.assertIn("127.0.0.1 cache.internal", captured["hosts"])
+            self.assertNotIn("example.com", captured["hosts"])
+
+        asyncio.run(exercise())
+
+    # -- M-CC-09 hermetic lab: read-only deps cache --------------------------
+
+    def test_deps_cache_dir_exposed_read_only_for_sandboxed_command(self) -> None:
+        """M-CC-09: a configured deps cache dir is exposed as DEPS_CACHE_DIR
+        and bound read-only into the sandbox (read, never write)."""
+        async def exercise() -> None:
+            cache = self.base / "deps-cache"
+            cache.mkdir()
+            command = [
+                "{python}",
+                "-c",
+                "import os; print(os.environ['DEPS_CACHE_DIR'])",
+            ]
+            policy = project(
+                self.root,
+                command,
+                deps_cache_dir=str(cache),
+                verification_commands=[
+                    {
+                        "id": "core",
+                        "argv": command,
+                        "python_path": ["src"],
+                        "sandbox": True,
+                    }
+                ],
+            )
+            captured: dict[str, Any] = {}
+
+            async def fake_run_exec(settings: Settings, worktree: Any, **kwargs: Any) -> dict[str, Any]:
+                captured["argv"] = kwargs["argv"]
+                captured["extra_env"] = kwargs.get("extra_env")
+                return {
+                    "command_id": kwargs["command_id"],
+                    "status": "passed",
+                    "exit_code": 0,
+                    "stdout": {"text": "", "bytes": 0, "sha256": "", "truncated": False},
+                    "stderr": {"text": "", "bytes": 0, "sha256": "", "truncated": False},
+                }
+
+            def edit(root: Path) -> None:
+                (root / "README.md").write_text("# Candidate\n", encoding="utf-8")
+
+            jobs, manager, completed = await self.prepare(policy, edit)
+            with patch("local_dev_mcp.verification._run_exec", new=fake_run_exec):
+                verified = await manager.verify(
+                    policy, str(completed["job_id"]), str(completed["base_head"])
+                )
+            self.assertEqual(verified["status"], "passed", verified)
+            self.assertEqual(captured["extra_env"]["DEPS_CACHE_DIR"], str(cache))
+            # The cache is ro-bind mounted inside the sandbox (read-only).
+            self.assertEqual(captured["argv"][0], "bwrap")
+            self.assertIn("--ro-bind", captured["argv"])
+            self.assertIn(str(cache), captured["argv"])
+
+        asyncio.run(exercise())
+
+    def test_deps_cache_dir_fails_closed_for_unsandboxed_command(self) -> None:
+        """M-CC-09: a deps cache dir cannot guarantee read-only for a
+        non-sandboxed command, so it fails closed."""
+        async def exercise() -> None:
+            cache = self.base / "deps-cache"
+            cache.mkdir()
+            policy = project(
+                self.root,
+                ["{python}", "-c", "pass"],
+                deps_cache_dir=str(cache),
+            )
+
+            def edit(root: Path) -> None:
+                (root / "README.md").write_text("# Candidate\n", encoding="utf-8")
+
+            jobs, manager, completed = await self.prepare(policy, edit)
+            verified = await manager.verify(
+                policy, str(completed["job_id"]), str(completed["base_head"])
+            )
+            self.assertEqual(verified["status"], "failed")
+            self.assertNotIn("verification_id", verified)
+            self.assertIn(
+                "deps_cache_dir requires a sandboxed", str(verified["commands"][0]["error"])
+            )
+
+        asyncio.run(exercise())
+
+
+class VerificationLabPolicyValidationTests(unittest.TestCase):
+    """M-CC-09: the hermetic-lab policy is self-consistent — incoherent opt-ins
+    fail closed at policy validation time."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        initialize_git_repository(self.root)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _policy(self, **overrides: object) -> ProjectPolicy:
+        return project(self.root, ["{python}", "-c", "pass"], **overrides)
+
+    def test_allowlist_mode_requires_a_non_empty_allowlist(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires a non-empty network_allowlist"):
+            self._policy(network_policy="allowlist")
+
+    def test_none_mode_rejects_an_allowlist(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must not configure a network_allowlist"):
+            self._policy(network_policy="none", network_allowlist=["host.test"])
+
+    def test_allowlist_without_network_policy_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires network_policy 'allowlist'"):
+            self._policy(network_allowlist=["host.test"])
+
+    def test_toolchain_pin_must_be_absolute(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be absolute"):
+            self._policy(toolchain_pin="relative/venv")
+
+    def test_deps_cache_dir_must_be_absolute(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be absolute"):
+            self._policy(deps_cache_dir="relative/cache")
 
 
 if __name__ == "__main__":
