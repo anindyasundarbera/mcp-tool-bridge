@@ -321,6 +321,11 @@ class DevelopmentJob:
     turns_used: int = 0
     tokens_used: int = 0
     extensions_granted: int = 0
+    # M-CC-08: slice extensions granted by the extend_budget human control.
+    # Kept separate from extensions_granted (auto grants) so a manual top-up
+    # never consumes the auto-extension headroom; the two together are bounded
+    # by claude_max_extensions + claude_max_manual_extensions.
+    manual_extensions_granted: int = 0
     no_progress_turns: int = 0
     tool_failures: int = 0
     soft_warned: bool = False
@@ -741,6 +746,7 @@ class DevelopmentJobManager:
             "turns_used": job.turns_used,
             "tokens_used": job.tokens_used,
             "extensions_granted": job.extensions_granted,
+            "manual_extensions_granted": job.manual_extensions_granted,
             "no_progress_turns": job.no_progress_turns,
             "tool_failures": job.tool_failures,
             "soft_warned": 1 if job.soft_warned else 0,
@@ -768,6 +774,9 @@ class DevelopmentJobManager:
             job.turns_used = int(row.get("turns_used", 0))
             job.tokens_used = int(row.get("tokens_used", 0))
             job.extensions_granted = int(row.get("extensions_granted", 0))
+            job.manual_extensions_granted = int(
+                row.get("manual_extensions_granted", 0)
+            )
             job.no_progress_turns = int(row.get("no_progress_turns", 0))
             job.tool_failures = int(row.get("tool_failures", 0))
             job.wall_seconds_used = float(row.get("wall_seconds_used", 0.0) or 0.0)
@@ -1616,11 +1625,13 @@ class DevelopmentJobManager:
                 "turns_used": job.turns_used,
                 "tokens_used": job.tokens_used,
                 "extensions_granted": job.extensions_granted,
+                "manual_extensions_granted": job.manual_extensions_granted,
                 "no_progress_turns": job.no_progress_turns,
                 "tool_failures": job.tool_failures,
                 "soft_turns": self.settings.claude_soft_turns,
                 "extension_turns": self.settings.claude_extension_turns,
                 "max_extensions": self.settings.claude_max_extensions,
+                "max_manual_extensions": self.settings.claude_max_manual_extensions,
                 "hard_turns": self.settings.claude_hard_turns,
                 "max_no_progress_turns": self.settings.claude_max_no_progress_turns,
                 "soft_warned": job.soft_warned,
@@ -2504,6 +2515,7 @@ class DevelopmentJobManager:
                 job.turns_used = 0
                 job.tokens_used = 0
                 job.extensions_granted = 0
+                job.manual_extensions_granted = 0
                 job.no_progress_turns = 0
                 job.tool_failures = 0
                 job.soft_warned = False
@@ -2609,6 +2621,92 @@ class DevelopmentJobManager:
                 },
             )
         return await self.get(project, job_id)
+
+    async def extend_budget(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        slices: int = 1,
+        *,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """M-CC-08: grant manual budget-extension slices to a job.
+
+        Bounded and repeat-safe: each call grants at most
+        ``claude_max_manual_extensions`` slices and never raises the job's total
+        extensions beyond ``claude_max_extensions + claude_max_manual_extensions``
+        (a job paused at budget exhaustion cannot be extended past the combined
+        ceiling). Each grant issues a durable ``budget_extension`` authorization
+        and records a ``control_extend_budget`` audit event; a call with nothing
+        left to grant is a no-op success rather than an error.
+        """
+        if not isinstance(slices, int) or slices < 1:
+            raise DevelopmentJobError("slices must be a positive integer")
+        reason = (reason or "").strip()
+        if len(reason) > 2000:
+            raise DevelopmentJobError("reason must be at most 2000 characters")
+        async with self._state_lock:
+            job = self._require_job(project, job_id)
+            if job.committed_sha is not None:
+                raise DevelopmentJobError(
+                    "a committed development job cannot be extended"
+                )
+            ceiling = (
+                self.settings.claude_max_extensions
+                + self.settings.claude_max_manual_extensions
+            )
+            requested = min(slices, self.settings.claude_max_manual_extensions)
+            available = max(0, ceiling - job.extensions_granted)
+            granted = min(requested, available)
+            authorization_id: str | None = None
+            if granted > 0:
+                authorization = self._authorization_manager().issue(
+                    project_id=project.id,
+                    capability="budget_extension",
+                    target=job.job_id,
+                    job_id=job.job_id,
+                    actor="ChatGPT",
+                    authority_source="chatgpt_confirmation",
+                    detail={
+                        "slices": granted,
+                        "reason": reason or None,
+                    },
+                )
+                authorization_id = authorization.authorization_id
+                job.extensions_granted += granted
+                job.manual_extensions_granted += granted
+                job.updated_at = _timestamp()
+                self._persist_progress(job)
+                self._persist_job(job)
+                self._record_event(
+                    job,
+                    "control_extend_budget",
+                    {
+                        "requested": requested,
+                        "granted": granted,
+                        "extensions_granted": job.extensions_granted,
+                        "manual_extensions_granted": job.manual_extensions_granted,
+                        "authorization_id": authorization_id,
+                    },
+                    authority={
+                        "actor": "ChatGPT",
+                        "authority_source": "chatgpt_confirmation",
+                        "scope": "budget_extension",
+                        "classification": "canonical",
+                    },
+                )
+            extension: dict[str, Any] = {
+                "requested": requested,
+                "granted": granted,
+                "remaining": max(
+                    0, ceiling - job.extensions_granted
+                ),
+                "authorization_id": authorization_id,
+            }
+            if granted == 0:
+                extension["status"] = "no_extension_remaining"
+            snapshot = self._snapshot(job)
+        return {**snapshot, "extension": extension}
 
     async def verification_worktree(
         self,
@@ -3594,7 +3692,10 @@ class DevelopmentJobManager:
                     # is still advancing, and extension/progress budget remains.
                     if (
                         terminal_reason == "max_turns"
-                        and job.extensions_granted
+                        # M-CC-08: only auto extensions count against the auto
+                        # ceiling, so extend_budget top-ups never consume the
+                        # in-place extension headroom.
+                        and (job.extensions_granted - job.manual_extensions_granted)
                         < self.settings.claude_max_extensions
                         and job.no_progress_turns
                         < self.settings.claude_max_no_progress_turns

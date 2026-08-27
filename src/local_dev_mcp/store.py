@@ -469,14 +469,16 @@ ON CONFLICT(job_id) DO UPDATE SET
 _UPSERT_PROGRESS = """
 INSERT INTO job_progress (
     job_id, pause_reason, pause_requested, turns_used, tokens_used,
-    extensions_granted, no_progress_turns, tool_failures, soft_warned,
-    wall_seconds_used, milestones_json, parent_job_id, delegation_mandate_json,
-    drafter_id, successor_base_head, updated_at
+    extensions_granted, manual_extensions_granted, no_progress_turns,
+    tool_failures, soft_warned, wall_seconds_used, milestones_json,
+    parent_job_id, delegation_mandate_json, drafter_id, successor_base_head,
+    updated_at
 ) VALUES (
     :job_id, :pause_reason, :pause_requested, :turns_used, :tokens_used,
-    :extensions_granted, :no_progress_turns, :tool_failures, :soft_warned,
-    :wall_seconds_used, :milestones_json, :parent_job_id, :delegation_mandate_json,
-    :drafter_id, :successor_base_head, :updated_at
+    :extensions_granted, :manual_extensions_granted, :no_progress_turns,
+    :tool_failures, :soft_warned, :wall_seconds_used, :milestones_json,
+    :parent_job_id, :delegation_mandate_json, :drafter_id, :successor_base_head,
+    :updated_at
 )
 ON CONFLICT(job_id) DO UPDATE SET
     pause_reason = excluded.pause_reason,
@@ -484,6 +486,7 @@ ON CONFLICT(job_id) DO UPDATE SET
     turns_used = excluded.turns_used,
     tokens_used = excluded.tokens_used,
     extensions_granted = excluded.extensions_granted,
+    manual_extensions_granted = excluded.manual_extensions_granted,
     no_progress_turns = excluded.no_progress_turns,
     tool_failures = excluded.tool_failures,
     soft_warned = excluded.soft_warned,
@@ -565,6 +568,10 @@ _ADDITIVE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         # M-CC-08: a human control requested interrupt-then-pause (PAUSED_
         # INTERRUPTED) rather than a hard cancel.
         ("pause_requested", "INTEGER NOT NULL DEFAULT 0"),
+        # M-CC-08: slice extensions granted by the extend_budget human control
+        # (separate from auto-granted extensions so manual top-ups never consume
+        # the auto-extension headroom).
+        ("manual_extensions_granted", "INTEGER NOT NULL DEFAULT 0"),
     ),
     # M-EV-01: additive columns on the requirements + requirement_links tables
     # so the full matrix semantics (kind, status, deferred_authority,

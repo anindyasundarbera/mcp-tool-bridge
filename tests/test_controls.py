@@ -243,6 +243,127 @@ class DashboardAuthoritiesTests(unittest.TestCase):
         asyncio.run(exercise())
 
 
+class ExtendBudgetTests(unittest.TestCase):
+    """extend_budget: bounded authorization grant + audit event."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        initialize_git_repository(self.root)
+        self.settings = control_settings(self.base)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_extend_budget_grants_slices_with_authorization_and_event(self) -> None:
+        async def exercise() -> None:
+            policy = project(self.root, ["{python}", "-c", "print('ok')"])
+            jobs, authorization = job_managers(sessioned_settings(self.base), policy)
+            completed = await start_completed(jobs, policy)
+            job_id = str(completed["job_id"])
+            budget_before = completed["budget"]
+            self.assertEqual(budget_before["manual_extensions_granted"], 0)
+
+            result = await jobs.extend_budget(policy, job_id, slices=3, reason="test")
+            extension = result["extension"]
+            self.assertEqual(extension["requested"], 3)
+            self.assertEqual(extension["granted"], 3)
+            self.assertEqual(extension["remaining"], 3)
+            self.assertIsNotNone(extension["authorization_id"])
+            self.assertNotIn("status", extension)
+
+            # Snapshot budget reflects the manual grant.
+            budget_after = result["budget"]
+            self.assertEqual(budget_after["manual_extensions_granted"], 3)
+            self.assertEqual(budget_after["extensions_granted"], 3)
+            self.assertEqual(budget_after["max_manual_extensions"], 5)
+
+            # A durable budget_extension authorization was issued for the job.
+            in_force = authorization.list_active_for(policy.id, job_id=job_id)
+            by_capability = {entry.capability: entry for entry in in_force}
+            self.assertIn("budget_extension", by_capability)
+            self.assertEqual(by_capability["budget_extension"].job_id, job_id)
+
+            # One control_extend_budget audit event was recorded.
+            events = event_types(jobs._db, job_id)
+            self.assertEqual(events.count("control_extend_budget"), 1)
+
+        asyncio.run(exercise())
+
+    def test_extend_budget_is_bounded_and_idempotent_at_ceiling(self) -> None:
+        async def exercise() -> None:
+            policy = project(self.root, ["{python}", "-c", "print('ok')"])
+            jobs, authorization = job_managers(sessioned_settings(self.base), policy)
+            completed = await start_completed(jobs, policy)
+            job_id = str(completed["job_id"])
+
+            # 5 manual slices max per call, combined ceiling is
+            # claude_max_extensions(1) + claude_max_manual_extensions(5) = 6.
+            first = await jobs.extend_budget(policy, job_id, slices=99, reason="big")
+            self.assertEqual(first["extension"]["granted"], 5)
+            self.assertEqual(first["extension"]["remaining"], 1)
+            self.assertEqual(first["extension"]["requested"], 5)
+
+            # One more slice reaches the ceiling.
+            second = await jobs.extend_budget(policy, job_id, slices=1, reason="more")
+            self.assertEqual(second["extension"]["granted"], 1)
+            self.assertEqual(second["extension"]["remaining"], 0)
+
+            # At the ceiling, a further call is a no-op success: granted 0, no
+            # new authorization, no new audit event.
+            third = await jobs.extend_budget(policy, job_id, slices=2, reason="over")
+            self.assertEqual(third["extension"]["granted"], 0)
+            self.assertEqual(third["extension"]["status"], "no_extension_remaining")
+            self.assertIsNone(third["extension"]["authorization_id"])
+
+            in_force = authorization.list_active_for(policy.id, job_id=job_id)
+            budget_auths = [
+                e for e in in_force if e.capability == "budget_extension"
+            ]
+            self.assertEqual(len(budget_auths), 2)
+            events = event_types(jobs._db, job_id)
+            self.assertEqual(events.count("control_extend_budget"), 2)
+
+        asyncio.run(exercise())
+
+    def test_extend_budget_is_capability_gated_via_server(self) -> None:
+        async def exercise() -> None:
+            from fastmcp.exceptions import ToolError
+
+            policy = project(
+                self.root,
+                ["{python}", "-c", "print('ok')"],
+                capabilities=["repository_read", "claude_edit", "verification_commit"],
+            )
+            server = server_for(self.base, policy)
+            with self.assertRaises(ToolError):
+                await server.call_tool(
+                    "extend_budget",
+                    {"project_id": "test-project", "job_id": "0" * 32},
+                )
+
+        asyncio.run(exercise())
+
+    def test_extend_budget_capability_requires_claude_edit_in_policy(self) -> None:
+        async def exercise() -> None:
+            with self.assertRaises(ValueError):
+                ProjectPolicy.model_validate(
+                    {
+                        "id": "test-project",
+                        "display_name": "T",
+                        "description": "T",
+                        "root": str(self.root),
+                        "capabilities": [
+                            "repository_read",
+                            ProjectCapability.EXTEND_BUDGET.value,
+                        ],
+                    }
+                )
+
+        asyncio.run(exercise())
+
+
 class PauseDevelopmentJobTests(unittest.TestCase):
     """pause_development_job: capability-gated, idempotent, audit event."""
 

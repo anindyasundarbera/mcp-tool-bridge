@@ -198,6 +198,11 @@ class Settings:
     claude_soft_turns: int
     claude_extension_turns: int
     claude_max_extensions: int
+    # M-CC-08: per-job ceiling on manual budget extension slices granted by the
+    # extend_budget human control. Additive to claude_max_extensions (auto
+    # extensions) so a human can top up a job that paused at budget exhaustion;
+    # the combined ceiling is the hard bound a job can ever reach.
+    claude_max_manual_extensions: int
     claude_hard_turns: int
     claude_max_no_progress_turns: int
     claude_max_tool_failures: int
@@ -343,6 +348,9 @@ class Settings:
             ),
             claude_max_extensions=_positive_int(
                 env, "CLAUDE_MAX_EXTENSIONS", 3
+            ),
+            claude_max_manual_extensions=_positive_int(
+                env, "CLAUDE_MAX_MANUAL_EXTENSIONS", 5
             ),
             claude_hard_turns=_positive_int(env, "CLAUDE_HARD_TURNS", 120),
             claude_max_no_progress_turns=_positive_int(

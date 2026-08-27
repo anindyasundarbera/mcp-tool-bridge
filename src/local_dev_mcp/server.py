@@ -656,6 +656,55 @@ def create_server(
         return await active_jobs.pause(project, job_id)
 
     @mcp.tool(
+        name="extend_budget",
+        description=(
+            "Grant manual budget-extension slices to a development job that "
+            "paused at budget exhaustion, recording a durable budget_extension "
+            "authorization and a control_extend_budget audit event. Bounded by "
+            "claude_max_manual_extensions per call and the combined "
+            "claude_max_extensions + claude_max_manual_extensions ceiling; a "
+            "call with nothing left to grant is a no-op success. Opt-in via the "
+            "extend_budget project capability."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
+    async def extend_budget(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        job_id: Annotated[
+            str,
+            Field(
+                description="Opaque job ID returned by send_to_local_dev.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+        slices: Annotated[
+            int,
+            Field(description="Number of manual extension slices to grant.", ge=1),
+        ] = 1,
+        reason: Annotated[
+            str | None,
+            Field(
+                description="Optional free-text justification for the audit record.",
+                max_length=2000,
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.EXTEND_BUDGET
+        )
+        return await active_jobs.extend_budget(
+            project, job_id, slices=slices, reason=reason
+        )
+
+    @mcp.tool(
         name="verify_development_job",
         description=(
             "Run only the fixed verification commands configured for a completed "
