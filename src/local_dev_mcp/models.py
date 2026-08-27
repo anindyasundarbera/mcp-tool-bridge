@@ -43,6 +43,19 @@ class ProjectCapability(StrEnum):
     # authorization).
     WORKING_TREE_CANDIDATE_CAPTURE = "working_tree_candidate_capture"
     GOVERNED_DISPOSABLE_RUNTIME_ACTION_EXECUTION = "governed_disposable_runtime_action_execution"
+    # M-CC-08 human control surface (dormant by default; opt-in per control).
+    # Each control steers an existing governed development job, so each requires
+    # claude_edit (the base capability that runs jobs); the authorization
+    # boundary never widens beyond the project's job-running grant. The one
+    # exception is revoke_authorization, which steers the durable authorization
+    # ledger that gates commit/push/review/export and therefore requires
+    # verification_commit (the base capability that consumes authorizations).
+    PAUSE_DEVELOPMENT_JOB = "pause_development_job"
+    EXTEND_BUDGET = "extend_budget"
+    NARROW_SCOPE = "narrow_scope"
+    REPLACE_WORKER = "replace_worker"
+    DISCARD_CANDIDATE = "discard_candidate"
+    REVOKE_AUTHORIZATION = "revoke_authorization"
 
 
 def _policy_path(value: str) -> str:
@@ -929,6 +942,31 @@ class ProjectPolicy(BaseModel):
             and ProjectCapability.EXPORT_EVIDENCE_BUNDLE not in self.capabilities
         ):
             raise ValueError("sensitivity_policy requires export_evidence_bundle")
+
+        # M-CC-08: human control surface — each control steers an existing
+        # governed development job, so each requires the job-running grant
+        # (claude_edit). revoke_authorization steers the durable authorization
+        # ledger that gates commit/push/review/export, so it requires
+        # verification_commit instead.
+        for capability, dependency in (
+            (
+                ProjectCapability.PAUSE_DEVELOPMENT_JOB,
+                ProjectCapability.CLAUDE_EDIT,
+            ),
+            (ProjectCapability.EXTEND_BUDGET, ProjectCapability.CLAUDE_EDIT),
+            (ProjectCapability.NARROW_SCOPE, ProjectCapability.CLAUDE_EDIT),
+            (ProjectCapability.REPLACE_WORKER, ProjectCapability.CLAUDE_EDIT),
+            (ProjectCapability.DISCARD_CANDIDATE, ProjectCapability.CLAUDE_EDIT),
+            (
+                ProjectCapability.REVOKE_AUTHORIZATION,
+                ProjectCapability.VERIFICATION_COMMIT,
+            ),
+        ):
+            if (
+                capability in self.capabilities
+                and dependency not in self.capabilities
+            ):
+                raise ValueError(f"{capability.value} requires {dependency.value}")
         command_ids = [command.id for command in self.verification_commands]
         if len(command_ids) != len(set(command_ids)):
             raise ValueError("verification command IDs must be unique per project")

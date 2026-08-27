@@ -468,18 +468,19 @@ ON CONFLICT(job_id) DO UPDATE SET
 
 _UPSERT_PROGRESS = """
 INSERT INTO job_progress (
-    job_id, pause_reason, turns_used, tokens_used, extensions_granted,
-    no_progress_turns, tool_failures, soft_warned, wall_seconds_used,
-    milestones_json, parent_job_id, delegation_mandate_json, drafter_id,
-    successor_base_head, updated_at
+    job_id, pause_reason, pause_requested, turns_used, tokens_used,
+    extensions_granted, no_progress_turns, tool_failures, soft_warned,
+    wall_seconds_used, milestones_json, parent_job_id, delegation_mandate_json,
+    drafter_id, successor_base_head, updated_at
 ) VALUES (
-    :job_id, :pause_reason, :turns_used, :tokens_used, :extensions_granted,
-    :no_progress_turns, :tool_failures, :soft_warned, :wall_seconds_used,
-    :milestones_json, :parent_job_id, :delegation_mandate_json, :drafter_id,
-    :successor_base_head, :updated_at
+    :job_id, :pause_reason, :pause_requested, :turns_used, :tokens_used,
+    :extensions_granted, :no_progress_turns, :tool_failures, :soft_warned,
+    :wall_seconds_used, :milestones_json, :parent_job_id, :delegation_mandate_json,
+    :drafter_id, :successor_base_head, :updated_at
 )
 ON CONFLICT(job_id) DO UPDATE SET
     pause_reason = excluded.pause_reason,
+    pause_requested = excluded.pause_requested,
     turns_used = excluded.turns_used,
     tokens_used = excluded.tokens_used,
     extensions_granted = excluded.extensions_granted,
@@ -561,6 +562,9 @@ _ADDITIVE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         # published committed SHA). Additive TEXT column; NULL for non-successor
         # jobs, so existing rows are untouched and SCHEMA_VERSION stays 1.
         ("successor_base_head", "TEXT"),
+        # M-CC-08: a human control requested interrupt-then-pause (PAUSED_
+        # INTERRUPTED) rather than a hard cancel.
+        ("pause_requested", "INTEGER NOT NULL DEFAULT 0"),
     ),
     # M-EV-01: additive columns on the requirements + requirement_links tables
     # so the full matrix semantics (kind, status, deferred_authority,

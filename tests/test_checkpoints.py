@@ -1184,12 +1184,14 @@ class CheckpointStoreTests(unittest.TestCase):
                 self.assertIn("parent_job_id", columns)
                 self.assertIn("delegation_mandate_json", columns)
                 self.assertIn("wall_seconds_used", columns)
+                self.assertIn("pause_requested", columns)
                 # The progress upsert that crashed on the live server now works.
                 upsert_progress_row(
                     connection,
                     {
                         "job_id": "job-tf",
                         "pause_reason": None,
+                        "pause_requested": 0,
                         "turns_used": 0,
                         "tokens_used": 0,
                         "extensions_granted": 0,
@@ -1220,6 +1222,7 @@ class CheckpointStoreTests(unittest.TestCase):
                     {
                         "job_id": "job-tf",
                         "pause_reason": None,
+                        "pause_requested": 0,
                         "turns_used": 1,
                         "tokens_used": 0,
                         "extensions_granted": 0,
@@ -1687,11 +1690,10 @@ class ContinuityToolSurfaceTests(unittest.TestCase):
             tools = {tool.name for tool in _asyncio.run(server.list_tools())}
 
         # Continuity is internal to the job lifecycle: it must not add tools.
-        # The count is the current tool surface (32 after the OH disposable
-        # runtime action tool); continuity itself adds none.
-        self.assertEqual(len(tools), 32)
+        # The count is the current tool surface (33: the M-CC-08 human control
+        # surface added pause_development_job); continuity itself adds none.
+        self.assertEqual(len(tools), 33)
         for leaked in (
-            "pause_development_job",
             "checkpoint_development_job",
             "extend_development_job",
             "compact_checkpoints",
@@ -1699,6 +1701,7 @@ class ContinuityToolSurfaceTests(unittest.TestCase):
         ):
             self.assertNotIn(leaked, tools)
         self.assertIn("resume_development_job", tools)
+        self.assertIn("pause_development_job", tools)
 
 
 if __name__ == "__main__":

@@ -617,6 +617,44 @@ def create_server(
         )
         return await active_jobs.cancel(project, job_id)
 
+    # M-CC-08: human control surface. Each control is dormant by default —
+    # registered always, but capability-gated at call time so a project that has
+    # not opted into the control cannot invoke it.
+
+    @mcp.tool(
+        name="pause_development_job",
+        description=(
+            "Pause a running development job at the next safe boundary, "
+            "preserving the candidate worktree and session so it can be resumed "
+            "from the last checkpoint. Idempotent: pausing an already-paused or "
+            "terminal job is a no-op. Records a control_pause audit event. "
+            "Opt-in via the pause_development_job project capability."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
+    async def pause_development_job(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        job_id: Annotated[
+            str,
+            Field(
+                description="Opaque job ID returned by send_to_local_dev.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.PAUSE_DEVELOPMENT_JOB
+        )
+        return await active_jobs.pause(project, job_id)
+
     @mcp.tool(
         name="verify_development_job",
         description=(

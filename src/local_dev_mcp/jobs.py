@@ -301,6 +301,12 @@ class DevelopmentJob:
     created_at: str = field(default_factory=_timestamp)
     updated_at: str = field(default_factory=_timestamp)
     cancel_requested: bool = False
+    # M-CC-08: a human control requested an interrupt-then-pause (rather than a
+    # hard cancel). When set, the run loop's CancelledError handler transitions
+    # the job to PAUSED_INTERRUPTED instead of CANCELLED so the candidate is
+    # preserved and resumable from the last checkpoint. Persisted in the
+    # ``job_progress`` sidecar (additive).
+    pause_requested: bool = False
     worktree: JobWorktree | None = None
     session_id: str | None = None
     result: dict[str, Any] | None = None
@@ -731,6 +737,7 @@ class DevelopmentJobManager:
         return {
             "job_id": job.job_id,
             "pause_reason": job.pause_reason,
+            "pause_requested": 1 if job.pause_requested else 0,
             "turns_used": job.turns_used,
             "tokens_used": job.tokens_used,
             "extensions_granted": job.extensions_granted,
@@ -756,6 +763,7 @@ class DevelopmentJobManager:
         if row is None:
             return
         job.pause_reason = row.get("pause_reason")
+        job.pause_requested = bool(row.get("pause_requested", 0))
         try:
             job.turns_used = int(row.get("turns_used", 0))
             job.tokens_used = int(row.get("tokens_used", 0))
@@ -2551,6 +2559,57 @@ class DevelopmentJobManager:
                 self._persist_job(job)
         return await self.get(project, job_id)
 
+    async def pause(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+    ) -> dict[str, Any]:
+        """M-CC-08: pause a running job, preserving the candidate for resume.
+
+        Requests an interrupt-then-pause at the next safe boundary: the run
+        loop's CancelledError handler transitions the job to
+        ``PAUSED_INTERRUPTED`` (resumable from the last checkpoint) instead of
+        ``CANCELLED``, so the retained worktree and session survive. Idempotent:
+        pausing an already-paused or terminal job is a no-op (no duplicate audit
+        event). Records a ``control_pause`` audit event.
+        """
+        async with self._state_lock:
+            job = self._require_job(project, job_id)
+            task = job.task
+            if job.status in TERMINAL_STATUSES:
+                return self._snapshot(job)
+            job.pause_requested = True
+            job.cancel_requested = True
+            job.status = JobStatus.PAUSED_INTERRUPTED
+            job.pause_reason = "human_requested_pause"
+            job.updated_at = _timestamp()
+            self._persist_job(job)
+            self._persist_progress(job)
+            if task is not None:
+                task.cancel()
+        if task is not None:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        async with self._state_lock:
+            if job.task is task:
+                job.task = None
+                job.updated_at = _timestamp()
+                self._persist_job(job)
+            self._record_event(
+                job,
+                "control_pause",
+                {"status": "paused_interrupted", "pause_reason": job.pause_reason},
+                authority={
+                    "actor": "ChatGPT",
+                    "authority_source": "chatgpt_confirmation",
+                    "scope": "pause",
+                    "classification": "canonical",
+                },
+            )
+        return await self.get(project, job_id)
+
     async def verification_worktree(
         self,
         project: ProjectPolicy,
@@ -3599,15 +3658,27 @@ class DevelopmentJobManager:
                         self._persist_progress(job)
         except asyncio.CancelledError:
             async with self._state_lock:
-                job.status = JobStatus.CANCELLED
-                job.cancel_requested = True
+                if job.pause_requested:
+                    # M-CC-08: a human control requested interrupt-then-pause.
+                    # Preserve the candidate and session as PAUSED_INTERRUPTED
+                    # (resumable from the last checkpoint) rather than a hard
+                    # cancel. ``cancel_requested`` is cleared so the paused job
+                    # is not mistaken for a cancellation in progress.
+                    job.status = JobStatus.PAUSED_INTERRUPTED
+                    job.pause_reason = job.pause_reason or "human_requested_pause"
+                    job.cancel_requested = False
+                    terminal_status = "paused_interrupted"
+                else:
+                    job.status = JobStatus.CANCELLED
+                    job.cancel_requested = True
+                    terminal_status = "cancelled"
                 job.updated_at = _timestamp()
                 self._persist_job(job)
                 self._persist_progress(job)
             self._record_event(
                 job,
                 "terminal",
-                {"status": "cancelled"},
+                {"status": terminal_status, "pause_reason": job.pause_reason},
                 authority={
                     "actor": "ChatGPT",
                     "authority_source": "chatgpt_confirmation",
