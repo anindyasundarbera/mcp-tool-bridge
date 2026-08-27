@@ -1541,6 +1541,23 @@ class DevelopmentJobManager:
                 }
                 for row in children
             ]
+        # M-CC-04: surface the job's governance ratification records. Option A:
+        # a ratification is an append-only approval distinct from any
+        # merge/tag/release/deploy action (those remain in PROHIBITED_ACTIONS).
+        # Additive: present only when at least one record exists.
+        ratifications = store.load_ratification_rows(self._db, job.job_id)
+        if ratifications:
+            snapshot["ratifications"] = [
+                {
+                    "ratification_id": row.get("ratification_id"),
+                    "candidate_fingerprint": row.get("candidate_fingerprint"),
+                    "base_head": row.get("base_head"),
+                    "actor": row.get("actor"),
+                    "authority_source": row.get("authority_source"),
+                    "ratified_at": row.get("ratified_at"),
+                }
+                for row in ratifications
+            ]
         if job.worktree is not None:
             snapshot["base_head"] = job.worktree.base_head
         if job.result is not None:
@@ -2178,6 +2195,88 @@ class DevelopmentJobManager:
             )
             self._persist_job(successor)
             return self._snapshot(successor)
+
+    async def ratify_candidate(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        actor: str,
+        authority_source: str,
+        detail: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """M-CC-04 (Option A): record governance ratification, distinct from merge.
+
+        Ratification is an append-only governance record that a named actor,
+        drawing on a stated authority source, approved the completed candidate
+        for a job. It is deliberately NOT a merge/tag/release/deploy action —
+        those remain in ``PROHIBITED_ACTIONS`` and are never performed here
+        (no new push surface, no ref movement). Internal-first: no new MCP tool.
+
+        The record binds to the candidate's durable evidence: ``candidate_fingerprint``
+        is the latest checkpoint's ``partial_fingerprint`` and ``base_head`` is the
+        job's retained worktree base, so the ratification can never be mistaken for
+        a ref-producing action.
+        """
+        actor = (actor or "").strip()
+        authority_source = (authority_source or "").strip()
+        if not actor or not authority_source:
+            raise DevelopmentJobError("ratification requires actor and authority_source")
+        async with self._state_lock:
+            job = self._require_job(project, job_id)
+            if job.status != JobStatus.COMPLETED or job.task is not None:
+                raise DevelopmentJobError(
+                    "only a completed inactive development job can be ratified"
+                )
+            if job.worktree is None:
+                raise DevelopmentJobError("job has no retained worktree to ratify")
+            latest = store.load_latest_checkpoint(self._db, job.job_id)
+            candidate_fingerprint = (
+                latest.get("partial_fingerprint") if latest is not None else None
+            )
+            if not candidate_fingerprint:
+                raise DevelopmentJobError(
+                    "candidate has no checkpoint fingerprint to ratify"
+                )
+            ratification_id = "rat-" + secrets.token_hex(16)
+            ratified_at = _timestamp()
+            base_head = job.worktree.base_head
+            store.insert_ratification_row(
+                self._db,
+                {
+                    "ratification_id": ratification_id,
+                    "project_id": project.id,
+                    "job_id": job.job_id,
+                    "candidate_fingerprint": candidate_fingerprint,
+                    "base_head": base_head,
+                    "actor": actor,
+                    "authority_source": authority_source,
+                    "ratified_at": ratified_at,
+                    "detail_json": _json_dumps(dict(detail or {})),
+                },
+            )
+            self._record_event(
+                job,
+                "ratified",
+                {
+                    "ratification_id": ratification_id,
+                    "candidate_fingerprint": candidate_fingerprint,
+                    "base_head": base_head,
+                },
+                authority={
+                    "actor": actor,
+                    "authority_source": authority_source,
+                    "scope": "ratification",
+                    "classification": "canonical",
+                    "detail": {
+                        "ratification_id": ratification_id,
+                        "job_id": job.job_id,
+                        "base_head": base_head,
+                    },
+                },
+            )
+            job.updated_at = _timestamp()
+            self._persist_job(job)
+            return self._snapshot(job)
 
     async def get(
         self,

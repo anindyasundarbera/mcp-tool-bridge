@@ -8,7 +8,11 @@ from typing import Any
 
 from local_dev_mcp import store
 from local_dev_mcp.config import Settings
-from local_dev_mcp.jobs import DevelopmentJobError, DevelopmentJobManager
+from local_dev_mcp.jobs import (
+    PROHIBITED_ACTIONS,
+    DevelopmentJobError,
+    DevelopmentJobManager,
+)
 from local_dev_mcp.models import Effort, ProjectPolicy
 from local_dev_mcp.registry import ProjectLockManager
 from tests.support import initialize_git_repository
@@ -900,6 +904,121 @@ class SuccessorJobTests(unittest.TestCase):
                 )
             # Unblock the running parent so the test exits cleanly.
             await manager.cancel(self.project, parent_id)
+
+        asyncio.run(exercise())
+
+
+class RatificationTests(unittest.TestCase):
+    """M-CC-04 (Option A): governance ratification, distinct from merge.
+
+    ``ratify_candidate`` records an append-only approval of a completed
+    candidate in the ``ratifications`` sidecar. It is deliberately NOT a
+    merge/tag/release/deploy action: those remain in ``PROHIBITED_ACTIONS``
+    and no merge surface exists. Internal-first: no new MCP tool.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        initialize_git_repository(self.root)
+        self.settings = settings(self.base)
+        self.project = policy(self.root)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _manager(self, executor: Any) -> DevelopmentJobManager:
+        return DevelopmentJobManager(
+            self.settings,
+            ProjectLockManager(),
+            executor,  # type: ignore[arg-type]
+            projects=(self.project,),
+        )
+
+    def test_ratify_records_governance_approval_distinct_from_merge(self) -> None:
+        async def exercise() -> None:
+            manager = self._manager(ImmediateExecutor())
+            started = await manager.start(self.project, "work", "high")
+            job_id = str(started["job_id"])
+            await wait_for_status(manager, self.project, job_id, {"completed"})
+
+            pre = await manager.get(self.project, job_id)
+            fingerprint = pre["candidate_fingerprint"]
+            self.assertTrue(fingerprint)
+
+            ratified = await manager.ratify_candidate(
+                self.project,
+                job_id,
+                actor="reviewer",
+                authority_source="human_supervisor",
+            )
+            # Ratification is approval only: no ref movement, no commit.
+            self.assertNotIn("commit_sha", ratified)
+            records = ratified["ratifications"]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["actor"], "reviewer")
+            self.assertEqual(records[0]["authority_source"], "human_supervisor")
+            self.assertEqual(records[0]["candidate_fingerprint"], fingerprint)
+            self.assertEqual(records[0]["base_head"], pre["base_head"])
+            self.assertRegex(
+                records[0]["ratification_id"], r"^rat-[0-9a-f]{32}$"
+            )
+
+            # Distinct from merge: merge stays prohibited and no merge surface
+            # exists on the manager.
+            self.assertIn("merge", PROHIBITED_ACTIONS)
+            self.assertIn("merge", ratified["prohibited_actions"])
+            self.assertFalse(hasattr(manager, "merge"))
+
+            # Durable: a fresh manager re-hydrates the same record.
+            manager2 = self._manager(ImmediateExecutor())
+            snapshot = await manager2.get(self.project, job_id)
+            self.assertEqual(len(snapshot["ratifications"]), 1)
+            self.assertEqual(
+                snapshot["ratifications"][0]["ratification_id"],
+                records[0]["ratification_id"],
+            )
+
+        asyncio.run(exercise())
+
+    def test_ratify_requires_completed_inactive_candidate(self) -> None:
+        async def exercise() -> None:
+            executor = BlockingExecutor()
+            manager = self._manager(executor)
+            started = await manager.start(self.project, "work", "high")
+            job_id = str(started["job_id"])
+            await asyncio.wait_for(executor.entered.wait(), timeout=2)
+            # A running job cannot be ratified.
+            with self.assertRaisesRegex(
+                DevelopmentJobError, "only a completed inactive"
+            ):
+                await manager.ratify_candidate(
+                    self.project,
+                    job_id,
+                    actor="reviewer",
+                    authority_source="human_supervisor",
+                )
+            # Unblock the running job so the test exits cleanly.
+            await manager.cancel(self.project, job_id)
+
+        asyncio.run(exercise())
+
+    def test_ratify_requires_actor_and_authority_source(self) -> None:
+        async def exercise() -> None:
+            manager = self._manager(ImmediateExecutor())
+            started = await manager.start(self.project, "work", "high")
+            job_id = str(started["job_id"])
+            await wait_for_status(manager, self.project, job_id, {"completed"})
+            with self.assertRaisesRegex(
+                DevelopmentJobError, "actor and authority_source"
+            ):
+                await manager.ratify_candidate(
+                    self.project,
+                    job_id,
+                    actor="",
+                    authority_source="human_supervisor",
+                )
 
         asyncio.run(exercise())
 

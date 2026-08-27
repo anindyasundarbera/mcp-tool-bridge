@@ -135,6 +135,17 @@ CREATE TABLE IF NOT EXISTS delegations (
     mandate_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ratifications (
+    ratification_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    candidate_fingerprint TEXT NOT NULL,
+    base_head TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    authority_source TEXT NOT NULL,
+    ratified_at TEXT NOT NULL,
+    detail_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS requirements (
     requirement_id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -1637,6 +1648,17 @@ INSERT INTO delegations (
 """
 
 
+_INSERT_RATIFICATION = """
+INSERT INTO ratifications (
+    ratification_id, project_id, job_id, candidate_fingerprint, base_head,
+    actor, authority_source, ratified_at, detail_json
+) VALUES (
+    :ratification_id, :project_id, :job_id, :candidate_fingerprint, :base_head,
+    :actor, :authority_source, :ratified_at, :detail_json
+)
+"""
+
+
 def insert_delegation_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
     """Append one parent->child delegation record as a single ACID transaction.
 
@@ -1659,6 +1681,36 @@ def load_delegation_rows_for_parent(
             "SELECT * FROM delegations WHERE parent_job_id = ? "
             "ORDER BY delegation_id ASC",
             (parent_job_id,),
+        ).fetchall()
+    ]
+
+
+def insert_ratification_row(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
+    """Append one governance ratification record as a single ACID transaction.
+
+    Ratifications (M-CC-04, Option A) are an append-only governance ledger,
+    deliberately distinct from any merge/tag/release/deploy action (those remain
+    in ``PROHIBITED_ACTIONS``). Each row records that a named actor, drawing on
+    a stated authority source, ratified the completed candidate for a job at its
+    pinned ``base_head``. ``candidate_fingerprint`` binds the ratification to the
+    candidate's working-tree evidence (e.g. the latest checkpoint's
+    ``partial_fingerprint``). SCHEMA_VERSION stays 1: the table is additive
+    (``CREATE TABLE IF NOT EXISTS``).
+    """
+    with connection:
+        connection.execute(_INSERT_RATIFICATION, row)
+
+
+def load_ratification_rows(
+    connection: sqlite3.Connection, job_id: str
+) -> list[dict[str, Any]]:
+    """Return one job's ratification rows as dicts, oldest first."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM ratifications WHERE job_id = ? "
+            "ORDER BY ratified_at ASC, ratification_id ASC",
+            (job_id,),
         ).fetchall()
     ]
 
