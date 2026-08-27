@@ -235,6 +235,7 @@ class Settings:
     evidence_retention_days: int
     checkpoint_retention_days: int
     claude_stream_json: bool
+    enable_durable_authz: bool
     max_delegations_per_job: int
     reader_injection_defense: bool
     claude_launch_command: tuple[str, ...]
@@ -368,6 +369,7 @@ class Settings:
                 env, "CHECKPOINT_RETENTION_DAYS", 0
             ),
             claude_stream_json=_truthy(env, "CLAUDE_STREAM_JSON"),
+            enable_durable_authz=_truthy(env, "ENABLE_DURABLE_AUTHZ"),
             max_delegations_per_job=_positive_int(
                 env, "MAX_DELEGATIONS_PER_JOB", 3
             ),
