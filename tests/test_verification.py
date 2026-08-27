@@ -434,6 +434,102 @@ class VerificationCommitTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_commit_gate_rejects_undeclared_unexpected_artifact(self) -> None:
+        """M-CC-06: a generated artifact outside the declared set is rejected.
+
+        A project declaring ``unexpected_paths`` verifies a candidate whose only
+        declared change is ``candidate.txt``, then the candidate grows an
+        untracked ``dist/bundle.js`` before commit. The commit gate detects a
+        changed path matching the policy that is NOT in the declared/verified
+        path list and rejects it (fail-closed, before the generic fingerprint
+        check), quarantining the job durably.
+        """
+        async def exercise() -> None:
+            from local_dev_mcp.jobs import JobStatus
+
+            policy_obj = project(
+                self.root,
+                ["{python}", "-c", "pass"],
+                unexpected_paths=["dist/", "*.lock"],
+            )
+            jobs, manager, completed = await self.prepare(
+                policy_obj,
+                lambda root: (root / "candidate.txt").write_text(
+                    "one", encoding="utf-8"
+                ),
+            )
+            verified = await manager.verify(
+                policy_obj, str(completed["job_id"]), str(completed["base_head"])
+            )
+            self.assertEqual(verified["status"], "passed")
+            self.assertEqual(list(verified["paths"]), ["candidate.txt"])
+            worktree = await jobs.verification_worktree(
+                policy_obj, str(completed["job_id"])
+            )
+            # A generated artifact appears in the candidate after verification
+            # and is not part of the declared changed set.
+            dist = worktree.path / "dist"
+            dist.mkdir()
+            (dist / "bundle.js").write_text("generated", encoding="utf-8")
+            with self.assertRaisesRegex(VerificationError, "dist/bundle.js"):
+                await manager.commit(
+                    policy_obj,
+                    str(completed["job_id"]),
+                    str(verified["verification_id"]),
+                    str(verified["base_head"]),
+                    str(verified["diff_fingerprint"]),
+                    list(verified["paths"]),
+                    "Unexpected artifact",
+                )
+            # Fail-closed is durable: the job is quarantined, not just raised.
+            quarantined = await jobs.get(policy_obj, str(completed["job_id"]))
+            self.assertEqual(
+                quarantined["status"], JobStatus.QUARANTINED_PROVENANCE.value
+            )
+            self.assertFalse(quarantined["resume_available"])
+
+        asyncio.run(exercise())
+
+    def test_commit_gate_allows_declared_unexpected_path(self) -> None:
+        """M-CC-06: an unexpected-pattern artifact that was verified is allowed.
+
+        A project declaring ``unexpected_paths=("*.lock",)`` verifies a
+        candidate whose declared changed set includes ``poetry.lock``. Because
+        that lock file is part of the verified, declared path list, the commit
+        gate allows it: declaring the artifact is the opt-in that converts it
+        from "unexpected" to "reviewed and accepted".
+        """
+        async def exercise() -> None:
+            policy_obj = project(
+                self.root,
+                ["{python}", "-c", "pass"],
+                unexpected_paths=["*.lock", "dist/"],
+            )
+            jobs, manager, completed = await self.prepare(
+                policy_obj,
+                lambda root: (root / "poetry.lock").write_text(
+                    '{"lock": true}', encoding="utf-8"
+                ),
+            )
+            verified = await manager.verify(
+                policy_obj, str(completed["job_id"]), str(completed["base_head"])
+            )
+            self.assertEqual(verified["status"], "passed")
+            self.assertEqual(list(verified["paths"]), ["poetry.lock"])
+            committed = await manager.commit(
+                policy_obj,
+                str(completed["job_id"]),
+                str(verified["verification_id"]),
+                str(verified["base_head"]),
+                str(verified["diff_fingerprint"]),
+                list(verified["paths"]),
+                "Declared lockfile",
+            )
+            self.assertEqual(committed["status"], "committed")
+            self.assertEqual(committed["paths"], ["poetry.lock"])
+
+        asyncio.run(exercise())
+
     def test_commit_failure_restores_empty_index_and_preserves_candidate(self) -> None:
         async def exercise() -> None:
             policy = project(self.root, ["{python}", "-c", "pass"])

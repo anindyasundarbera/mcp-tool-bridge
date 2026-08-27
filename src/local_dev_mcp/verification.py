@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import hashlib
 import json
 import os
@@ -444,6 +445,57 @@ def _validate_policy_path(project: ProjectPolicy, path: str) -> None:
             raise VerificationError(
                 f"hidden candidate path requires an explicit commit root: {path}"
             )
+
+
+_GLOB_MAGIC = frozenset("*?[")
+
+
+def _matches_unexpected_pattern(pattern: str, path: str) -> bool:
+    """Match a candidate path against one ``unexpected_paths`` entry (M-CC-06).
+
+    A trailing ``/`` makes the entry a directory prefix (``dist/`` matches
+    ``dist`` and everything beneath it). A literal entry with no glob magic
+    matches the exact path or anything beneath it as a directory (``node_modules``
+    matches ``node_modules`` and ``node_modules/...``). Any other entry is
+    treated as a shell-style glob on the whole relative path (``*.lock`` matches
+    top-level ``.lock`` files only; use ``**/*.lock`` for nested ones).
+    """
+    if pattern.endswith("/"):
+        directory = pattern[:-1]
+        return path == directory or path.startswith(directory + "/")
+    if not any(char in pattern for char in _GLOB_MAGIC):
+        return path == pattern or path.startswith(pattern + "/")
+    return fnmatch.fnmatchcase(path, pattern)
+
+
+def _undeclared_unexpected_paths(
+    project: ProjectPolicy,
+    changed_paths: tuple[str, ...],
+    declared_paths: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Changed paths matching ``unexpected_paths`` that are not declared (M-CC-06).
+
+    Fail-closed only when the policy declares patterns: an empty
+    ``unexpected_paths`` tuple never rejects. ``declared_paths`` is the
+    verification record's ordered path list — the exact set the verifier
+    examined and any reviewer signed off on. A path that matches a declared
+    unexpected pattern but IS in the declared set is allowed (it was
+    verified); one that appears outside the declared set is flagged.
+    """
+    if not project.unexpected_paths:
+        return ()
+    declared = set(declared_paths)
+    return tuple(
+        sorted(
+            path
+            for path in changed_paths
+            if path not in declared
+            and any(
+                _matches_unexpected_pattern(pattern, path)
+                for pattern in project.unexpected_paths
+            )
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1458,6 +1510,34 @@ class VerificationCommitManager:
                 current = await _candidate_state(self.settings, project, worktree)
             except (DevelopmentJobError, WorktreeError, GitCommandError) as exc:
                 raise VerificationError(str(exc)) from exc
+
+            # M-CC-06: fail-closed unexpected-files gate. A changed path matching
+            # the project's declared ``unexpected_paths`` policy (generated
+            # artifacts, ``*.lock``, ``dist/``, ``node_modules/``, ...) that is
+            # NOT part of the verified, declared changed set is rejected here,
+            # before the fingerprint comparison, so the failure is explicit and
+            # diagnostic. The declared set is the verification record's ordered
+            # path list — the exact set the verifier examined and any reviewer
+            # signed off on. A declared unexpected path (one that was verified)
+            # is allowed. Empty ``unexpected_paths`` (the default) never rejects.
+            # The existing submodule rejection in the candidate-state derivation
+            # stays.
+            undeclared_unexpected = _undeclared_unexpected_paths(
+                project, current.paths, record.paths
+            )
+            if undeclared_unexpected:
+                await self._jobs.quarantine_provenance(
+                    project,
+                    job_id,
+                    "undeclared unexpected file(s) matching the project's "
+                    "unexpected_paths policy",
+                )
+                raise VerificationError(
+                    "commit gate rejected unexpected file(s) matching the "
+                    "project's unexpected_paths policy: "
+                    + ", ".join(undeclared_unexpected)
+                )
+
             if current != CandidateState(
                 record.base_head, record.diff_fingerprint, record.paths
             ):

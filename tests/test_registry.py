@@ -137,6 +137,40 @@ class ProjectRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectRegistryError, "policy paths"):
             ProjectRegistry.load(config)
 
+    def test_unexpected_paths_policy_is_validated_fail_closed(self) -> None:
+        """M-CC-06: the unexpected_paths policy rejects invalid entries."""
+        repository = self.root / "repo"
+        initialize_git_repository(repository)
+        config = self.root / "projects.json"
+
+        for bad, expected in (
+            (["../secret"], "unexpected_paths"),
+            (["/abs/dist"], "unexpected_paths"),
+            ([""], "unexpected_paths"),
+            (["dist/", "dist/"], "duplicates"),
+        ):
+            write_registry(
+                config,
+                [project_payload(repository, unexpected_paths=bad)],
+            )
+            with self.assertRaisesRegex(ProjectRegistryError, expected):
+                ProjectRegistry.load(config)
+
+        # Valid glob / literal / directory-prefix patterns load and normalize.
+        write_registry(
+            config,
+            [
+                project_payload(
+                    repository,
+                    unexpected_paths=["*.lock", "dist/", "node_modules/**"],
+                )
+            ],
+        )
+        project = ProjectRegistry.load(config).resolve("test-project")
+        self.assertEqual(
+            project.unexpected_paths, ("*.lock", "dist/", "node_modules/**")
+        )
+
     def test_verification_commit_requires_fixed_commands_roots_and_claude(self) -> None:
         repository = self.root / "repo"
         initialize_git_repository(repository)

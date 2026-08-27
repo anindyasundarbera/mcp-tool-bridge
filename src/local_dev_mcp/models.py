@@ -118,6 +118,35 @@ def _validate_ratified_spec_commit(value: object) -> str | None:
     return text
 
 
+def _unexpected_path(value: str) -> str:
+    """Validate one ``unexpected_paths`` entry (M-CC-06).
+
+    Entries may be shell-style glob patterns (``*.lock``, ``**/*.lock``) or
+    literal relative paths; a trailing ``/`` marks a directory prefix
+    (``dist/``). They must be non-empty, relative, free of ``..`` traversal
+    and NUL bytes, and at most 2000 characters. The normalized form (forward
+    slashes, trailing directory marker preserved) is returned so the stored
+    policy is deterministic.
+    """
+    normalized = value.replace("\\", "/").strip()
+    if not normalized:
+        raise ValueError("unexpected_paths entries must be non-empty")
+    if normalized.startswith("/"):
+        raise ValueError(
+            "unexpected_paths entries must be non-empty relative paths without '..'"
+        )
+    if len(normalized) > 2000 or "\x00" in normalized:
+        raise ValueError(
+            "unexpected_paths entries must be NUL-free and at most 2000 characters"
+        )
+    if ".." in PurePosixPath(normalized).parts:
+        raise ValueError(
+            "unexpected_paths entries must be non-empty relative paths without '..'"
+        )
+    return normalized
+
+
+
 # Names of interpreter/library loader variables a policy-configured command must
 # not set, because they would let a runtime check rebind the interpreter or
 # shared-library search path the bridge runs under (an injection vector). PATH
@@ -408,6 +437,13 @@ class ProjectPolicy(BaseModel):
     runtime_verification_commands: tuple[RuntimeVerificationCommand, ...] = ()
     working_tree_capture_scope: WorkingTreeCaptureScope | None = None
     protected_paths: tuple[str, ...] = (".git", ".env")
+    # M-CC-06: unexpected-files policy. A tuple of shell-style glob patterns or
+    # literal relative paths (``*.lock``, ``dist/``, ``node_modules/``) that a
+    # candidate's changed set must never contain unless the path is explicitly
+    # declared in the verified path list. Empty (the default) disables the
+    # commit-gate check, which only ever fails closed when the policy declares
+    # patterns.
+    unexpected_paths: tuple[str, ...] = ()
     # ``None`` means "inherit the global ``CLAUDE_DEFAULT_EFFORT``" rather than
     # pinning a per-project default, so a bridge-wide default actually takes
     # effect for projects that do not opt out of it.
@@ -457,6 +493,18 @@ class ProjectPolicy(BaseModel):
         if value is None:
             return ()
         return tuple(_policy_path(str(item)) for item in value)
+
+    @field_validator("unexpected_paths", mode="before")
+    @classmethod
+    def validate_unexpected_paths(cls, value: object) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if isinstance(value, (str, bytes)):
+            raise ValueError("unexpected_paths must be a list of pattern strings")
+        patterns = tuple(_unexpected_path(str(item)) for item in value)  # type: ignore[arg-type]
+        if len(patterns) != len(set(patterns)):
+            raise ValueError("unexpected_paths must not contain duplicates")
+        return patterns
 
     @field_validator("claude_model")
     @classmethod
@@ -610,6 +658,11 @@ class ProjectPolicy(BaseModel):
                 "working_tree_candidate_capture requires a pinned "
                 "working_tree_capture_scope in policy"
             )
+        # M-CC-06: the unexpected_paths entries are validated and normalized by
+        # the field validator (non-empty, relative, no '..', no duplicates);
+        # re-validate here so policy validation is a single, explicit gate.
+        for pattern in self.unexpected_paths:
+            _unexpected_path(pattern)
         command_ids = [command.id for command in self.verification_commands]
         if len(command_ids) != len(set(command_ids)):
             raise ValueError("verification command IDs must be unique per project")
