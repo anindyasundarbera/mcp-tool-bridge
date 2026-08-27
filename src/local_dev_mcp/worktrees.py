@@ -837,3 +837,159 @@ class GitWorktreeManager:
                     )
                 except (GitCommandError, OSError):
                     pass
+
+    async def reset_worktree_to_base(
+        self,
+        project: ProjectPolicy,
+        worktree: JobWorktree,
+    ) -> None:
+        """Reset a job worktree's working tree to the clean base state (M-CC-10).
+
+        Candidate-corruption rollback: on a re-derive failure the worktree is
+        returned to the exact clean detached state it had at ``base_head``.
+        The index is cleared and every tracked file restored to ``HEAD``
+        (``git reset --hard``), then every untracked file/directory is removed
+        (``git clean -fd``). Because the worktree is isolated and every file in
+        it is a candidate artifact, this is the faithful recovery the content-
+        addressed checkpoint ledger describes (the ledger retains paths + a
+        digest, never file bytes). Only the isolated worktree is touched — the
+        canonical checkout is never read or written. The path is re-validated
+        as a trusted directory inside the project's worktree root before any
+        destructive git runs, so a swapped/symlinked path is refused.
+        """
+        root = self._root_for(project)
+        expected_parent = (root / project.id).resolve(strict=True)
+        try:
+            metadata = os.lstat(worktree.path)
+        except FileNotFoundError as exc:
+            raise WorktreeError("job worktree no longer exists") from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise WorktreeError("job worktree is not a trusted directory")
+        resolved = worktree.path.resolve(strict=True)
+        if resolved.parent != expected_parent:
+            raise WorktreeError("job worktree escaped the configured worktree root")
+
+        timeout = self.settings.git_command_timeout_seconds
+        await run_git(
+            resolved,
+            "reset",
+            "--hard",
+            "HEAD",
+            timeout_seconds=timeout,
+        )
+        await run_git(
+            resolved,
+            "clean",
+            "-fd",
+            "--",
+            ".",
+            timeout_seconds=timeout,
+        )
+        status = await run_git(
+            resolved,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            timeout_seconds=timeout,
+        )
+        if status:
+            raise WorktreeError("job worktree did not return to a clean base state")
+
+    async def recreate_detached(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        base_head: str,
+    ) -> JobWorktree:
+        """Recreate a lost job worktree detached at an exact ``base_head``.
+
+        M-CC-10: reconstructs a job worktree whose directory vanished. Unlike
+        ``create_detached_at_head`` (MCPB-012) this does NOT require the
+        canonical HEAD to equal ``base_head`` — reconstruction must work after
+        the canonical checkout has moved on. Only the ``base_head`` object
+        resolving in the canonical repository is required (read-only
+        ``cat-file``); the canonical working tree, index, and refs are never
+        written. The new worktree comes up clean at ``base_head`` and its path
+        is validated as a trusted directory inside the project's worktree root.
+        """
+        root = self._root_for(project)
+        project_directory = _ensure_private_directory(root / project.id)
+
+        path = project_directory / job_id
+        if path.exists() or path.is_symlink():
+            raise WorktreeError("job worktree path already exists")
+
+        timeout = self.settings.git_command_timeout_seconds
+        # Read-only: confirm the base commit object exists in the canonical
+        # repository before creating any worktree from it.
+        await run_git(
+            project.root,
+            "cat-file",
+            "-e",
+            f"{base_head}^{{commit}}",
+            timeout_seconds=timeout,
+        )
+
+        created = False
+        completed = False
+        try:
+            await run_git(
+                project.root,
+                "worktree",
+                "add",
+                "--detach",
+                "--",
+                str(path),
+                base_head,
+                timeout_seconds=timeout,
+            )
+            created = True
+
+            resolved = path.resolve(strict=True)
+            if resolved.parent != project_directory.resolve(strict=True):
+                raise WorktreeError("job worktree escaped the configured worktree root")
+            worktree_root = await run_git(
+                resolved,
+                "rev-parse",
+                "--show-toplevel",
+                timeout_seconds=timeout,
+            )
+            worktree_head = await run_git(
+                resolved,
+                "rev-parse",
+                "--verify",
+                "HEAD",
+                timeout_seconds=timeout,
+            )
+            worktree_status = await run_git(
+                resolved,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                timeout_seconds=timeout,
+            )
+            if Path(worktree_root).resolve(strict=True) != resolved:
+                raise WorktreeError("created job path is not a Git worktree root")
+            if worktree_head.lower() != base_head.lower() or worktree_status:
+                raise WorktreeError("recreated job worktree has an invalid baseline")
+            completed = True
+            return JobWorktree(path=resolved, base_head=base_head.lower())
+        except (GitCommandError, OSError) as exc:
+            raise WorktreeError(str(exc)) from exc
+        finally:
+            if created and not completed:
+                # Git may have registered a partially-created worktree. A forced
+                # removal is safe here because this path was allocated by this call
+                # and has not been handed to any caller.
+                try:
+                    await run_git(
+                        project.root,
+                        "worktree",
+                        "remove",
+                        "--force",
+                        "--",
+                        str(path),
+                        timeout_seconds=timeout,
+                    )
+                except (GitCommandError, OSError):
+                    pass

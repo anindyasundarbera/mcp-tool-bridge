@@ -160,6 +160,14 @@ def _valid_session_id(value: object) -> bool:
     )
 
 
+def _reported_tool_failures(result: dict[str, Any]) -> int:
+    """Return the non-negative tool-failure count an executor result reports."""
+    value = result.get("tool_failures")
+    if isinstance(value, int) and value > 0:
+        return value
+    return 0
+
+
 def _redact(value: Any, paths: tuple[Path, ...]) -> Any:
     if isinstance(value, str):
         result = value
@@ -578,7 +586,17 @@ class DevelopmentJobManager:
                     job.error = "bridge restarted while job was in progress"
                 job.updated_at = _timestamp()
                 mutated = True
-            elif job.worktree is not None and not _worktree_dir_ok(job.worktree.path):
+            # M-CC-10: persist the worktree base commit durably BEFORE it can be
+            # nulled below, so ``reconstruct_lost_worktree`` has a restart-safe
+            # base even after the directory vanishes and this reload marks the
+            # job failed. Idempotent: a meta row already on disk is refreshed.
+            if job.worktree is not None:
+                self._persist_worktree_meta(job)
+            if (
+                job.worktree is not None
+                and job.status in TERMINAL_STATUSES
+                and not _worktree_dir_ok(job.worktree.path)
+            ):
                 job.worktree = None
                 job.status = JobStatus.FAILED
                 job.error = "job worktree no longer exists"
@@ -598,6 +616,27 @@ class DevelopmentJobManager:
         so the durable store mirrors the in-memory state.
         """
         store.upsert_job_row(self._db, job_to_row(job))
+
+    def _persist_worktree_meta(self, job: DevelopmentJob) -> None:
+        """Durably record a job's worktree base commit (M-CC-10).
+
+        Writes the ``job_worktree_meta`` sidecar row so a lost worktree can be
+        reconstructed from the content-addressed checkpoint ledger even after
+        a server restart — the ``jobs`` row nulls ``worktree_base_head`` when
+        the directory vanishes. Idempotent; safe to call on every assignment
+        and on reload. Call inside ``async with self._state_lock``.
+        """
+        if job.worktree is None:
+            return
+        store.upsert_job_worktree_meta(
+            self._db,
+            {
+                "job_id": job.job_id,
+                "base_head": job.worktree.base_head,
+                "worktree_path": str(job.worktree.path),
+                "recorded_at": _timestamp(),
+            },
+        )
 
     def _requirements_manager(self) -> Any:
         """Return the RequirementManager, lazily constructing it if needed.
@@ -1279,6 +1318,64 @@ class DevelopmentJobManager:
         except asyncio.CancelledError:
             pass
 
+    async def _execute_slice(
+        self,
+        job: DevelopmentJob,
+        project: ProjectPolicy,
+        drafter_text: str,
+        effort: Effort,
+        session_id: str | None,
+        slice_max: int,
+        slice_index: int,
+    ) -> tuple[dict[str, Any], tuple[str, ...]]:
+        """Run one executor slice and return ``(result, boundary_paths)``.
+
+        M-CC-10: extracted from ``_run`` so a slice that reports tool failures
+        can be retried within policy by the caller — each invocation runs a
+        fresh executor call with the same text, absorbs its budget counters,
+        and records a ``boundary`` checkpoint of its own, so every attempt is
+        durable before the next one starts. The returned ``boundary_paths`` is
+        the changed-path set captured for THIS attempt (the last attempt's set
+        wins when a retry loop follows).
+        """
+        exec_task: asyncio.Task[dict[str, Any]] = asyncio.create_task(
+            self._executor.execute(
+                project,
+                drafter_text,
+                effort,
+                root=job.worktree.path,
+                resume_session_id=session_id,
+                max_turns=slice_max,
+            )
+        )
+        sampler = asyncio.create_task(self._sampler_loop(job, exec_task))
+        # M-CT-02: measure the slice wall-time around the executor call as the
+        # robust fallback for wall-time accumulation. ``time.monotonic()`` is
+        # not affected by system clock adjustments and is the right clock for
+        # elapsed measurement.
+        slice_start = time.monotonic()
+        try:
+            result = await exec_task
+        finally:
+            slice_wall = time.monotonic() - slice_start
+            if not exec_task.done():
+                exec_task.cancel()
+            if not sampler.done():
+                sampler.cancel()
+            for task in (exec_task, sampler):
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        if job.cancel_requested:
+            raise asyncio.CancelledError
+
+        self._absorb_result_budget(job, result, slice_wall_seconds=slice_wall)
+        boundary_paths = await self._record_checkpoint(
+            job, "boundary", event={"slice": slice_index}, result=result
+        )
+        return result, boundary_paths
+
     def _absorb_result_budget(
         self,
         job: DevelopmentJob,
@@ -1919,6 +2016,9 @@ class DevelopmentJobManager:
             )
             self._jobs[job.job_id] = job
             self._persist_progress(job)
+            # M-CC-10: durably record the captured worktree's base commit so a
+            # later lost-worktree reconstruction has a restart-safe base.
+            self._persist_worktree_meta(job)
             self._record_event(
                 job,
                 "created",
@@ -2723,6 +2823,189 @@ class DevelopmentJobManager:
                 },
             )
 
+    # ------------------------------------------------------------------
+    # M-CC-10: failure-recovery helpers.
+    #
+    # ``rollback_candidate`` resets a corrupted candidate's worktree to the
+    # clean base state described by the checkpoint ledger and pauses the job
+    # resumably. ``reconstruct_lost_worktree`` rebuilds a job worktree whose
+    # directory vanished, from the durable ``job_worktree_meta`` base commit
+    # plus the last checkpoint's changed-set. Both are internal (no new MCP
+    # tool), additive, and audited.
+    # ------------------------------------------------------------------
+
+    async def rollback_candidate(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """M-CC-10: roll a corrupted candidate back to the last checkpoint.
+
+        On a candidate re-derive failure (fingerprint mismatch / unreadable
+        candidate state) the worktree is reset to the clean base state the
+        checkpoint ledger describes: the index is cleared, every tracked
+        changed file is restored to the base HEAD, and every untracked
+        file/directory under the worktree is removed
+        (``GitWorktreeManager.reset_worktree_to_base``). The content-addressed
+        checkpoint retains paths + a digest — never file bytes — so the
+        recovery is honest: the worktree returns to base and the job is
+        transitioned to PAUSED_INTERRUPTED (resumable from the last checkpoint)
+        so a resumed drafter re-derives the candidate from the resume seed. The
+        stale candidate/result are cleared and an audit event records the
+        rollback. Internal — no new tool.
+        """
+        async with self._state_lock:
+            job = self._require_job(project, job_id)
+            if job.worktree is None:
+                raise DevelopmentJobError("job has no worktree to roll back")
+            if job.status != JobStatus.COMPLETED:
+                raise DevelopmentJobError(
+                    "only a completed job's candidate can roll back"
+                )
+            checkpoint = store.load_latest_checkpoint(self._db, job.job_id)
+            worktree = job.worktree
+        changed_paths: list[str] = []
+        if checkpoint is not None:
+            parsed = _json_loads(checkpoint.get("changed_paths_json"))
+            if isinstance(parsed, list):
+                changed_paths = [str(path) for path in parsed]
+        await self._worktrees.reset_worktree_to_base(project, worktree)
+        async with self._state_lock:
+            job = self._require_job(project, job_id)
+            job.status = JobStatus.PAUSED_INTERRUPTED
+            job.pause_reason = "candidate corruption rolled back to last checkpoint"
+            job.error = None
+            job.result = None
+            job.candidate = None
+            self._last_changed_paths.pop(job.job_id, None)
+            job.updated_at = _timestamp()
+            self._persist_job(job)
+            self._persist_progress(job)
+            self._record_event(
+                job,
+                "candidate_rollback",
+                {
+                    "reason": reason[-1000:],
+                    "checkpoint_id": (
+                        checkpoint.get("checkpoint_id") if checkpoint else None
+                    ),
+                    "changed_path_count": len(changed_paths),
+                },
+                authority={
+                    "actor": "bridge",
+                    "authority_source": "bridge_internal",
+                    "scope": "candidate_rollback",
+                    "classification": "observed",
+                },
+            )
+        return {
+            "job_id": job_id,
+            "status": "rolled_back",
+            "pause_reason": "candidate corruption rolled back to last checkpoint",
+            "changed_path_count": len(changed_paths),
+        }
+
+    async def reconstruct_lost_worktree(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+    ) -> dict[str, Any]:
+        """M-CC-10: reconstruct a lost job worktree from the checkpoint ledger.
+
+        A job whose worktree directory vanished (deleted, unmounted, or never
+        recreated after a restart) is rebuilt from its content-addressed
+        checkpoints: the durable ``job_worktree_meta`` sidecar supplies the
+        base commit (falling back to the in-memory ``worktree.base_head``), the
+        worktree is recreated detached at that commit via
+        ``GitWorktreeManager.recreate_detached``, and the last checkpoint's
+        changed-set is re-applied as the resume scope. File content is NOT
+        retained by checkpoints (only paths + a digest), so the reconstructed
+        worktree starts clean at base and the job is transitioned to
+        PAUSED_INTERRUPTED (resumable) with the checkpoint resume seed; a
+        resumed drafter re-derives the changes. An audit event records the
+        reconstruction. Internal — no new tool.
+        """
+        async with self._state_lock:
+            job = self._require_job(project, job_id)
+            if job.committed_sha is not None:
+                raise DevelopmentJobError(
+                    "a committed job has no worktree to reconstruct"
+                )
+            if job.worktree is not None and _worktree_dir_ok(job.worktree.path):
+                raise DevelopmentJobError(
+                    "job worktree still exists; nothing to reconstruct"
+                )
+            checkpoint = store.load_latest_checkpoint(self._db, job.job_id)
+            if checkpoint is None:
+                raise DevelopmentJobError(
+                    "job has no checkpoint ledger to reconstruct from"
+                )
+            base_head: str | None = None
+            if job.worktree is not None:
+                base_head = job.worktree.base_head
+            else:
+                meta = store.load_job_worktree_meta(self._db, job.job_id)
+                if meta is not None and meta.get("base_head"):
+                    base_head = meta["base_head"]
+                    meta_path = meta.get("worktree_path")
+                    if (
+                        isinstance(meta_path, str)
+                        and _worktree_dir_ok(Path(meta_path))
+                    ):
+                        raise DevelopmentJobError(
+                            "job worktree still exists; nothing to reconstruct"
+                        )
+            if not base_head:
+                raise DevelopmentJobError(
+                    "no durable base commit for reconstruction"
+                )
+            prior_status = job.status
+            changed_paths = _json_loads(checkpoint.get("changed_paths_json"))
+            if not isinstance(changed_paths, list):
+                changed_paths = []
+        worktree = await self._worktrees.recreate_detached(
+            project, job_id, base_head
+        )
+        async with self._state_lock:
+            job = self._require_job(project, job_id)
+            job.worktree = worktree
+            self._persist_worktree_meta(job)
+            self._last_changed_paths[job.job_id] = tuple(
+                str(path) for path in changed_paths
+            )
+            job.status = JobStatus.PAUSED_INTERRUPTED
+            job.pause_reason = "lost worktree reconstructed from checkpoint"
+            job.error = None
+            job.updated_at = _timestamp()
+            self._persist_job(job)
+            self._persist_progress(job)
+            self._record_event(
+                job,
+                "worktree_reconstructed",
+                {
+                    "prior_status": (
+                        prior_status.value if prior_status is not None else None
+                    ),
+                    "base_head": worktree.base_head,
+                    "changed_path_count": len(changed_paths),
+                    "checkpoint_id": checkpoint.get("checkpoint_id"),
+                },
+                authority={
+                    "actor": "bridge",
+                    "authority_source": "bridge_internal",
+                    "scope": "worktree_reconstruction",
+                    "classification": "observed",
+                },
+            )
+        return {
+            "job_id": job_id,
+            "status": "reconstructed",
+            "base_head": worktree.base_head,
+            "changed_path_count": len(changed_paths),
+            "pause_reason": "lost worktree reconstructed from checkpoint",
+        }
+
     def _maybe_compact(self, job: DevelopmentJob) -> None:
         if store.checkpoint_count(self._db, job.job_id) > self.settings.claude_checkpoint_max:
             store.compact_checkpoints(self._db, job.job_id)
@@ -2895,6 +3178,9 @@ class DevelopmentJobManager:
                         job.worktree = worktree
                         job.updated_at = _timestamp()
                         self._persist_job(job)
+                        # M-CC-10: durably record the worktree base commit so a
+                        # lost worktree can be reconstructed restart-safely.
+                        self._persist_worktree_meta(job)
                         self._record_event(
                             job,
                             "worktree_prepared",
@@ -2945,44 +3231,53 @@ class DevelopmentJobManager:
                         slice_max = self.settings.claude_extension_turns
                     else:
                         slice_max = self.settings.claude_max_turns
-                    exec_task: asyncio.Task[dict[str, Any]] = asyncio.create_task(
-                        self._executor.execute(
+                    # M-CC-10: tool-failure retry within policy. A slice that
+                    # reports tool failures is re-invoked (fresh executor call
+                    # with the same text) up to ``claude_tool_failure_retries``
+                    # times, bounded additionally by the cumulative
+                    # ``claude_max_tool_failures`` ceiling — retries never run
+                    # once the hard cap is reached, so the ceiling always wins
+                    # and the job isolates as FAILED_INFRASTRUCTURE below. Each
+                    # failed attempt's tool failures are absorbed and an audit
+                    # event records the retry. A retried slice that succeeds on
+                    # a later attempt proceeds through the normal classification.
+                    retry_budget = max(0, self.settings.claude_tool_failure_retries)
+                    retries_used = 0
+                    while True:
+                        result, boundary_paths = await self._execute_slice(
+                            job,
                             project,
                             drafter_text,
                             effort,
-                            root=job.worktree.path,
-                            resume_session_id=session_id,
-                            max_turns=slice_max,
+                            session_id,
+                            slice_max,
+                            slice_index,
                         )
-                    )
-                    sampler = asyncio.create_task(self._sampler_loop(job, exec_task))
-                    # M-CT-02: measure the slice wall-time around the executor
-                    # call as the robust fallback for wall-time accumulation.
-                    # ``time.monotonic()`` is not affected by system clock
-                    # adjustments and is the right clock for elapsed measurement.
-                    slice_start = time.monotonic()
-                    try:
-                        result = await exec_task
-                    finally:
-                        slice_wall = time.monotonic() - slice_start
-                        if not exec_task.done():
-                            exec_task.cancel()
-                        if not sampler.done():
-                            sampler.cancel()
-                        for task in (exec_task, sampler):
-                            try:
-                                await task
-                            except (asyncio.CancelledError, Exception):
-                                pass
-                    if job.cancel_requested:
-                        raise asyncio.CancelledError
-
-                    self._absorb_result_budget(
-                        job, result, slice_wall_seconds=slice_wall
-                    )
-                    boundary_paths = await self._record_checkpoint(
-                        job, "boundary", event={"slice": slice_index}, result=result
-                    )
+                        if (
+                            retries_used >= retry_budget
+                            or _reported_tool_failures(result) <= 0
+                            or job.tool_failures
+                            >= self.settings.claude_max_tool_failures
+                            or job.cancel_requested
+                        ):
+                            break
+                        retries_used += 1
+                        self._record_event(
+                            job,
+                            "tool_failure_retry",
+                            {
+                                "slice": slice_index,
+                                "retry": retries_used,
+                                "tool_failures": job.tool_failures,
+                                "ceiling": self.settings.claude_max_tool_failures,
+                            },
+                            authority={
+                                "actor": "bridge",
+                                "authority_source": "budget_policy",
+                                "scope": "tool_failure_retry",
+                                "classification": "observed",
+                            },
+                        )
                     # M-CT-04: close any milestone whose acceptance criteria are
                     # now met (paths present + optional acceptance command passes).
                     await self._close_milestones(job, project, boundary_paths)

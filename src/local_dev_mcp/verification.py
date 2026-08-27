@@ -32,6 +32,37 @@ class VerificationError(RuntimeError):
 MAX_COMMIT_PATHS = 500
 _FINGERPRINT_MARKER = b"local-dev-mcp-candidate-state-v1\0"
 
+# M-CC-10: candidate-corruption signatures. When ``_candidate_state`` (or a
+# helper it calls) raises one of these, the candidate cannot be re-derived
+# because the worktree state is inconsistent — a staged index, a path that
+# changed/vanished while it was read, an unresolved index entry, an unexpected
+# path type, or a path that Git cannot fingerprint. These are distinct from
+# benign rejections (an empty changed set, a policy-blocked path): corruption
+# triggers the M-CC-10 rollback to the last verified checkpoint; a benign
+# rejection merely fails the verification.
+_CANDIDATE_CORRUPTION_SIGNATURES: tuple[str, ...] = (
+    "candidate index must be empty before verification",
+    "candidate paths must be valid UTF-8",
+    "candidate index contains an unresolved entry",
+    "candidate index contains an unexpected path type",
+    "candidate path no longer exists",
+    "candidate worktree could not be opened",
+    "candidate paths must not traverse symbolic links or non-directories",
+    "changed symbolic links are not allowed",
+    "changed symbolic links and submodules are not allowed",
+    "candidate paths must be regular files or deletions",
+    "candidate path could not be inspected",
+    "Git returned an invalid staged blob size",
+    "Git could not read a staged blob",
+    "Git staged blob size changed while it was read",
+)
+
+
+def _is_candidate_corruption(error: VerificationError) -> bool:
+    """True when a VerificationError is a candidate-corruption signature."""
+    message = str(error)
+    return any(signature in message for signature in _CANDIDATE_CORRUPTION_SIGNATURES)
+
 # M-EV-02: the allowlisted env keys used by ``_run_exec`` that form the
 # deterministic verification environment. Only their *set* values (constants
 # pinned by M-CC-09, not the real process env) are part of the digest, so the
@@ -1528,6 +1559,34 @@ class VerificationCommitManager:
             or _stderr_text(first) != _stderr_text(second)
         )
 
+    async def _candidate_state_or_rollback(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        worktree: JobWorktree,
+    ) -> CandidateState:
+        """M-CC-10: read the candidate state, rolling a corrupt candidate back.
+
+        Wraps ``_candidate_state`` so a candidate that cannot be re-derived
+        because its worktree state is corrupt (staged index, changed-while-read,
+        unresolved index entry, symlink, vanished path) is rolled back to the
+        last verified checkpoint — the worktree is reset to the clean base the
+        checkpoint ledger describes and the job is paused resumably — instead of
+        being left dangling. The original ``VerificationError`` is re-raised so
+        the orchestrator still sees the failure; the rollback makes it
+        recoverable. A rollback failure is swallowed so it never masks the
+        original corruption error.
+        """
+        try:
+            return await _candidate_state(self.settings, project, worktree)
+        except VerificationError as exc:
+            if _is_candidate_corruption(exc):
+                try:
+                    await self._jobs.rollback_candidate(project, job_id, str(exc))
+                except Exception:
+                    pass
+            raise
+
     async def verify(
         self,
         project: ProjectPolicy,
@@ -1541,7 +1600,9 @@ class VerificationCommitManager:
                 if expected_head != worktree.base_head:
                     raise VerificationError("expected_head does not match the job base HEAD")
                 await self._worktrees.validate_resume(project, worktree)
-                before = await _candidate_state(self.settings, project, worktree)
+                before = await self._candidate_state_or_rollback(
+                    project, job_id, worktree
+                )
                 command_results: list[dict[str, Any]] = []
                 redacted_paths = (
                     worktree.path,
@@ -1579,7 +1640,9 @@ class VerificationCommitManager:
                         first["command_digest"] = _command_digest(command)
                     command_results.append(first)
                 results = tuple(command_results)
-                after = await _candidate_state(self.settings, project, worktree)
+                after = await self._candidate_state_or_rollback(
+                    project, job_id, worktree
+                )
             except (DevelopmentJobError, WorktreeError, GitCommandError) as exc:
                 raise VerificationError(str(exc)) from exc
 

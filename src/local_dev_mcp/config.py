@@ -201,6 +201,13 @@ class Settings:
     claude_hard_turns: int
     claude_max_no_progress_turns: int
     claude_max_tool_failures: int
+    # M-CC-10: how many times a single executor slice that reports tool failures
+    # is retried (a fresh executor invocation with the same text) before the
+    # cumulative tool-failure ceiling classifies the job as FAILED_INFRASTRUCTURE.
+    # 0 disables retry (the pre-M-CC-10 behavior). Bounded additionally by
+    # ``claude_max_tool_failures``: retries never run once the cumulative ceiling
+    # is reached, so the hard cap always wins.
+    claude_tool_failure_retries: int
     # M-CT-02: cumulative wall-time ceiling across all slices of a job. 0 means
     # disabled (the default). Distinct from the per-slice ``claude_timeout_seconds``.
     claude_hard_wall_seconds: int
@@ -343,6 +350,9 @@ class Settings:
             ),
             claude_max_tool_failures=_positive_int(
                 env, "CLAUDE_MAX_TOOL_FAILURES", 5
+            ),
+            claude_tool_failure_retries=_non_negative_int(
+                env, "CLAUDE_TOOL_FAILURE_RETRIES", 2
             ),
             claude_hard_wall_seconds=_non_negative_int(
                 env, "CLAUDE_HARD_WALL_SECONDS", 0

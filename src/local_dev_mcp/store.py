@@ -324,6 +324,18 @@ CREATE TABLE IF NOT EXISTS registered_apex_authority (
     apex_authority_ref TEXT NOT NULL,
     confirmed_at TEXT NOT NULL
 );
+-- M-CC-10: additive sidecar persisting a job's worktree ``base_head`` so a
+-- lost worktree can be reconstructed from the content-addressed checkpoint
+-- ledger even after a server restart. The ``jobs`` row nulls
+-- ``worktree_base_head`` when the directory vanishes (see ``_reload_jobs``),
+-- so this sidecar is the durable authority for the base commit. Additive only;
+-- ``SCHEMA_VERSION`` stays 1.
+CREATE TABLE IF NOT EXISTS job_worktree_meta (
+    job_id TEXT PRIMARY KEY,
+    base_head TEXT NOT NULL,
+    worktree_path TEXT,
+    recorded_at TEXT NOT NULL
+);
 """
 
 _UPSERT_JOB = """
@@ -430,6 +442,18 @@ INSERT INTO job_events (
 ) VALUES (
     :job_id, :project_id, :occurred_at, :event_type, :detail_json
 )
+"""
+
+_UPSERT_JOB_WORKTREE_META = """
+INSERT INTO job_worktree_meta (
+    job_id, base_head, worktree_path, recorded_at
+) VALUES (
+    :job_id, :base_head, :worktree_path, :recorded_at
+)
+ON CONFLICT(job_id) DO UPDATE SET
+    base_head = excluded.base_head,
+    worktree_path = excluded.worktree_path,
+    recorded_at = excluded.recorded_at
 """
 
 _UPSERT_PROGRESS = """
@@ -1200,6 +1224,32 @@ def checkpoint_count(connection: sqlite3.Connection, job_id: str) -> int:
         "SELECT COUNT(*) FROM job_checkpoints WHERE job_id = ?", (job_id,)
     ).fetchone()
     return int(row[0]) if row is not None else 0
+
+
+def upsert_job_worktree_meta(
+    connection: sqlite3.Connection, row: dict[str, Any]
+) -> None:
+    """Persist one job's worktree base commit as a single ACID transaction.
+
+    M-CC-10: a 1:1 sidecar to ``jobs`` keyed by ``job_id`` that durably
+    records the worktree's ``base_head`` (and, when known, its path) so a lost
+    worktree can be reconstructed from the content-addressed checkpoint ledger
+    even after a server restart — the ``jobs`` row itself nulls
+    ``worktree_base_head`` when the directory vanishes. The upsert is
+    idempotent and additive; ``SCHEMA_VERSION`` stays 1.
+    """
+    with connection:
+        connection.execute(_UPSERT_JOB_WORKTREE_META, row)
+
+
+def load_job_worktree_meta(
+    connection: sqlite3.Connection, job_id: str
+) -> dict[str, Any] | None:
+    """Return one job's worktree meta row, or None when none is recorded."""
+    row = connection.execute(
+        "SELECT * FROM job_worktree_meta WHERE job_id = ?", (job_id,)
+    ).fetchone()
+    return dict(row) if row is not None else None
 
 
 _INSERT_CHECKPOINT_DETAIL = """
