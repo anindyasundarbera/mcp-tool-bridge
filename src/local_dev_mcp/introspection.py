@@ -130,6 +130,30 @@ def effective_policy_view(
             if project.working_tree_capture_scope is not None
             else None
         ),
+        # M-CC-11 security-hardening policies, exposed so an orchestrator can
+        # observe which hardening a project opted into. Values are never
+        # secrets: allowlist entries and credential names are identifiers.
+        "filesystem_policy": (
+            {
+                "read_allow": sorted(project.filesystem_policy.read_allow),
+                "write_allow": sorted(project.filesystem_policy.write_allow),
+            }
+            if project.filesystem_policy is not None
+            else None
+        ),
+        "credential_policy": (
+            {"allow": sorted(project.credential_policy.allow)}
+            if project.credential_policy is not None
+            else None
+        ),
+        "signed_manifests": project.signed_manifests,
+        "sensitivity_policy": (
+            {
+                "sensitive_paths": sorted(project.sensitivity_policy.sensitive_paths),
+            }
+            if project.sensitivity_policy is not None
+            else None
+        ),
         "default_effort": project.default_effort,
         "allow_ultracode": project.allow_ultracode,
         "self_managed": project.self_managed,

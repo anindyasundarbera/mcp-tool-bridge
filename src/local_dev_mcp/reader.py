@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .config import Settings
+from .security import filesystem_read_allowed
 from .git import run_git
 from .models import ProjectPolicy
 
@@ -119,6 +120,12 @@ def resolve_project_path(
     relative = _relative_input(requested, allow_root=allow_root)
     if _protected(project, relative):
         raise RepositoryReadError("path is protected by project policy")
+    # M-CC-11 filesystem_policy: when a project opts in with a read allowlist,
+    # a resolved read path (other than the bare root used to list/search a
+    # whole project) must fall at or beneath one of the allowlisted prefixes.
+    # Opt-in only: a project without a filesystem_policy is unaffected.
+    if relative != PurePosixPath(".") and not filesystem_read_allowed(project, relative):
+        raise RepositoryReadError("path is outside the project filesystem read allowlist")
     candidate = project.root if relative == PurePosixPath(".") else project.root / relative
     cursor = project.root
     for part in relative.parts:
@@ -243,6 +250,10 @@ class RepositoryReader:
                     continue
                 relative = PurePosixPath(candidate.relative_to(project.root).as_posix())
                 if _protected(project, relative):
+                    continue
+                # M-CC-11: files beyond a project's read allowlist are never
+                # surfaced in listings.
+                if not filesystem_read_allowed(project, relative):
                     continue
                 if len(files) >= max_results:
                     truncated = True
@@ -442,6 +453,9 @@ class RepositoryReader:
             data = event["data"]
             relative = PurePosixPath(data["path"]["text"])
             if any(part.startswith(".") for part in relative.parts) or _protected(project, relative):
+                continue
+            # M-CC-11: matches outside a project's read allowlist are dropped.
+            if not filesystem_read_allowed(project, relative):
                 continue
             for submatch in data.get("submatches", []):
                 if len(matches) >= max_results:

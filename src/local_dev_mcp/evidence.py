@@ -28,6 +28,11 @@ from .git import run_git
 from .jobs import DevelopmentJobManager
 from .models import ProjectPolicy
 from .registry import ProjectLockManager
+from .security import (
+    project_sensitivity_prefixes,
+    resolve_signing_key,
+    sign_evidence_bundle,
+)
 from .worktrees import GitWorktreeManager
 
 
@@ -61,32 +66,59 @@ _SENSITIVE_PATH_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
-def _is_sensitive_path(path: str) -> bool:
-    return any(pattern.search(path) for pattern in _SENSITIVE_PATH_PATTERNS)
+def _is_sensitive_path(
+    path: str,
+    extra_patterns: tuple[re.Pattern[str], ...] = (),
+    sensitive_prefixes: tuple[str, ...] = (),
+) -> bool:
+    """True iff ``path`` matches a built-in or project-sensitive pattern.
+
+    ``extra_patterns`` are compiled regexes matched against the path;
+    ``sensitive_prefixes`` are directory prefixes (M-CC-11 sensitivity policy)
+    where any path at or beneath the prefix is sensitive.
+    """
+    if any(pattern.search(path) for pattern in _SENSITIVE_PATH_PATTERNS):
+        return True
+    if any(pattern.search(path) for pattern in extra_patterns):
+        return True
+    for prefix in sensitive_prefixes:
+        if path == prefix or path.startswith(prefix.rstrip("/") + "/"):
+            return True
+    return False
 
 
 def _exclude_sensitive_paths(
     paths: list[Any] | None,
+    extra_patterns: tuple[re.Pattern[str], ...] = (),
+    sensitive_prefixes: tuple[str, ...] = (),
 ) -> tuple[list[Any], int]:
     """Drop sensitive entries from a changed-paths list.
 
     Returns the kept entries and the count of dropped entries. Non-string
     entries are always kept (they cannot match a path pattern). ``None`` input
-    is preserved as ``None`` with zero exclusions.
+    is preserved as ``None`` with zero exclusions. ``extra_patterns`` and
+    ``sensitive_prefixes`` extend the built-in sensitive-path filter with a
+    project's sensitivity policy (M-CC-11).
     """
     if paths is None:
         return None, 0
     kept: list[Any] = []
     excluded = 0
     for item in paths:
-        if isinstance(item, str) and _is_sensitive_path(item):
+        if isinstance(item, str) and _is_sensitive_path(
+            item, extra_patterns=extra_patterns, sensitive_prefixes=sensitive_prefixes
+        ):
             excluded += 1
         else:
             kept.append(item)
     return kept, excluded
 
 
-def _scrub_sensitive_diff_detail(detail: Any) -> Any:
+def _scrub_sensitive_diff_detail(
+    detail: Any,
+    extra_patterns: tuple[re.Pattern[str], ...] = (),
+    sensitive_prefixes: tuple[str, ...] = (),
+) -> Any:
     """Replace diff-stat detail lines that mention a sensitive path.
 
     A ``git diff --stat`` line looks like ``" <path> | <changes>"``. The path is
@@ -94,7 +126,8 @@ def _scrub_sensitive_diff_detail(detail: Any) -> Any:
     whitespace stripped) and checked against the sensitive patterns. Matching
     lines become ``<excluded-sensitive>`` so the recipient can see that a line
     was withheld without exposing the path or content. Non-string detail is
-    returned unchanged.
+    returned unchanged. ``extra_patterns`` and ``sensitive_prefixes`` extend
+    the built-in filter with a project's sensitivity policy (M-CC-11).
     """
     if not isinstance(detail, str):
         return detail
@@ -103,7 +136,9 @@ def _scrub_sensitive_diff_detail(detail: Any) -> Any:
         stripped = line.lstrip()
         if stripped and " | " in stripped:
             path = stripped.split(" | ", 1)[0].strip()
-            if _is_sensitive_path(path):
+            if _is_sensitive_path(
+                path, extra_patterns=extra_patterns, sensitive_prefixes=sensitive_prefixes
+            ):
                 lines.append("<excluded-sensitive>")
                 continue
         lines.append(line)
@@ -136,6 +171,10 @@ def _json_loads(value: str | None) -> Any:
         return json.loads(value)
     except (json.JSONDecodeError, TypeError):
         return None
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False)
 
 
 class EvidenceBundleManager:
@@ -304,17 +343,24 @@ class EvidenceBundleManager:
             # Sensitive-path exclude filter: drop matching changed_paths and
             # scrub the diff detail BEFORE the bundle-wide redact so secrets
             # never enter the archive. ``sensitive_excluded_count`` tells the
-            # recipient something was withheld.
+            # recipient something was withheld. M-CC-11: a project's
+            # ``sensitivity_policy`` extends the built-in filter with its own
+            # declared sensitive paths/patterns (classified before export).
+            sensitivity_prefixes = project_sensitivity_prefixes(
+                project.sensitivity_policy
+            )
             changed_paths_raw = (
                 _json_loads(latest_checkpoint.get("changed_paths_json"))
                 if latest_checkpoint is not None
                 else None
             )
             kept_paths, sensitive_excluded_count = _exclude_sensitive_paths(
-                changed_paths_raw
+                changed_paths_raw,
+                sensitive_prefixes=sensitivity_prefixes,
             )
             scrubbed_detail = _scrub_sensitive_diff_detail(
-                diff_summary.get("detail")
+                diff_summary.get("detail"),
+                sensitive_prefixes=sensitivity_prefixes,
             )
             diff_summary = {**diff_summary, "detail": scrubbed_detail}
 
@@ -338,6 +384,15 @@ class EvidenceBundleManager:
                 "checkpoint_count": checkpoint_count,
                 "requirements": self._requirements_section(project, job_id),
             }
+            if project.sensitivity_policy is not None:
+                # M-CC-11 sensitivity classification: surface the policy that
+                # was applied and the number of artifacts withheld because of it.
+                bundle["sensitivity"] = {
+                    "sensitive_paths": sorted(
+                        project.sensitivity_policy.sensitive_paths
+                    ),
+                    "excluded_count": sensitive_excluded_count,
+                }
 
             # Redact sensitive paths BEFORE computing the bundle-wide content
             # address. The SHA-256 is over the sorted, un-ASCII-escaped JSON of
@@ -347,6 +402,41 @@ class EvidenceBundleManager:
             redacted = _redact(bundle, self._redaction_paths(project, job_id))
             bundle_json = json.dumps(redacted, sort_keys=True, ensure_ascii=False)
             redacted["bundle_sha256"] = _sha256(bundle_json)
+
+            # M-CC-11 signed_manifests: sign the bundle's content address with
+            # the project key (HMAC-SHA256 over ``<project_id>\\n<bundle_sha256>``)
+            # and persist the manifest record alongside the bundle. Fail closed:
+            # a project that opts into signing but has no configured key is an
+            # error, never a silently unsigned bundle.
+            if project.signed_manifests:
+                key = resolve_signing_key(
+                    project.id,
+                    state_root=self._worktrees.ensure_state_root(),
+                )
+                if key is None:
+                    raise EvidenceBundleError(
+                        "signed_manifests requires a configured project signing key "
+                        f"(BRIDGELAB_EVIDENCE_SIGNING_KEY_"
+                        f"{project.id.upper().replace('-', '_')} or "
+                        "<state>/signing_keys/<project_id>.key)"
+                    )
+                signed = sign_evidence_bundle(redacted, project.id, key)
+                manifest = signed["manifest"]
+                store.insert_evidence_manifest(
+                    self._db,
+                    {
+                        "project_id": project.id,
+                        "job_id": job_id,
+                        "bundle_sha256": manifest["bundle_sha256"],
+                        "algorithm": manifest["algorithm"],
+                        "signature": manifest["signature"],
+                        "signed_at": _timestamp(),
+                        "detail_json": _json_dumps(
+                            {"expected_candidate_fingerprint": expected}
+                        ),
+                    },
+                )
+                redacted = signed
             return redacted
 
     def _verification_entry(

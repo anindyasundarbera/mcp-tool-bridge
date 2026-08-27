@@ -10,6 +10,7 @@ from typing import Any
 from .config import Settings
 from .git import project_status
 from .models import Effort, ProjectPolicy
+from .security import projected_credential_env
 
 
 def validate_effort(project: ProjectPolicy, effort: Effort) -> None:
@@ -495,8 +496,26 @@ class ClaudeExecutor:
         before = await project_status(
             execution_root, self.settings.git_command_timeout_seconds
         )
-        environment = os.environ.copy()
-        environment["NO_COLOR"] = "1"
+        # M-CC-11 credential_policy: when a project opts in, the Claude worktree
+        # launcher receives a minimal base environment plus ONLY the credential
+        # env names the project declares — never a copy of the bridge's whole
+        # environment. Without a credential_policy (the default), the historical
+        # behavior (full environment copy) is preserved.
+        if project.credential_policy is not None:
+            environment = projected_credential_env(
+                project.credential_policy,
+                base={
+                    "PATH": os.environ.get("PATH", os.defpath),
+                    "HOME": os.environ.get("HOME", ""),
+                    "LANG": os.environ.get("LANG", "C.UTF-8"),
+                    "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+                    "TZ": os.environ.get("TZ", "UTC"),
+                    "NO_COLOR": "1",
+                },
+            )
+        else:
+            environment = os.environ.copy()
+            environment["NO_COLOR"] = "1"
 
         process = await asyncio.create_subprocess_exec(
             *command,

@@ -1145,14 +1145,18 @@ async def _run_exec(
     command_id: str,
     argv: list[str],
     extra_env: dict[str, str] | None = None,
+    credential_names: tuple[str, ...] = (),
     start_error_prefix: str = "executable could not start",
 ) -> dict[str, Any]:
     """Run a fixed-argv subprocess in the candidate worktree and bound its output.
 
     Shared by the verification commands and the M-CC-11 supply-chain scans.
     The environment is deterministic (M-CC-09) and stripped of tokens/certs; no
-    shell is involved. A non-zero exit code is reported to the caller, which
-    decides whether it is a gate rejection.
+    shell is involved. ``credential_names`` (M-CC-11 credential_policy) are the
+    ONLY credential env names projected from the bridge's own process
+    environment into the subprocess — least privilege, never a full copy. A
+    non-zero exit code is reported to the caller, which decides whether it is a
+    gate rejection.
     """
     expanded = list(argv)
     if expanded[0] == "{python}":
@@ -1172,6 +1176,14 @@ async def _run_exec(
     }
     if extra_env:
         environment.update(extra_env)
+    if credential_names:
+        environment.update(
+            {
+                name: os.environ[name]
+                for name in credential_names
+                if name in os.environ
+            }
+        )
 
     try:
         process = await asyncio.create_subprocess_exec(
@@ -1332,12 +1344,22 @@ def _sandbox_argv(
     return arguments
 
 
+def _credential_names(project: ProjectPolicy) -> tuple[str, ...]:
+    """The credential env names a project declares (empty when unset)."""
+    return (
+        project.credential_policy.allow
+        if project.credential_policy is not None
+        else ()
+    )
+
+
 async def _run_command(
     settings: Settings,
     worktree: JobWorktree,
     command: VerificationCommand,
     *,
     project: ProjectPolicy | None = None,
+    credential_names: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Run one verification command under the hermetic lab, opt-in per project.
 
@@ -1406,6 +1428,7 @@ async def _run_command(
             command_id=command.id,
             argv=argv,
             extra_env=extra_env,
+            credential_names=credential_names,
             start_error_prefix="verification executable could not start",
         )
     finally:
@@ -1425,6 +1448,7 @@ async def _run_supply_chain_scan(
     settings: Settings,
     worktree: JobWorktree,
     scan: SupplyChainCommand,
+    credential_names: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Run one severity-gated supply-chain scan with a fixed argument vector.
 
@@ -1434,12 +1458,15 @@ async def _run_supply_chain_scan(
     (exactly how grype's ``--fail-on`` surfaces a HIGH/CRITICAL finding). The
     command must be present on PATH or start with ``{python}``; a scanner that
     cannot start is treated as a failed gate (fail-closed), not skipped.
+    ``credential_names`` are the only credential env names projected from the
+    bridge's environment into the scanner (M-CC-11 credential_policy).
     """
     return await _run_exec(
         settings,
         worktree,
         command_id=scan.id,
         argv=list(scan.argv),
+        credential_names=credential_names,
         start_error_prefix="supply-chain scanner could not start",
     )
 
@@ -1621,7 +1648,11 @@ class VerificationCommitManager:
                     first: dict[str, Any] | None = None
                     for _ in range(repetitions):
                         result = await _run_command(
-                            self.settings, worktree, command, project=project
+                            self.settings,
+                            worktree,
+                            command,
+                            project=project,
+                            credential_names=_credential_names(project),
                         )
                         bounded = _bound_redacted_output(
                             _redact(result, redacted_paths),
@@ -1847,7 +1878,10 @@ class VerificationCommitManager:
                 )
                 for scan in project.supply_chain_scans:
                     scan_result = await _run_supply_chain_scan(
-                        self.settings, worktree, scan
+                        self.settings,
+                        worktree,
+                        scan,
+                        credential_names=_credential_names(project),
                     )
                     bounded_scan = _bound_redacted_output(
                         _redact(scan_result, redacted_scan_paths),

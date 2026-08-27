@@ -332,6 +332,65 @@ class RuntimeVerificationCommand(BaseModel):
         return _validate_env_mapping(value)
 
 
+# Credential names that a project may not declare in ``credential_policy``
+# because the bridge sets them deterministically for worktree subprocesses
+# (M-CC-09 hermetic lab): projecting a bridge-environment value over the
+# deterministic default would break reproducible verification.
+_DETERMINISTIC_ENV_KEYS = frozenset(
+    {
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "NO_COLOR",
+        "PYTHONIOENCODING",
+        "PYTHONDONTWRITEBYTECODE",
+        "TZ",
+        "SOURCE_DATE_EPOCH",
+        "PYTHONHASHSEED",
+    }
+)
+
+
+def _policy_allow_path(value: str) -> str:
+    """Validate one filesystem/sensitivity allowlist entry.
+
+    Mirrors ``_capture_scope_path`` (non-empty, relative, no ``..``, no empty
+    or ``.`` segments) but additionally allows the recursive glob suffix
+    ``**`` so a policy may declare a whole subtree (``docs/**``). ``**`` is
+    permitted only as a trailing full segment (``a/**`` or ``a/**/b`` is
+    rejected; only ``a/**`` is accepted) to keep matching semantics
+    deterministic and one-dimensional.
+    """
+    normalized = value.replace("\\", "/").strip()
+    path = PurePosixPath(normalized)
+    if not normalized or path.is_absolute() or ".." in path.parts:
+        raise ValueError(
+            "policy allowlist entries must be non-empty relative paths without '..'"
+        )
+    parts = path.parts
+    for index, part in enumerate(parts):
+        if part == "**":
+            if index != len(parts) - 1:
+                raise ValueError("'**' is allowed only as the final path segment")
+        elif part in ("", "."):
+            raise ValueError(
+                "policy allowlist entries must not contain empty or '.' segments"
+            )
+    return path.as_posix()
+
+
+def _validate_allowlist(value: object, *, label: str) -> tuple[str, ...]:
+    """Validate a tuple of policy allowlist entries (paths or globs)."""
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)):
+        raise ValueError(f"{label} must be a list of relative paths")
+    entries = tuple(_policy_allow_path(str(item)) for item in value)  # type: ignore[arg-type]
+    if len(entries) != len(set(entries)):
+        raise ValueError(f"{label} must not contain duplicate entries")
+    return entries
+
+
 def _capture_scope_path(value: str) -> str:
     """Validate one include/protected-exclude path for the capture scope.
 
@@ -419,6 +478,117 @@ class CapabilityDefinition(BaseModel):
     operations: dict[str, OperationDefinition] = Field(default_factory=dict)
 
 
+class FileSystemPolicy(BaseModel):
+    """Per-project filesystem allowlists for job operations (M-CC-11).
+
+    Opt-in and validated. ``read_allow`` constrains which repository paths a
+    job may read through the reader surface; ``write_allow`` constrains which
+    paths a job may write. Entries are relative paths; a trailing ``/**``
+    selects a whole subtree. An empty list on a side leaves that side
+    unconstrained (the existing protected-path and approved write-root rules
+    still apply). At least one side must be non-empty for the policy to be
+    meaningful.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    read_allow: tuple[str, ...] = Field(default_factory=tuple)
+    write_allow: tuple[str, ...] = Field(default_factory=tuple)
+
+    @field_validator("read_allow", "write_allow", mode="before")
+    @classmethod
+    def validate_allowlists(cls, value: object) -> tuple[str, ...]:
+        return _validate_allowlist(value, label="filesystem allowlist")
+
+    @model_validator(mode="after")
+    def validate_non_empty(self) -> "FileSystemPolicy":
+        if not self.read_allow and not self.write_allow:
+            raise ValueError(
+                "filesystem_policy requires at least one read_allow or write_allow entry"
+            )
+        return self
+
+
+class CredentialPolicy(BaseModel):
+    """Least-privilege, short-lived credential projection (M-CC-11).
+
+    Opt-in per project. Declares the ONLY credential environment-variable
+    names the bridge may project from its own process environment into a job's
+    worktree subprocess environment (verification commands, supply-chain
+    scanners, and the Claude worktree launcher). No other credential from the
+    bridge's environment is ever passed through; when the policy is unset the
+    bridge keeps its existing minimal deterministic environment behavior.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    allow: tuple[str, ...] = Field(default_factory=tuple)
+
+    @field_validator("allow", mode="before")
+    @classmethod
+    def validate_allow(cls, value: object) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if isinstance(value, (str, bytes)):
+            raise ValueError(
+                "credential_policy.allow must be a list of environment variable names"
+            )
+        import re
+
+        key_pattern = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
+        names = tuple(str(item) for item in value)  # type: ignore[arg-type]
+        if len(names) != len(set(names)):
+            raise ValueError("credential_policy.allow must not contain duplicate names")
+        for name in names:
+            if not key_pattern.match(name):
+                raise ValueError(
+                    "credential names must be uppercase [A-Z_][A-Z0-9_]* names"
+                )
+            if name in _FORBIDDEN_ENV_KEYS:
+                raise ValueError(
+                    f"credential name {name!r} is forbidden (it would rebind the "
+                    "interpreter or shared-library search path)"
+                )
+            if name in _DETERMINISTIC_ENV_KEYS:
+                raise ValueError(
+                    f"credential name {name!r} is reserved for the deterministic "
+                    "verification environment"
+                )
+        return names
+
+    @model_validator(mode="after")
+    def validate_non_empty(self) -> "CredentialPolicy":
+        if not self.allow:
+            raise ValueError("credential_policy requires at least one allow entry")
+        return self
+
+
+class SensitivityPolicy(BaseModel):
+    """Per-project sensitivity classification before evidence export (M-CC-11).
+
+    Opt-in per project. Declares paths/patterns that must be withheld from the
+    evidence bundle: any changed path or diff-detail line at or under a
+    declared sensitive path is excluded from the bundle (in addition to the
+    built-in global sensitive-path filter) and the exclusions are counted so a
+    recipient can see that artifacts were withheld.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    sensitive_paths: tuple[str, ...] = Field(default_factory=tuple)
+
+    @field_validator("sensitive_paths", mode="before")
+    @classmethod
+    def validate_paths(cls, value: object) -> tuple[str, ...]:
+        return _validate_allowlist(value, label="sensitivity_policy.sensitive_paths")
+
+    @model_validator(mode="after")
+    def validate_non_empty(self) -> "SensitivityPolicy":
+        if not self.sensitive_paths:
+            raise ValueError("sensitivity_policy requires at least one sensitive_path")
+        return self
+
+
 class ProjectPolicy(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -436,6 +606,12 @@ class ProjectPolicy(BaseModel):
     supply_chain_scans: tuple[SupplyChainCommand, ...] = ()
     runtime_verification_commands: tuple[RuntimeVerificationCommand, ...] = ()
     working_tree_capture_scope: WorkingTreeCaptureScope | None = None
+    # M-CC-11 security-hardening policies — all opt-in, validated in
+    # ``validate_policy``, and internal (none of them introduces an MCP tool).
+    filesystem_policy: FileSystemPolicy | None = None
+    credential_policy: CredentialPolicy | None = None
+    signed_manifests: bool = False
+    sensitivity_policy: SensitivityPolicy | None = None
     protected_paths: tuple[str, ...] = (".git", ".env")
     # M-CC-06: unexpected-files policy. A tuple of shell-style glob patterns or
     # literal relative paths (``*.lock``, ``dist/``, ``node_modules/``) that a
@@ -737,6 +913,22 @@ class ProjectPolicy(BaseModel):
         # re-validate here so policy validation is a single, explicit gate.
         for pattern in self.unexpected_paths:
             _unexpected_path(pattern)
+
+        # M-CC-11: signed_manifests and sensitivity_classification only mean
+        # something when the evidence bundle can actually be exported; each is
+        # a project opt-in gated on the capability it hardens (a signing or
+        # classification policy on a project that can never export would be
+        # misleading authority). Both are internal — no new tool.
+        if (
+            self.signed_manifests
+            and ProjectCapability.EXPORT_EVIDENCE_BUNDLE not in self.capabilities
+        ):
+            raise ValueError("signed_manifests requires export_evidence_bundle")
+        if (
+            self.sensitivity_policy is not None
+            and ProjectCapability.EXPORT_EVIDENCE_BUNDLE not in self.capabilities
+        ):
+            raise ValueError("sensitivity_policy requires export_evidence_bundle")
         command_ids = [command.id for command in self.verification_commands]
         if len(command_ids) != len(set(command_ids)):
             raise ValueError("verification command IDs must be unique per project")

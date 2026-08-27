@@ -205,6 +205,16 @@ CREATE TABLE IF NOT EXISTS supply_chain_scans (
     scanned_at TEXT NOT NULL,
     detail_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS evidence_manifests (
+    manifest_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    bundle_sha256 TEXT NOT NULL,
+    algorithm TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    signed_at TEXT NOT NULL,
+    detail_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS runtime_verifications (
     runtime_verification_id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -1657,6 +1667,44 @@ def load_supply_chain_scans(
         for row in connection.execute(
             "SELECT * FROM supply_chain_scans WHERE job_id = ? "
             "ORDER BY scan_id ASC",
+            (job_id,),
+        ).fetchall()
+    ]
+
+
+_INSERT_EVIDENCE_MANIFEST = """
+INSERT INTO evidence_manifests (
+    project_id, job_id, bundle_sha256, algorithm, signature, signed_at, detail_json
+) VALUES (
+    :project_id, :job_id, :bundle_sha256, :algorithm, :signature, :signed_at,
+    :detail_json
+)
+"""
+
+
+def insert_evidence_manifest(
+    connection: sqlite3.Connection, row: dict[str, Any]
+) -> None:
+    """Persist one signed evidence manifest as a single ACID transaction.
+
+    M-CC-11: the signature of the evidence bundle is stored alongside the
+    bundle (durably, in the private state DB) so an orchestrator or operator
+    can audit that a bundle was signed with the project key. Additive table;
+    ``SCHEMA_VERSION`` stays 1.
+    """
+    with connection:
+        connection.execute(_INSERT_EVIDENCE_MANIFEST, row)
+
+
+def load_evidence_manifests(
+    connection: sqlite3.Connection, job_id: str
+) -> list[dict[str, Any]]:
+    """Return one job's signed evidence manifests as dicts, oldest first."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM evidence_manifests WHERE job_id = ? "
+            "ORDER BY manifest_id ASC",
             (job_id,),
         ).fetchall()
     ]

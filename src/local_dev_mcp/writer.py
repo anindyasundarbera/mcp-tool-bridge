@@ -13,6 +13,7 @@ from .config import Settings
 from .git import run_git
 from .models import ProjectPolicy
 from .reader import _is_within, _protected, _relative_input
+from .security import filesystem_write_allowed
 
 
 WriteMode = Literal["create", "update"]
@@ -48,6 +49,12 @@ def _validate_target(
         for configured in project.markdown_write_roots
     ):
         raise RepositoryWriteError("path is outside the approved Markdown write roots")
+    # M-CC-11 filesystem_policy: when a project opts in with a write allowlist,
+    # a write must fall at or beneath one of the allowlisted prefixes (in
+    # addition to the approved write roots above). Opt-in only: a project
+    # without a filesystem_policy is unaffected.
+    if not filesystem_write_allowed(project, relative):
+        raise RepositoryWriteError("path is outside the project filesystem write allowlist")
 
     target = project.root / relative
     cursor = project.root
