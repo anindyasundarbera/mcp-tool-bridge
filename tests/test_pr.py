@@ -171,6 +171,78 @@ class PullRequestTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_concurrent_open_pull_request_creates_once_edits_once(self) -> None:
+        """M-CC-05 tail: racing open_pull_request calls yield one create + one edit.
+
+        Two ``open_pull_request`` calls run concurrently via ``asyncio.gather``
+        under one shared ``PullRequestManager`` with a mocked ``_gh``. The
+        per-project lock serializes the discover-then-create/update critical
+        section, so the callers cannot double-create: the first discovers no PR
+        and issues exactly one ``gh pr create``; the second (after the first
+        releases the lock) discovers the now-existing PR and issues exactly one
+        ``gh pr edit``. Never a merge.
+        """
+        async def exercise() -> None:
+            policy_obj = policy(self.root)
+            branch = "agent/pr-test-concurrent"
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            _, verification, publication, pr, completed = await self._prepare(
+                policy_obj, edit
+            )
+            info = await self._publish(
+                verification, publication, policy_obj, completed, branch
+            )
+
+            gh_mock = mock.AsyncMock(side_effect=[
+                # First caller: discover -> no existing PR, then create -> url.
+                "",
+                "https://github.com/example/repo/pull/42",
+                # Second caller (after the first releases the project lock):
+                # discover -> the now-existing PR, then edit -> success.
+                '[{"number": 42, "url": "https://github.com/example/repo/pull/42", "state": "open", "headRefName": "agent/pr-test-concurrent"}]',
+                "",
+            ])
+            with mock.patch("local_dev_mcp.pr._gh", new=gh_mock):
+                results = await asyncio.gather(
+                    pr.open_pull_request(
+                        policy_obj,
+                        info["job_id"],
+                        info["base_head"],
+                        info["fingerprint"],
+                        "Concurrent PR",
+                    ),
+                    pr.open_pull_request(
+                        policy_obj,
+                        info["job_id"],
+                        info["base_head"],
+                        info["fingerprint"],
+                        "Concurrent PR",
+                    ),
+                )
+
+            self.assertEqual([r["status"] for r in results], ["ok", "ok"])
+            self.assertEqual(
+                sorted(r["pr_state"]["action"] for r in results),
+                ["created", "updated"],
+            )
+            self.assertTrue(all(r["remote_branch_state"]["present"] for r in results))
+            calls = [c.args for c in gh_mock.call_args_list]
+            # Exactly one gh pr create, one gh pr edit, two gh pr list discovers,
+            # and nothing that merges.
+            self.assertEqual(len(calls), 4)
+            self.assertEqual(sum("create" in c for c in calls), 1)
+            self.assertEqual(sum("edit" in c for c in calls), 1)
+            self.assertEqual(
+                sum(len(c) > 2 and c[1] == "pr" and c[2] == "list" for c in calls),
+                2,
+            )
+            self.assertFalse(any("merge" in c for c in calls))
+
+        asyncio.run(exercise())
+
     def test_non_draft_create_has_body_no_draft_flag(self) -> None:
         """Non-draft PR creation supplies --body/--title, omits --draft/--fill."""
         async def exercise() -> None:
