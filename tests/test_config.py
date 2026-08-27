@@ -165,6 +165,36 @@ def _policy(**overrides: object) -> ProjectPolicy:
     return ProjectPolicy(**project_payload(Path("/tmp/repo"), **overrides))
 
 
+class GroundingAndSpecGatePolicyTests(unittest.TestCase):
+    """M-GV-03 / M-GV-04 policy-level validation of external grounding and
+    the ratified spec commit."""
+
+    def test_grounding_flag_requires_a_ref(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "requires apex_authority_ref"):
+            _policy(require_apex_grounding=True)
+
+    def test_grounding_flag_with_a_ref_is_accepted(self) -> None:
+        policy = _policy(
+            require_apex_grounding=True,
+            apex_authority_ref=f"docs/spec.md@{'a' * 40}",
+        )
+        self.assertEqual(policy.apex_authority_ref, f"docs/spec.md@{'a' * 40}")
+
+    def test_ratified_spec_commit_must_be_a_full_sha(self) -> None:
+        for value in ("abc", "abc123", "g" * 40, "a" * 39):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValidationError, "40-character git SHA"
+                ):
+                    _policy(ratified_spec_commit=value)
+        with self.assertRaisesRegex(ValidationError, "must not be empty"):
+            _policy(ratified_spec_commit="")
+
+    def test_ratified_spec_commit_is_accepted(self) -> None:
+        policy = _policy(ratified_spec_commit="b" * 40)
+        self.assertEqual(policy.ratified_spec_commit, "b" * 40)
+
+
 class CandidateReviewPolicyTests(unittest.TestCase):
     def test_candidate_review_alone_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValidationError, "candidate_review requires claude_edit"):

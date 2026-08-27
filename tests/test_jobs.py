@@ -345,6 +345,51 @@ class DevelopmentJobManagerTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_job_under_ratified_spec_is_accepted(self) -> None:
+        # M-GV-04: a job whose spec is pinned to the project's ratified spec
+        # commit is accepted.
+        async def exercise() -> None:
+            executor = ImmediateExecutor()
+            manager = DevelopmentJobManager(
+                self.settings,
+                ProjectLockManager(),
+                executor,  # type: ignore[arg-type]
+            )
+            ratified = "a" * 40
+            pinned = policy(self.root, ratified_spec_commit=ratified)
+            started = await manager.start(
+                pinned,
+                f"implement the ratified spec {ratified}",
+                "high",
+            )
+            self.assertEqual(started["status"], "queued")
+
+        asyncio.run(exercise())
+
+    def test_spec_drift_is_rejected(self) -> None:
+        # M-GV-04: a job whose spec is not pinned to the ratified spec commit
+        # (no pin at all, or pinned to a different commit) is rejected.
+        async def exercise() -> None:
+            executor = ImmediateExecutor()
+            manager = DevelopmentJobManager(
+                self.settings,
+                ProjectLockManager(),
+                executor,  # type: ignore[arg-type]
+            )
+            ratified = "a" * 40
+            pinned = policy(self.root, ratified_spec_commit=ratified)
+            for text in (
+                "work without any commit pin",
+                f"pinned to the wrong commit {'b' * 40}",
+            ):
+                with self.subTest(text=text):
+                    with self.assertRaisesRegex(
+                        DevelopmentJobError, "spec drift"
+                    ):
+                        await manager.start(pinned, text, "high")
+
+        asyncio.run(exercise())
+
     def test_self_managed_job_requires_candidate_health(self) -> None:
         async def exercise(status: str) -> dict[str, Any]:
             executor = ImmediateExecutor()

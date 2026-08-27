@@ -1352,6 +1352,31 @@ class DevelopmentJobManager:
                 "creating the first job on this project"
             )
 
+    def _validate_spec_pinned(
+        self, project: ProjectPolicy, specification: str
+    ) -> None:
+        """M-GV-04: reject a job whose spec drifts from the ratified spec commit.
+
+        When the project sets ``ratified_spec_commit``, runtime work is allowed
+        only under that ratified spec commit: the job's spec text must pin
+        itself to it. The ratified SHA must appear in the text as a standalone
+        hex token (a ``<commit>`` marker or the bare SHA); a spec that
+        references no commit or a different commit is rejected as drift. A
+        project that never ratified a spec commit is unaffected (opt-in).
+        """
+        ratified = project.ratified_spec_commit
+        if ratified is None:
+            return
+        if re.search(
+            rf"(?<![0-9a-fA-F]){re.escape(ratified)}(?![0-9a-fA-F])",
+            specification,
+        ):
+            return
+        raise DevelopmentJobError(
+            f"job spec is not pinned to the ratified spec commit {ratified}; "
+            "spec drift is rejected (ratified_spec_commit is set for this project)"
+        )
+
     def _new_job_id(self) -> str:
         for _ in range(10):
             candidate = secrets.token_hex(16)
@@ -1802,6 +1827,9 @@ class DevelopmentJobManager:
         # project's apex authority and requires the external grounding ref to
         # be present and unchanged since registration.
         self._enforce_apex_grounding_for_genesis(project)
+        # M-GV-04: a project with a ratified spec commit only allows runtime
+        # work pinned to that commit; a drifting spec is rejected here.
+        self._validate_spec_pinned(project, specification)
         # M-EV-01: scan the project's canonical spec for normative requirement
         # IDs and persist them (idempotent) so the coverage matrix is available
         # before any edit. Failures are non-fatal: a project with no parseable
@@ -1861,6 +1889,9 @@ class DevelopmentJobManager:
         """
         effort = resolve_effort(project, effort, self.settings)
         specification = self._validate_input(project, text, effort)
+        # M-GV-04: a delegated child job's spec must also be pinned to the
+        # project's ratified spec commit when one is set.
+        self._validate_spec_pinned(project, specification)
         mandate = self._validate_mandate(mandate)
         async with self._state_lock:
             parent = self._require_job(project, parent_job_id)

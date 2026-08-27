@@ -100,6 +100,24 @@ def _validate_apex_authority_ref(value: object) -> str | None:
     return text
 
 
+def _validate_ratified_spec_commit(value: object) -> str | None:
+    """Validate an optional ``ProjectPolicy.ratified_spec_commit`` (M-GV-04).
+
+    The ratified spec commit is a full 40-hex git SHA pinning the project's
+    governing spec (the apex authority) to one immutable commit. Runtime jobs
+    are spec-gated to it: a job whose spec is not pinned to this commit is
+    rejected.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        raise ValueError("ratified_spec_commit must not be empty")
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", text):
+        raise ValueError("ratified_spec_commit must be a 40-character git SHA")
+    return text
+
+
 # Names of interpreter/library loader variables a policy-configured command must
 # not set, because they would let a runtime check rebind the interpreter or
 # shared-library search path the bridge runs under (an injection vector). PATH
@@ -409,6 +427,13 @@ class ProjectPolicy(BaseModel):
     # since registration.
     apex_authority_ref: str | None = None
     require_apex_grounding: bool = False
+    # M-GV-04: spec-gated runtime. When set, a full 40-hex git SHA pinning the
+    # project's governing spec (the apex authority) to one immutable commit.
+    # Runtime jobs are only allowed under that ratified commit: a job whose
+    # spec is not pinned to it is rejected as spec drift. Composes with
+    # M-GV-03: the apex authority is the spec; the ratified commit is the
+    # pinned point.
+    ratified_spec_commit: str | None = None
 
     @field_validator("root", mode="before")
     @classmethod
@@ -441,6 +466,11 @@ class ProjectPolicy(BaseModel):
     @classmethod
     def validate_apex_authority_ref(cls, value: object) -> str | None:
         return _validate_apex_authority_ref(value)
+
+    @field_validator("ratified_spec_commit", mode="before")
+    @classmethod
+    def validate_ratified_spec_commit(cls, value: object) -> str | None:
+        return _validate_ratified_spec_commit(value)
 
     @model_validator(mode="after")
     def validate_policy(self) -> "ProjectPolicy":
