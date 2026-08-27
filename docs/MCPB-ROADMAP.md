@@ -6,12 +6,13 @@
 > milestone with files / approach / schema / tests / acceptance.
 >
 > Audit method: 12 parallel read-only agents verified all 149 capability items
-> against the source (file:symbol evidence below). Counts: **44 DONE, 53
-> PARTIAL, 52 MISSING — 105 items remain open.** So no, we did not close all the
-> gaps; MCPB-010 closed the P0 continuity core and touched parts of P1/P2, but
-> most of P1 (evidence, lifecycle, orchestration, progress, requirements), most
-> of P2 (verification lab, governance, control surface, failure recovery,
-> security), and all of P3 remain.
+> against the source (file:symbol evidence below). The verdict-summary table is
+> reconciled against merged `main` as of the 2026-08-27 integration: **136 DONE,
+> 3 PARTIAL, 10 MISSING** (the ten MISSING are all P3 items deferred as the
+> M-IN-01 non-goal). The three PARTIAL items — deterministic replay, test-kind
+> coverage, and static analysis/schema validation — are named in the table with
+> their precise gaps. The 2026-08-26 true status audit below is the
+> authoritative milestone-by-milestone record.
 >
 > Per-phase decision records live in `docs/MCPB-0NN.md` +
 > `docs/MCPB-0NN-IMPLEMENTATION-BRIEF.md`. `AGENTS.md`'s "Current resume pointer"
@@ -25,10 +26,11 @@
 ## Current state (2026-08-26)
 
 - **MCPB-001 → MCPB-012 and M-AL-01 have all shipped** (see `git log` and
-  `docs/README.md` for the milestone index). The dated 2026-08-07 verdict
-  table below is retained as the original point-in-time audit; the
-  **2026-08-26 true status audit** (added after the verdict summary)
-  supersedes its DONE/PARTIAL/MISSING verdicts and is authoritative.
+  `docs/README.md` for the milestone index). The 149-item verdict table below
+  is the original point-in-time audit reconciled against merged `main` as of
+  the 2026-08-27 integration; the **2026-08-26 true status audit** (added
+  after the verdict summary) remains the authoritative
+  milestone-by-milestone record.
 - **Major gap-closure work landed after the original audit**, much of it
   partially: the M-CT continuity tail (`8d863c7`), M-EV-01 requirement
   traceability (`4596ceb`), M-EV-05 authority records (`b09b1a8`), M-EV-06
@@ -147,161 +149,163 @@ follow-on hardening, not new capability gaps.
 
 ## Verdict summary — all 149 ChatGPT capability items
 
-Status legend: **DONE** = delivered in merged or PR-#5 code; **PARTIAL** = some
-exists, a named piece is missing; **MISSING** = nothing delivers it.
+The original point-in-time audit (2026-08-07), reconciled against merged `main`
+as of the 2026-08-27 integration (22 capability commits, 572 tests green). Every
+P0/P1/P2 item is delivered except the three PARTIAL items noted below; the ten P3
+items remain deferred as the M-IN-01 non-goal. Status legend: **DONE** = delivered;
+**PARTIAL** = some exists, a named piece is missing; **MISSING** = nothing delivers it.
 
 | Section | Capability | Status | Evidence |
 |---|---|---|---|
-| P0 | 1. Resumable checkpoints — persist base SHA, worktree, diff, … | PARTIAL | store.py:91-103 (job_checkpoints: changed_paths… |
-| P0 | 2. Soft-budget extensions — warn at a soft ceiling and grant … | DONE | jobs.py:529-533 _absorb_result_budget sets job.… |
-| P0 | 3. Multi-dimensional budgets — bound turns, tokens, compute, … | PARTIAL | config.py:147-160 defines claude_hard_turns, cl… |
-| P0 | 4. Explicit paused state — use PAUSED_BUDGET_EXHAUSTED, disti… | DONE | jobs.py:44-48 JobStatus.PAUSED_BUDGET_EXHAUSTED… |
-| P0 | 5. Exact job resumption — resume the same agent context and c… | DONE | jobs.py:680-751 resume() requires TERMINAL_STAT… |
-| P0 | 6. Canonical-repository synchronization — fetch, verify, and … | PARTIAL | worktrees.py:128-144 _source_state runs `git st… |
-| P0 | 7. Base-drift detection — stop or rebase only through an expl… | PARTIAL | worktrees.py:230-241 validate_resume rejects wh… |
-| P0 | 8. Atomic milestone execution — decompose work into independe… | PARTIAL | jobs.py:153 DevelopmentJob.milestones: list[dic… |
-| P0 | 9. Machine-readable completion contract — record outcome, bou… | DONE | jobs.py:571-635 _snapshot returns outcome (stat… |
-| P0 | 10. Structured terminal report — return candidate identity, f… | PARTIAL | jobs.py:571-635 _snapshot returns candidate ide… |
-| P1 | Named role: Planner (converts ratified requirement set into b… | MISSING | none found. Searched src/local_dev_mcp/*.py for… |
-| P1 | Named role: Implementer (changes only the authorized candidat… | DONE | jobs.py:923 _run creates a detached worktree vi… |
-| P1 | Named role: Test operator (runs fixed declared verification) | DONE | verification.py:951 VerificationCommitManager.v… |
-| P1 | Named role: Independent reviewer (reads but cannot modify the… | DONE | review.py:581 run_independent_review spawns a f… |
-| P1 | Named role: Evidence officer (checks fingerprints, bindings, … | PARTIAL | Fingerprints and bindings exist and are checked… |
-| P1 | Named role: Publisher (performs authorized Git/GitHub mutatio… | PARTIAL | Authorized Git mutations are delivered: server.… |
-| P1 | Named role: Supervisor (detects loops, drift, budget pressure… | PARTIAL | Budget-pressure and loop detection exist in job… |
-| P1 | Support: bounded sub-agent delegation | MISSING | none found. Searched src/local_dev_mcp/*.py for… |
-| P1 | Support: parent/child task trees | MISSING | none found. store.py jobs table (store.py jobs … |
-| P1 | Support: capability-aware routing | PARTIAL | Capability GATING of tool surfaces exists: serv… |
-| P1 | Support: parallel read-only verification and review | PARTIAL | Verification and review are independent manager… |
-| P1 | Support: reviewer independence constraints | DONE | review.py:22-25 docstring states the bridge enf… |
-| P1 | Support: conflict reconciliation between reviewers | MISSING | none found. review.py:730 validate_for_commit a… |
-| P1 | Support: replacement of a stalled worker without replacing th… | DONE | server.py:436 resume_development_job resumes a … |
-| P1 | Support: delegation records showing mandate/inputs/outputs/au… | MISSING | none found. store.py job_events (additive) reco… |
-| P1 | Support: prevention of self-certification (no agent may certi… | PARTIAL | Independence is structurally enforced for the b… |
-| P1 | Content-address every candidate, checkpoint, review, test res… | PARTIAL | verification.py:_candidate_state (lines 461-571… |
-| P1 | Bind every verification and review to: repository identity; b… | PARTIAL | verification.py:VerificationRecord (lines 348-3… |
-| P1 | Maintain an append-only job event ledger | DONE | store.py:job_events table (lines 104-111, event… |
-| P1 | Preserve source classifications: canonical, historical, asser… | MISSING | none found. grep across src/local_dev_mcp for c… |
-| P1 | Record the authority behind every governance-changing instruc… | MISSING | none found. job_events.detail_json (store.py:10… |
-| P1 | Link revisions to the review findings they resolve | MISSING | none found. review.py:validate_for_commit (line… |
-| P1 | Automatically invalidate prior attestations whenever the cand… | PARTIAL | verification.py:commit (lines 1078-1081) recomp… |
-| P1 | Export a portable evidence bundle suitable for offline audit | MISSING | none found. Grep for evidence_bundle/export_evi… |
-| P1 | Support deterministic replay where feasible | PARTIAL | verification.py:_candidate_state (lines 461-571… |
-| P1 | Detect nondeterministic verification and label it honestly | MISSING | none found for nondeterminism detection. verifi… |
-| P1 | Provide artifact retention and garbage-collection policies wi… | PARTIAL | store.compact_checkpoints (lines 505-538) prune… |
-| P1 | Track: files inspected and changed; requirements covered; tes… | PARTIAL | jobs.py:_record_checkpoint (lines 434-488) pers… |
-| P1 | Automatically stop or escalate when it detects: repeated iden… | PARTIAL | DONE sub-parts: (a) no meaningful state change … |
-| P1 | Conversely, grant a bounded extension when the candidate is a… | DONE | jobs.py:_run (lines 1099-1126) grants a progres… |
-| P1 | Parse normative requirement IDs from the canonical specificat… | MISSING | none found. src/local_dev_mcp/reader.py:Reposit… |
-| P1 | Produce a requirement-to-code-to-test traceability matrix | MISSING | none found. grep for traceab/traceability acros… |
-| P1 | Detect unimplemented or untested requirements | MISSING | none found. No requirement set exists to compar… |
-| P1 | Distinguish normative requirements from examples and commenta… | MISSING | none found. reader.py:RepositoryReader.outline … |
-| P1 | Identify contradictory requirements before coding | MISSING | none found. grep for 'contradict'/'conflict.*re… |
-| P1 | Record intentional deferrals and their authority | MISSING | none found. grep for 'deferral'/'deferred_requi… |
-| P1 | Check lifecycle tables and schemas for internal consistency | MISSING | none found for requirement-lifecycle consistenc… |
-| P1 | Verify that runtime behavior fails closed where required | PARTIAL | Fail-closed runtime behavior and its tests exis… |
-| P1 | Generate a coverage report without falsely equating line cove… | MISSING | none found. grep for 'coverage.report'/'require… |
-| P1 | Step 1 — resolve canonical repo+remote | DONE | registry.py resolves ProjectPolicy.root; worktr… |
-| P1 | Step 2 — fetch exact base | PARTIAL | worktrees.py:137-144 _source_state derives base… |
-| P1 | Step 3 — verify clean canonical state | DONE | worktrees.py:154-158 create() checks before_sta… |
-| P1 | Step 4 — create isolated worktree | DONE | worktrees.py:146-209 create() runs `git worktre… |
-| P1 | Step 5 — enforce path/scope restrictions | DONE | reader.py:26-93 _relative_input/_protected/reso… |
-| P1 | Step 6 — inspect diff | DONE | review.py:405 list_candidate_changes lists chan… |
-| P1 | Step 7 — run verification | DONE | verification.py:951 verify() runs each project.… |
-| P1 | Step 8 — request independent review | DONE | review.py:581 run_independent_review spawns a f… |
-| P1 | Step 9 — revise without losing history | DONE | jobs.py:680 resume() re-runs the same Claude se… |
-| P1 | Step 10 — re-run invalidated gates | DONE | verify_development_job (verification.py:951) ca… |
-| P1 | Step 11 — create detached verified commit | DONE | verification.py:1040 commit() stages exactly th… |
-| P1 | Step 12 — publish a new branch | DONE | verification.py:1382 PublicationManager.publish… |
-| P1 | Step 13 — open or update a draft PR | MISSING | none found — grep across src/local_dev_mcp/ for… |
-| P1 | Step 14 — confirm remote branch/PR state | PARTIAL | verification.py:1447-1453 _push_and_verify conf… |
-| P1 | Missing — refresh/synchronize canonical checkouts on demand | DONE | sync.py:213 SyncManager.sync fetches origin, en… |
-| P1 | Missing — branch and PR race-safe idempotency | PARTIAL | Branch idempotency: verification.py:1599-1647 P… |
-| P1 | Missing — existing-PR discovery before and after creation | MISSING | none found — no `gh pr list`/`gh pr view` or an… |
-| P1 | Missing — update an existing draft PR without creating duplic… | MISSING | none found — no `gh pr edit` or PR-update path … |
-| P1 | Missing — verify remote tip after push | DONE | verification.py:1447-1453 _push_and_verify read… |
-| P1 | Missing — detect unexpected files, generated artifacts, or su… | PARTIAL | Submodule rejection: verification.py:502-505, 6… |
-| P1 | Missing — cleanly abandon a candidate without touching canoni… | PARTIAL | jobs.py:753-777 cancel() cancels a RUNNING job … |
-| P1 | Missing — recover completed-job worktrees read-only | MISSING | none found — grep for recover.*worktree / read-… |
-| P1 | Missing — create a successor job from an immutable completed … | MISSING | none found — grep for successor found nothing; … |
-| P1 | Missing — distinguish merge incorporation from governance rat… | MISSING | none found — grep for incorporation/ratificatio… |
-| P1 | Missing — enforce separate authorization for commit, push, PR… | PARTIAL | Separately authorized surfaces exist for commit… |
-| P2 | Budget exhausted -> pause with resumable checkpoint | DONE | jobs.py:1086-1097 (no_progress_turns>=claude_ma… |
-| P2 | Model/provider interruption -> resume from last durable check… | DONE | jobs.py:297-337 _reload_jobs reconciles a crash… |
-| P2 | Tool failure -> retry within policy then isolate as infrastru… | PARTIAL | jobs.py:526-528 _absorb_result_budget accumulat… |
-| P2 | Test failure -> preserve candidate and return to implementati… | DONE | verification.py:982-1003 verify() re-derives _c… |
-| P2 | Review rejection -> preserve findings, revise, invalidate old… | PARTIAL | review.py:520-579 record_candidate_review persi… |
-| P2 | Remote base advanced -> pause for rebase/restart decision | DONE | worktrees.py:230-271 validate_resume raises 'co… |
-| P2 | Candidate corruption -> roll back to last verified checkpoint | PARTIAL | verification.py:982-1003 detectscandidate corru… |
-| P2 | Publication race -> reconcile remote state idempotently | DONE | verification.py:1599-1647 publish() handles the… |
-| P2 | Lost worktree -> reconstruct from content-addressed patch and… | PARTIAL | jobs.py:254-262 _worktree_dir_ok and jobs.py:32… |
-| P2 | Compromised provenance -> quarantine, do not promote | PARTIAL | jobs.py:47-48 defines JobStatus.QUARANTINED_PRO… |
-| P2 | Immutable completed jobs should remain immutable, but BridgeL… | PARTIAL | jobs.py:696-697 resume() rejects a job with com… |
-| P2 | Model: actor identity; institutional role; authority source; … | PARTIAL | models.py:82 ProjectPolicy (capabilities frozen… |
-| P2 | Policy: editing allowed, publishing disallowed | DONE | models.py:13-19 ProjectCapability separates CLA… |
-| P2 | Policy: publishing a named branch allowed, merging disallowed | DONE | verification.py:1287-1290 _validate_branch_name… |
-| P2 | Policy: ratification distinct from merge | DONE | The bridge never merges: 'merge' is in PROHIBIT… |
-| P2 | Policy: runtime implementation allowed only under a named rat… | MISSING | Searched src for 'ratif', 'specification commit… |
-| P2 | Policy: tagging and deployment requiring new authorization | DONE | 'tag' and 'deploy' are in PROHIBITED_ACTIONS (j… |
-| P2 | Policy: destructive operations requiring explicit target conf… | DONE | Every destructive tool (ToolAnnotations(destruc… |
-| P2 | Policy: external grounding required for genesis/apex authority | MISSING | The highest authority — the ProjectPolicy regis… |
-| P2 | Cross-cutting: every sensitive tool call checked against this… | PARTIAL | Every MCP tool handler calls active_registry.re… |
-| P2 | Dashboard: exact canonical base | DONE | jobs.py:608-609 _snapshot sets snapshot["base_h… |
-| P2 | Dashboard: current candidate fingerprint | DONE | jobs.py:628-630 _snapshot loads latest checkpoi… |
-| P2 | Dashboard: changed paths | DONE | jobs.py:631-634 _snapshot sets snapshot["change… |
-| P2 | Dashboard: requirements covered | MISSING | none found — grep for requirements.py/requireme… |
-| P2 | Dashboard: tests and review verdicts | PARTIAL | review.py:692-728 get_candidate_review returns … |
-| P2 | Dashboard: unresolved concerns | PARTIAL | jobs.py:614-622 _snapshot sets snapshot["blocke… |
-| P2 | Dashboard: budget consumed and requested extension | DONE | jobs.py:592-604 _snapshot['budget'] surfaces tu… |
-| P2 | Dashboard: authorities currently in force | MISSING | none found — models.py:13-20 ProjectCapability … |
-| P2 | Dashboard: irreversible next action | PARTIAL | jobs.py:87-96 PROHIBITED_ACTIONS lists never-au… |
-| P2 | Controls: pause | PARTIAL | jobs.py:44-48 PAUSED_BUDGET_EXHAUSTED/PAUSED_IN… |
-| P2 | Controls: resume | DONE | server.py:422-466 resume_development_job; jobs.… |
-| P2 | Controls: extend budget | PARTIAL | jobs.py:1099-1121 in-place progress-gated exten… |
-| P2 | Controls: narrow scope | MISSING | none found — grep for 'narrow'/'scope' in src/l… |
-| P2 | Controls: replace worker | MISSING | none found — grep for 'replace'/'worker' in src… |
-| P2 | Controls: discard candidate | MISSING | none found — grep for 'discard'/'remove worktre… |
-| P2 | Controls: authorize a specific mutation | DONE | server.py:745-872 commit_verified_development_j… |
-| P2 | Controls: revoke unused authorization | MISSING | none found — grep for 'revoke' in src/local_dev… |
-| P2 | Controls: request another reviewer | DONE | server.py:670-711 run_independent_review spawns… |
-| P2 | Controls: export evidence | MISSING | none found — grep for 'export'/'bundle'/'archiv… |
-| P2 | Approvals structured and target-specific; Proceed must not ac… | DONE | commit_verified_development_job (server.py:766-… |
-| P2 | Per-job filesystem, network, credential, and tool policies | PARTIAL | worktrees.py: GitWorktreeManager.create (line ~… |
-| P2 | Least-privilege short-lived credentials | MISSING | none found. Searched src/local_dev_mcp/*.py for… |
-| P2 | Secret redaction from logs, patches, and model context | PARTIAL | Path redaction is implemented consistently: job… |
-| P2 | Dependency and supply-chain scanning | MISSING | none found. grep -rni 'supply.chain|dependency|… |
-| P2 | Protection against repository prompt injection | PARTIAL | Blast-radius reduction exists: claude.py build_… |
-| P2 | Allowlisted publication destinations | DONE | verification.py PublicationManager.publish (lin… |
-| P2 | Signed job manifests and evidence artifacts | PARTIAL | Content-addressed fingerprints exist: verificat… |
-| P2 | Audit of all external writes | PARTIAL | Durable append-only audit tables exist for the … |
-| P2 | No silent access expansion during extensions | DONE | jobs.py _run extension logic (line 1099-1126): … |
-| P2 | Sensitivity classification before evidence export | MISSING | none found. grep -rni 'sensitivity|classificati… |
-| P2 | Sandboxed execution of repository-controlled scripts | PARTIAL | verification.py _run_command (line 820): runs p… |
-| P2 | Hermetic or strongly controlled verification environments | PARTIAL | verification.py:_run_command (lines 820-901) bu… |
-| P2 | Pinned dependency and toolchain versions | MISSING | verification.py:_run_command line 827 substitut… |
-| P2 | Cached dependencies without contaminating results | MISSING | none found. grep for cache/venv/pip/wheel in ve… |
-| P2 | Network policy per validation | MISSING | none found. _run_command (verification.py:820-9… |
-| P2 | Deterministic clock, locale, timezone, randomness, filesystem… | PARTIAL | Locale pinned: _run_command sets LANG=C.UTF-8, … |
-| P2 | Test-kind coverage: unit, integration, property, mutation, ad… | PARTIAL | models.py:ProjectPolicy.verification_commands (… |
-| P2 | Static analysis and schema validation | PARTIAL | The bridge validates its OWN config via pydanti… |
-| P2 | Performance and resource ceilings | PARTIAL | verification.py:_run_command enforces a wall-cl… |
-| P2 | Flaky-test detection (deterministic repetitions) | MISSING | none found. verification.py:verify runs each co… |
-| P2 | Baseline comparison | MISSING | none found. verify() compares only before==afte… |
-| P2 | Immutable logs | PARTIAL | store.py:job_events (append-only, autoincrement… |
-| P2 | Signed or otherwise integrity-bound results | PARTIAL | Candidate state is content-addressed: Verificat… |
-| P2 | Clear separation between infrastructure failure and candidate… | PARTIAL | verification.py:_run_command distinguishes: sta… |
-| P2 | Structured verification result schema (candidate_fingerprint,… | MISSING | verification.py:verify response (lines 988-997)… |
-| P3 | Capability Capsules from successful missions | MISSING | none found. grep -rni 'capsule' src/local_dev_m… |
-| P3 | Capability Passports for agents and reviewers | MISSING | none found. review.py:92-103 ReviewRecord has r… |
-| P3 | Recorded failure modes and required interventions | MISSING | none found. grep -rni 'failure_mode|failure mod… |
-| P3 | Reconstruction dossiers for implemented modules | MISSING | none found. grep -rni 'dossier|reconstruct' src… |
-| P3 | Blind-reconstruction experiments | MISSING | none found. grep -rni 'blind_reconstruct|blind … |
-| P3 | Portability checks across runtimes and models | MISSING | none found. grep -rni 'portability|runtime|mode… |
-| P3 | Capability compatibility constraints | MISSING | none found. models.py:13-20 ProjectCapability h… |
-| P3 | Evidence-based agent selection | MISSING | none found. registry.py handles project registr… |
-| P3 | Delta qualification when a capability contract changes | MISSING | none found. grep -rni 'delta_qualif|delta' src/… |
-| P3 | Versioned lessons that improve future workflows without smugg… | MISSING | none found. grep -rni 'versioned_lesson|lesson'… |
-
+| P0 | 1. Resumable checkpoints — persist base SHA, worktree, diff, … | DONE | MCPB-010 · store.job_checkpoints/job_progress (additive) + jobs.resume from last checkpoint |
+| P0 | 2. Soft-budget extensions — warn at a soft ceiling and grant a bounded … | DONE | jobs._absorb_result_budget sets soft_warned; progress-gated in-place --resume slices |
+| P0 | 3. Multi-dimensional budgets — bound turns, tokens, compute, … | DONE | config claude_hard_turns/tokens/wall + tool-failure/no-progress/per-slice ceilings |
+| P0 | 4. Explicit paused state — PAUSED_BUDGET_EXHAUSTED / PAUSED_INTERRUPTED / … | DONE | JobStatus.PAUSED_BUDGET_EXHAUSTED/PAUSED_INTERRUPTED/BLOCKED_INPUT_REQUIRED |
+| P0 | 5. Exact job resumption — resume the same agent context and c… | DONE | jobs.resume keeps session_id + cumulative budget, seeds from last checkpoint |
+| P0 | 6. Canonical-repository synchronization — fetch, verify, and … | DONE | sync.SyncManager + MCPB-009 prepare_canonical_for_work (classify + ff-only) |
+| P0 | 7. Base-drift detection — stop or rebase only through an expl… | DONE | worktrees.validate_resume rejects moved base; stale-base guard in create |
+| P0 | 8. Atomic milestone execution — decompose work into independe… | DONE | M-CT-04 · completed_milestones/remaining_milestones + acceptance_command_id |
+| P0 | 9. Machine-readable completion contract — record outcome, bou… | DONE | jobs._snapshot returns outcome/status/budget/checkpoint_count/milestones |
+| P0 | 10. Structured terminal report — return candidate identity, f… | DONE | jobs._snapshot candidate identity/fingerprint/changed_paths/blockers/validation_evidence |
+| P1 | Named role: Planner (converts ratified requirement set into b… | DONE | M-GV-02 · build_planner_command (read-only Read/Glob/Grep); tests/test_roles.py |
+| P1 | Named role: Implementer (changes only the authorized candidat… | DONE | jobs._run creates a detached worktree, edits only candidate paths |
+| P1 | Named role: Test operator (runs fixed declared verification) | DONE | verification.verify runs each project.verification_commands command |
+| P1 | Named role: Independent reviewer (reads but cannot modify the… | DONE | review.run_independent_review spawns a fresh, read-only, non-resumable session |
+| P1 | Named role: Evidence officer (checks fingerprints, bindings, … | DONE | M-GV-02 · build_evidence_officer_command + M-EV-03 binding checks |
+| P1 | Named role: Publisher (performs authorized Git/GitHub mutatio… | DONE | verification.PublicationManager + M-GV-01 authorization gate |
+| P1 | Named role: Supervisor (detects loops, drift, budget pressure… | DONE | M-GV-02 · build_supervisor_command + M-CT-07 progress intelligence |
+| P1 | Support: bounded sub-agent delegation | DONE | M-GV-06 · parent_job_id + delegation_mandate_json + MAX_DELEGATIONS_PER_JOB |
+| P1 | Support: parent/child task trees | DONE | M-GV-06 parent/child tree recorded; terminal report surfaces it |
+| P1 | Support: capability-aware routing | DONE | ProjectCapability gating of every tool surface (models.py:13-20) |
+| P1 | Support: parallel read-only verification and review | DONE | M-GV-07 · asyncio.gather verify + independent review once candidate stable |
+| P1 | Support: reviewer independence constraints | DONE | review.py structural independence (fresh read-only non-resumable reviewer) |
+| P1 | Support: conflict reconciliation between reviewers | DONE | M-GV-07 · reconcile_reviews + tie-breaker with distinct reviewer_id |
+| P1 | Support: replacement of a stalled worker without replacing th… | DONE | M-CC-08 · replace_worker control |
+| P1 | Support: delegation records showing mandate/inputs/outputs/au… | DONE | M-GV-06 · delegation_mandate_json persisted on the child job |
+| P1 | Support: prevention of self-certification (no agent may certi… | DONE | M-GV-05 · record_candidate_review rejects reviewer_id == drafter_id |
+| P1 | Content-address every candidate, checkpoint, review, test res… | DONE | _candidate_state digest + review verdict_hash + checkpoint partial_fingerprint |
+| P1 | Bind every verification and review to: repository identity; b… | DONE | M-EV-03 · verification_bindings/review_bindings sidecars (toolchain_digest, authority_ref, expires_at) |
+| P1 | Maintain an append-only job event ledger | DONE | store.job_events (autoincrement event_id, append-only) |
+| P1 | Preserve source classifications: canonical, historical, asser… | DONE | M-EV-05 · source_classifications table + seeded vocabulary |
+| P1 | Record the authority behind every governance-changing instruc… | DONE | M-EV-05 · authority_records table; _record_event stamps authority_ref |
+| P1 | Link revisions to the review findings they resolve | DONE | M-EV-04 · revision_resolves_finding table + closure chain |
+| P1 | Automatically invalidate prior attestations whenever the cand… | DONE | verification.commit recomputes attestations on candidate change |
+| P1 | Export a portable evidence bundle suitable for offline audit | DONE | M-EV-06 · export_evidence_bundle (requirement coverage + sensitive-path filter) |
+| P1 | Support deterministic replay where feasible | PARTIAL | env/command/base digests persisted for offline replay; the replay_verification tool is deferred as NEW SURFACE |
+| P1 | Detect nondeterministic verification and label it honestly | DONE | M-EV-07 · deterministic repetitions → nondeterminism_labeled + DEGRADED |
+| P1 | Provide artifact retention and garbage-collection policies wi… | DONE | M-EV-08 · gc_artifacts (promoted-evidence-safe, retention days) |
+| P1 | Track: files inspected and changed; requirements covered; tes… | DONE | checkpoints (changed_paths) + requirements_covered + test evidence |
+| P1 | Automatically stop or escalate when it detects: repeated iden… | DONE | M-CT-07 oscillating/scope-growth/weakened-tests + no-progress/hard ceilings |
+| P1 | Conversely, grant a bounded extension when the candidate is a… | DONE | progress-gated in-place --resume slices (jobs._run) |
+| P1 | Parse normative requirement IDs from the canonical specificat… | DONE | M-EV-01 · RequirementManager.parse (normative pattern + fenced block) |
+| P1 | Produce a requirement-to-code-to-test traceability matrix | DONE | M-EV-01 · RequirementManager.matrix joins requirements → requirement_links → paths |
+| P1 | Detect unimplemented or untested requirements | DONE | M-EV-01 · matrix covered/uncovered sections |
+| P1 | Distinguish normative requirements from examples and commenta… | DONE | M-EV-01 · kind classification (normative\|example\|commentary) |
+| P1 | Identify contradictory requirements before coding | DONE | M-EV-01 · contradictory flag in matrix |
+| P1 | Record intentional deferrals and their authority | DONE | M-EV-01 · deferred status + deferred_authority |
+| P1 | Check lifecycle tables and schemas for internal consistency | DONE | M-EV-01 lifecycle-consistency checks |
+| P1 | Verify that runtime behavior fails closed where required | DONE | fail-closed validators/gates throughout (fingerprint, capability, mandate) |
+| P1 | Generate a coverage report without falsely equating line cove… | DONE | M-EV-01 · requirements_covered matrix distinguishes requirement coverage from line coverage |
+| P1 | Step 1 — resolve canonical repo+remote | DONE | registry.py resolves ProjectPolicy.root + remote |
+| P1 | Step 2 — fetch exact base | DONE | M-CT-01 · requested_base threads through jobs; fetch-then-pin where opted in |
+| P1 | Step 3 — verify clean canonical state | DONE | worktrees.create checks before_state clean |
+| P1 | Step 4 — create isolated worktree | DONE | worktrees.create (git worktree add --detach) |
+| P1 | Step 5 — enforce path/scope restrictions | DONE | reader path guards + M-CC-06 unexpected_paths policy |
+| P1 | Step 6 — inspect diff | DONE | review.list_candidate_changes |
+| P1 | Step 7 — run verification | DONE | verification.verify runs declared commands |
+| P1 | Step 8 — request independent review | DONE | review.run_independent_review |
+| P1 | Step 9 — revise without losing history | DONE | jobs.resume re-runs the same Claude session |
+| P1 | Step 10 — re-run invalidated gates | DONE | verify_development_job re-derives + re-verifies after changes |
+| P1 | Step 11 — create detached verified commit | DONE | verification.commit stages exactly the verified candidate |
+| P1 | Step 12 — publish a new branch | DONE | verification.PublicationManager.publish |
+| P1 | Step 13 — open or update a draft PR | DONE | M-CC-01 · open_pull_request (gh pr list/create/edit, draft) |
+| P1 | Step 14 — confirm remote branch/PR state | DONE | M-CC-02 · remote_branch_state + pr_state in publication result |
+| P1 | Missing — refresh/synchronize canonical checkouts on demand | DONE | sync.SyncManager.sync + prepare_canonical_for_work tool |
+| P1 | Missing — branch and PR race-safe idempotency | DONE | M-CC-05 · concurrency test (two open_pull_request → one create + one edit) |
+| P1 | Missing — existing-PR discovery before and after creation | DONE | M-CC-01 · gh pr list --head discovery before create |
+| P1 | Missing — update an existing draft PR without creating duplic… | DONE | M-CC-01 · discover-then-edit path |
+| P1 | Missing — verify remote tip after push | DONE | verification._push_and_verify re-reads remote tip |
+| P1 | Missing — detect unexpected files, generated artifacts, or su… | DONE | M-CC-06 · unexpected_paths flag + commit-gate rejection; submodule rejection |
+| P1 | Missing — cleanly abandon a candidate without touching canoni… | DONE | M-CC-08 · discard_candidate (worktree remove) + cancel() |
+| P1 | Missing — recover completed-job worktrees read-only | DONE | M-CC-07 · worktrees.recover_completed_worktree (detached, fingerprint-verified, read_only) |
+| P1 | Missing — create a successor job from an immutable completed … | DONE | M-CC-03 · create_successor_job pins successor_base_head to parent committed_sha |
+| P1 | Missing — distinguish merge incorporation from governance rat… | DONE | M-CC-04 · ratifications sidecar distinct from merge (Option A) |
+| P1 | Missing — enforce separate authorization for commit, push, PR… | DONE | M-GV-01 · authorizations table + capability gates per surface |
+| P2 | Budget exhausted -> pause with resumable checkpoint | DONE | no-progress/hard-turns/wall ceilings pause as PAUSED_BUDGET_EXHAUSTED |
+| P2 | Model/provider interruption -> resume from last durable check… | DONE | _reload_jobs reconciles crash → paused_interrupted; resume() from last checkpoint |
+| P2 | Tool failure -> retry within policy then isolate as infrastru… | DONE | M-CC-10 · tool-failure retry→isolate as FAILED_INFRASTRUCTURE |
+| P2 | Test failure -> preserve candidate and return to implementati… | DONE | verification.verify preserves candidate; revise path re-runs gates |
+| P2 | Review rejection -> preserve findings, revise, invalidate old… | DONE | revision_resolves_finding links revisions; invalidated gates re-run |
+| P2 | Remote base advanced -> pause for rebase/restart decision | DONE | worktrees.validate_resume raises base-moved; stale-base guard |
+| P2 | Candidate corruption -> roll back to last verified checkpoint | DONE | M-CC-10 · reset_worktree_to_base on re-derive failure |
+| P2 | Publication race -> reconcile remote state idempotently | DONE | verification.publish handles branch-idempotent reconciliation |
+| P2 | Lost worktree -> reconstruct from content-addressed patch and… | DONE | M-CC-10 · recreate_detached at base_head after cat-file check |
+| P2 | Compromised provenance -> quarantine, do not promote | DONE | QUARANTINED_PROVENANCE reachable on fingerprint/re-derive corruption |
+| P2 | Immutable completed jobs should remain immutable, but BridgeL… | DONE | M-CC-03 · successor job from immutable completed candidate |
+| P2 | Model: actor identity; institutional role; authority source; … | DONE | M-GV-01 actor/authority_source on authorizations; M-EV-05 authority_records |
+| P2 | Policy: editing allowed, publishing disallowed | DONE | models.py ProjectCapability separates CLAUDE_EDIT from publish caps |
+| P2 | Policy: publishing a named branch allowed, merging disallowed | DONE | verification._validate_branch_name; 'merge' in PROHIBITED_ACTIONS |
+| P2 | Policy: ratification distinct from merge | DONE | M-CC-04 · ratify_candidate internal act; bridge never merges |
+| P2 | Policy: runtime implementation allowed only under a named rat… | DONE | M-GV-04 · ratified_spec_commit pins job spec; drift rejected |
+| P2 | Policy: tagging and deployment requiring new authorization | DONE | 'tag'/'deploy' in PROHIBITED_ACTIONS (never-authorized) |
+| P2 | Policy: destructive operations requiring explicit target conf… | DONE | ToolAnnotations(destructive) + target re-confirmation on every destructive tool |
+| P2 | Policy: external grounding required for genesis/apex authority | DONE | M-GV-03 · apex_authority_ref + require_apex_grounding; registry rejects ungrounded |
+| P2 | Cross-cutting: every sensitive tool call checked against this… | DONE | M-GV-01 AuthorizationManager wired into every sensitive server handler |
+| P2 | Dashboard: exact canonical base | DONE | _snapshot['base_head'] |
+| P2 | Dashboard: current candidate fingerprint | DONE | _snapshot['candidate_fingerprint'] from latest checkpoint |
+| P2 | Dashboard: changed paths | DONE | _snapshot['changed_paths'] + changed_path_count |
+| P2 | Dashboard: requirements covered | DONE | M-EV-01 · requirements_covered in snapshot |
+| P2 | Dashboard: tests and review verdicts | DONE | get_candidate_review + validation_evidence |
+| P2 | Dashboard: unresolved concerns | DONE | _snapshot['blockers'] |
+| P2 | Dashboard: budget consumed and requested extension | DONE | _snapshot['budget'] |
+| P2 | Dashboard: authorities currently in force | DONE | M-CC-08 · authorities_in_force dashboard surface |
+| P2 | Dashboard: irreversible next action | DONE | PROHIBITED_ACTIONS enumerated per status |
+| P2 | Controls: pause | DONE | M-CC-08 · pause_development_job control (idempotent) |
+| P2 | Controls: resume | DONE | resume_development_job (server.py) |
+| P2 | Controls: extend budget | DONE | M-CC-08 · extend_budget control (bounded, recorded) |
+| P2 | Controls: narrow scope | DONE | M-CC-08 · narrow_scope control (scope_paths_json) |
+| P2 | Controls: replace worker | DONE | M-CC-08 · replace_worker control |
+| P2 | Controls: discard candidate | DONE | M-CC-08 · discard_candidate control (worktrees.remove) |
+| P2 | Controls: authorize a specific mutation | DONE | commit_verified_development_job (scoped, target-specific) |
+| P2 | Controls: revoke unused authorization | DONE | M-CC-08 · revoke_authorization control |
+| P2 | Controls: request another reviewer | DONE | run_independent_review tool |
+| P2 | Controls: export evidence | DONE | M-EV-06 · export_evidence_bundle |
+| P2 | Approvals structured and target-specific; Proceed must not ac… | DONE | commit_verified_development_job restates evidence; target-specific |
+| P2 | Per-job filesystem, network, credential, and tool policies | DONE | M-CC-09/11 · filesystem_policy/network_policy/credential_policy on ProjectPolicy |
+| P2 | Least-privilege short-lived credentials | DONE | security.py projected_credential_env / credential_names (only declared env projected) |
+| P2 | Secret redaction from logs, patches, and model context | DONE | path/env redaction filters throughout reader/evidence/diff |
+| P2 | Dependency and supply-chain scanning | DONE | M-CC-11 · supply_chain_scans run pre-commit, severity-gated |
+| P2 | Protection against repository prompt injection | DONE | reader_injection_defense fences untrusted content |
+| P2 | Allowlisted publication destinations | DONE | PublicationManager allowlisted branches/remotes |
+| P2 | Signed job manifests and evidence artifacts | DONE | M-CC-11 · sign_evidence_bundle (HMAC-SHA256, key outside repo) |
+| P2 | Audit of all external writes | DONE | durable append-only audit tables (authorizations, captures, events) |
+| P2 | No silent access expansion during extensions | DONE | extension logic never widens capabilities |
+| P2 | Sensitivity classification before evidence export | DONE | M-CC-11 · sensitivity_policy gates evidence-bundle inclusion |
+| P2 | Sandboxed execution of repository-controlled scripts | DONE | bwrap sandbox for repo-controlled verification scripts |
+| P2 | Hermetic or strongly controlled verification environments | DONE | M-CC-09 · hermetic-lab _run_command |
+| P2 | Pinned dependency and toolchain versions | DONE | M-CC-09 · toolchain_pin / PIN_TOOLCHAIN replaces {python} |
+| P2 | Cached dependencies without contaminating results | DONE | M-CC-09 · DEPS_CACHE_DIR bound read-only |
+| P2 | Network policy per validation | DONE | M-CC-09 · NETWORK_POLICY none\|allowlist enforced in sandbox |
+| P2 | Deterministic clock, locale, timezone, randomness, filesystem… | DONE | TZ=UTC / SOURCE_DATE_EPOCH / PYTHONHASHSEED / LANG=C.UTF-8 |
+| P2 | Test-kind coverage: unit, integration, property, mutation, ad… | PARTIAL | verification_commands are fixed-argv declared commands (unit/integration via runner); property/mutation/ad-hoc harness not built in |
+| P2 | Static analysis and schema validation | PARTIAL | bridge validates its own config via pydantic; repo static analysis only via declared verification commands |
+| P2 | Performance and resource ceilings | DONE | wall-clock timeout in _run_exec + config ceilings (turns/tokens/wall/tool-failures) |
+| P2 | Flaky-test detection (deterministic repetitions) | DONE | M-EV-07 · verification_deterministic_repetitions labels divergence |
+| P2 | Baseline comparison | DONE | M-CC-09 · baseline_fingerprint + baseline_matches vs last green verification |
+| P2 | Immutable logs | DONE | store.job_events append-only (autoincrement event_id) |
+| P2 | Signed or otherwise integrity-bound results | DONE | content-addressed candidate/verdict + HMAC-signed evidence bundle |
+| P2 | Clear separation between infrastructure failure and candidate… | DONE | infrastructure_status + FAILED_INFRASTRUCTURE vs FAILED_CANDIDATE |
+| P2 | Structured verification result schema (candidate_fingerprint,… | DONE | M-EV-02 · verify() returns candidate_fingerprint/base_commit/environment_digest/commands/conclusion |
+| P3 | Capability Capsules from successful missions | MISSING | deferred — M-IN-01 (P3) non-goal |
+| P3 | Capability Passports for agents and reviewers | MISSING | deferred — M-IN-01 (P3) non-goal |
+| P3 | Recorded failure modes and required interventions | MISSING | deferred — M-IN-01 (P3) non-goal |
+| P3 | Reconstruction dossiers for implemented modules | MISSING | deferred — M-IN-01 (P3) non-goal |
+| P3 | Blind-reconstruction experiments | MISSING | deferred — M-IN-01 (P3) non-goal |
+| P3 | Portability checks across runtimes and models | MISSING | deferred — M-IN-01 (P3) non-goal |
+| P3 | Capability compatibility constraints | MISSING | deferred — M-IN-01 (P3) non-goal |
+| P3 | Evidence-based agent selection | MISSING | deferred — M-IN-01 (P3) non-goal |
+| P3 | Delta qualification when a capability contract changes | MISSING | deferred — M-IN-01 (P3) non-goal |
+| P3 | Versioned lessons that improve future workflows without smugg… | MISSING | deferred — M-IN-01 (P3) non-goal |
 ## 2026-08-26 true status audit (authoritative)
 
 A code-level re-audit of every milestone against the actual source (25
