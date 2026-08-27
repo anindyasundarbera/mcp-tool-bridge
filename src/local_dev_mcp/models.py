@@ -416,6 +416,12 @@ class ProjectPolicy(BaseModel):
     self_managed: bool = False
     requires_review: bool = False
     allow_bridge_reviewer: bool = False
+    # M-GV-07: when True, a job that reaches COMPLETED automatically runs the
+    # verification gate and the independent bridge-spawned review concurrently
+    # (asyncio.gather) and records both, so a candidate is gated end-to-end
+    # without an extra manual verification/review round-trip. Opt-in per
+    # project; default off keeps existing projects' behavior unchanged.
+    parallel_gates: bool = False
     claude_model: str | None = None
     claude_max_turns: int | None = Field(default=None, ge=1, le=200)
     # M-GV-03: external grounding for genesis/apex authority. An optional

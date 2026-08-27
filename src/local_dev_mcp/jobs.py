@@ -535,6 +535,12 @@ class DevelopmentJobManager:
         # connection so there is a single write path. Lazily constructed if
         # not provided (lazy import to avoid a module-load-time dependency).
         self._requirements: Any = requirements
+        # M-GV-07: lazily-constructed verification/review managers used by the
+        # parallel post-completion gate. Kept as instances (not constructed in
+        # __init__) so a job manager that never enables ``parallel_gates``
+        # never opens the extra DB connections or imports the managers.
+        self._verification: Any = None
+        self._review: Any = None
         self._reload_jobs()
 
     def _reload_jobs(self) -> None:
@@ -606,6 +612,47 @@ class DevelopmentJobManager:
             db=self._db,
         )
         return self._requirements
+
+    def _verification_manager(self) -> Any:
+        """Return the VerificationCommitManager, lazily constructing it if needed.
+
+        M-GV-07: the parallel post-completion gate runs the verification gate
+        from inside ``_run``. ``verification`` imports ``jobs`` at module load,
+        so constructing it at import time would create a cycle; the lazy import
+        (and the deferred construction) breaks it. The manager shares this
+        manager's settings/locks/projects so the gate sees the same project
+        policy and the same per-project lock the job run used.
+        """
+        if self._verification is not None:
+            return self._verification
+        from .verification import VerificationCommitManager
+
+        self._verification = VerificationCommitManager(
+            self.settings, self._locks, self, projects=self._projects
+        )
+        return self._verification
+
+    def _review_manager(self) -> Any:
+        """Return the ReviewManager, lazily constructing it if needed.
+
+        M-GV-07: mirror of ``_verification_manager`` for the independent
+        bridge-spawned review half of the parallel gate. ``review`` imports
+        ``jobs`` at module load, so the import is deferred to first use. The
+        manager is wired to the same executor this job manager uses, so a
+        single fake/real executor drives both the drafting and the review.
+        """
+        if self._review is not None:
+            return self._review
+        from .review import ReviewManager
+
+        self._review = ReviewManager(
+            self.settings,
+            self._locks,
+            self,
+            self._executor,
+            projects=self._projects,
+        )
+        return self._review
 
     def _project_policies(self) -> tuple[ProjectPolicy, ...]:
         """Return the project policies this manager was constructed with."""
@@ -2515,6 +2562,75 @@ class DevelopmentJobManager:
         lines.append("Continue from this state; do not redo completed work.")
         return "\n".join(lines)
 
+    async def _run_parallel_gates(
+        self, job: DevelopmentJob, project: ProjectPolicy
+    ) -> None:
+        """M-GV-07: run the verification and independent-review gates concurrently.
+
+        Called from ``_run``'s ``finally`` once the candidate is stable and the
+        per-project lock has been released (both gates re-acquire it internally;
+        ``asyncio.Lock`` is not reentrant, so running them inside the lock block
+        would deadlock). The two gates are scheduled together via
+        ``asyncio.gather`` so the expensive steps overlap; each gate records its
+        durable verification/review row, and the outcome is summarized in a
+        ``parallel_gates`` audit event.
+
+        Non-fatal by construction: a failed gate must never fail the job that
+        already reached COMPLETED. Every failure path is caught and surfaced
+        only in the audit event.
+        """
+        try:
+            if job.worktree is None:
+                raise DevelopmentJobError("job has no retained worktree")
+            expected_head = job.worktree.base_head
+            verification = self._verification_manager()
+            review = self._review_manager()
+        except Exception as exc:  # pragma: no cover - defensive only
+            self._record_event(
+                job,
+                "parallel_gates",
+                {"status": "skipped", "error": str(exc)[:500]},
+                authority={
+                    "actor": "bridge",
+                    "authority_source": "bridge_internal",
+                    "scope": "parallel_gates",
+                    "classification": "observed",
+                },
+            )
+            return
+        results = await asyncio.gather(
+            verification.verify(project, job.job_id, expected_head),
+            review.run_independent_review(project, job.job_id),
+            return_exceptions=True,
+        )
+        verification_result, review_result = results
+        verification_status = "ok" if not isinstance(verification_result, Exception) else "failed"
+        review_status = "ok" if not isinstance(review_result, Exception) else "failed"
+        detail: dict[str, Any] = {
+            "status": (
+                "both_recorded"
+                if verification_status == "ok" and review_status == "ok"
+                else "partial"
+            ),
+            "verification": verification_status,
+            "review": review_status,
+        }
+        if isinstance(verification_result, Exception):
+            detail["verification_error"] = str(verification_result)[:500]
+        if isinstance(review_result, Exception):
+            detail["review_error"] = str(review_result)[:500]
+        self._record_event(
+            job,
+            "parallel_gates",
+            detail,
+            authority={
+                "actor": "bridge",
+                "authority_source": "bridge_internal",
+                "scope": "parallel_gates",
+                "classification": "observed",
+            },
+        )
+
     async def _run(
         self,
         job: DevelopmentJob,
@@ -2941,3 +3057,12 @@ class DevelopmentJobManager:
                 job.updated_at = _timestamp()
                 self._persist_job(job)
                 self._persist_progress(job)
+            # M-GV-07: once the candidate is stable (job COMPLETED, task cleared,
+            # project lock released), run the verification and independent-review
+            # gates concurrently when the project opts into ``parallel_gates``.
+            # Deliberately outside the ``async with self._state_lock`` block and
+            # after ``job.task = None``: both gates re-acquire the per-project
+            # lock and both require an inactive completed job (``job.task is
+            # None``), and ``_run_parallel_gates`` is non-fatal.
+            if project.parallel_gates and job.status == JobStatus.COMPLETED:
+                await self._run_parallel_gates(job, project)

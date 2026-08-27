@@ -1715,5 +1715,186 @@ class SelfCertificationTests(unittest.TestCase):
         asyncio.run(exercise())
 
 
+class ParallelGateExecutor:
+    """M-GV-07: fake executor capable of both the drafting and the review phase.
+
+    The parallel post-completion gate wires the ReviewManager to the same
+    executor the job manager uses, so a single fake must implement both
+    ``execute`` (drafting) and ``execute_review`` (bridge-spawned review).
+    """
+
+    def __init__(self, edit: Any, verdict: dict[str, Any] | None = None) -> None:
+        self.edit = edit
+        self.review_calls: list[dict[str, Any]] = []
+        self.verdict = verdict or {
+            "summary": "parallel gate looks good",
+            "issues": [],
+            "recommendation": "approve",
+        }
+
+    async def execute(
+        self,
+        project: ProjectPolicy,
+        specification: str,
+        effort: str,
+        *,
+        root: Path | None = None,
+        resume_session_id: str | None = None,
+        max_turns: int | None = None,
+    ) -> dict[str, object]:
+        assert root is not None
+        self.edit(root)
+        return {
+            "status": "completed",
+            "result": "candidate ready",
+            "session_id": "parallel-gate-session",
+        }
+
+    async def execute_review(
+        self,
+        project: ProjectPolicy,
+        specification: str,
+        effort: str,
+        *,
+        root: Path | None = None,
+        resume_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        assert resume_session_id is None, "reviewer must never resume"
+        assert root is not None, "reviewer must run in the candidate worktree"
+        self.review_calls.append({"root": root, "specification": specification})
+        return {
+            "status": "completed",
+            "project_id": project.id,
+            "result": json.dumps(self.verdict),
+            "exit_code": 0,
+            "is_error": False,
+        }
+
+
+class ParallelGateTests(unittest.TestCase):
+    """M-GV-07 tail: on completion a job runs verify + independent review together.
+
+    With ``parallel_gates`` enabled on the project, a job that reaches
+    COMPLETED automatically schedules the verification gate and the
+    bridge-spawned independent review concurrently (``asyncio.gather`` in
+    ``_run``'s ``finally``) and persists both records. Without the flag the
+    job completes untouched (no auto-verification), preserving existing
+    behavior for projects that verify/review manually.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        initialize_git_repository(self.root)
+        (self.root / "src").mkdir()
+        (self.root / "src" / "marker.py").write_text("VALUE = 1\n", encoding="utf-8")
+        import subprocess
+
+        subprocess.run(["git", "-C", str(self.root), "add", "src"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-qm", "Add source"], check=True
+        )
+        self.settings = Settings.from_env(
+            {
+                "PROJECTS_CONFIG_PATH": str(self.base / "projects.json"),
+                "JOB_WORKTREE_ROOT": str(self.base / "jobs"),
+                "VERIFICATION_COMMAND_TIMEOUT_SECONDS": "2",
+                "MAX_VERIFICATION_OUTPUT_BYTES": "64",
+            }
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    async def _wait_validation_evidence(
+        self, jobs: DevelopmentJobManager, project: ProjectPolicy, job_id: str
+    ) -> dict[str, Any]:
+        """Poll the snapshot until both gate records have been persisted.
+
+        The job's status flips to ``completed`` before the finally-gate has
+        finished (the gates run after the status transition), so the test waits
+        for the durable ``validation_evidence`` rows rather than the status.
+        """
+        import time
+
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            snapshot = await jobs.get(project, job_id)
+            evidence = snapshot.get("validation_evidence")
+            if (
+                evidence
+                and evidence.get("verifications")
+                and evidence.get("reviews")
+            ):
+                return snapshot
+            await asyncio.sleep(0.01)
+        raise AssertionError(
+            "parallel gates did not persist both a verification and a review record"
+        )
+
+    def test_parallel_gates_record_verification_and_review(self) -> None:
+        async def exercise() -> None:
+            project = review_project(
+                self.root,
+                ["{python}", "-c", "pass"],
+                parallel_gates=True,
+            )
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            executor = ParallelGateExecutor(edit)
+            jobs = DevelopmentJobManager(
+                self.settings, ProjectLockManager(), executor, projects=(project,)
+            )
+            started = await jobs.start(project, "make candidate", "high")
+            job_id = str(started["job_id"])
+            completed = await wait_completed(jobs, project, job_id)
+            self.assertEqual(completed["status"], "completed")
+
+            # Both gates ran and both durable records exist.
+            snapshot = await self._wait_validation_evidence(jobs, project, job_id)
+            evidence = snapshot["validation_evidence"]
+            verifications = evidence["verifications"]
+            reviews = evidence["reviews"]
+            self.assertEqual(len(verifications), 1)
+            self.assertEqual(verifications[0]["status"], "passed")
+            self.assertEqual(len(reviews), 1)
+            self.assertEqual(
+                reviews[0]["verdict_summary"]["recommendation"], "approve"
+            )
+            # The bridge-spawned reviewer actually executed over the candidate
+            # worktree (a fresh, non-resumed session).
+            self.assertEqual(len(executor.review_calls), 1)
+            self.assertIsNotNone(executor.review_calls[0]["root"])
+
+        asyncio.run(exercise())
+
+    def test_parallel_gates_are_opt_in(self) -> None:
+        async def exercise() -> None:
+            project = review_project(self.root, ["{python}", "-c", "pass"])
+
+            def edit(root: Path) -> None:
+                (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+
+            executor = ParallelGateExecutor(edit)
+            jobs = DevelopmentJobManager(
+                self.settings, ProjectLockManager(), executor, projects=(project,)
+            )
+            started = await jobs.start(project, "make candidate", "high")
+            job_id = str(started["job_id"])
+            completed = await wait_completed(jobs, project, job_id)
+            self.assertEqual(completed["status"], "completed")
+            # No auto-verification / auto-review: the gate is opt-in, so a job
+            # that would otherwise be manually verified/reviewed has no rows.
+            await asyncio.sleep(0.1)
+            snapshot = await jobs.get(project, job_id)
+            self.assertNotIn("validation_evidence", snapshot)
+            self.assertEqual(len(executor.review_calls), 0)
+
+        asyncio.run(exercise())
+
+
 if __name__ == "__main__":
     unittest.main()
