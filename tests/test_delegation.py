@@ -12,10 +12,13 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from fastmcp.exceptions import ToolError
+
 from local_dev_mcp.config import Settings
 from local_dev_mcp.jobs import DevelopmentJobError, DevelopmentJobManager
-from local_dev_mcp.models import Effort, ProjectPolicy
-from local_dev_mcp.registry import ProjectLockManager
+from local_dev_mcp.models import Effort, ProjectCapability, ProjectPolicy
+from local_dev_mcp.registry import ProjectLockManager, ProjectRegistry
+from local_dev_mcp.server import create_server
 
 from tests.support import initialize_git_repository
 from tests.test_jobs import ImmediateExecutor, policy, settings, wait_for_status
@@ -280,6 +283,145 @@ class DelegationTests(unittest.TestCase):
                 self.assertIn("delegation_mandate_json", columns)
             finally:
                 connection.close()
+
+
+class CapabilitySubsetTests(unittest.TestCase):
+    """M-GV-06 tail: runtime capability-subset enforcement for delegated children.
+
+    A delegated child is bounded to the capability names its mandate
+    ``authority`` list declares. ``DevelopmentJobManager.require_job_capability``
+    rejects a job-scoped invocation of a capability outside that subset
+    (fail-closed when the mandate has no authority list), while leaving plain
+    parent jobs governed only by the project-level capability gate. The server
+    handlers wire the check after their ``ProjectRegistry.resolve`` gate.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        initialize_git_repository(self.root)
+        self.settings = settings(self.base)
+        self.project = policy(self.root)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _manager(self, executor: Any) -> DevelopmentJobManager:
+        return DevelopmentJobManager(
+            self.settings,
+            ProjectLockManager(),
+            executor,  # type: ignore[arg-type]
+            projects=(self.project,),
+        )
+
+    async def _child(
+        self, manager: DevelopmentJobManager, authority: list[str]
+    ) -> str:
+        parent = await manager.start(self.project, "parent work", "high")
+        parent_id = str(parent["job_id"])
+        await wait_for_status(manager, self.project, parent_id, {"completed"})
+        child = await manager.delegate(
+            self.project,
+            parent_id,
+            "child work",
+            "high",
+            mandate={"outputs": ["candidate.txt"], "authority": authority},
+        )
+        child_id = str(child["job_id"])
+        await wait_for_status(manager, self.project, child_id, {"completed"})
+        return child_id
+
+    def test_child_capability_inside_authority_is_allowed(self) -> None:
+        async def exercise() -> None:
+            manager = self._manager(ImmediateExecutor())
+            child_id = await self._child(manager, ["repository_read", "claude_edit"])
+            # Both declared capabilities are usable on the child's job.
+            await manager.require_job_capability(
+                self.project, child_id, ProjectCapability.REPOSITORY_READ
+            )
+            await manager.require_job_capability(
+                self.project, child_id, ProjectCapability.CLAUDE_EDIT
+            )
+
+        asyncio.run(exercise())
+
+    def test_child_capability_outside_authority_is_rejected(self) -> None:
+        async def exercise() -> None:
+            manager = self._manager(ImmediateExecutor())
+            child_id = await self._child(manager, ["repository_read"])
+            with self.assertRaisesRegex(
+                DevelopmentJobError,
+                r"delegated child job .*not authorized for capability 'candidate_review'",
+            ):
+                await manager.require_job_capability(
+                    self.project, child_id, ProjectCapability.CANDIDATE_REVIEW
+                )
+
+        asyncio.run(exercise())
+
+    def test_child_without_authority_fails_closed(self) -> None:
+        async def exercise() -> None:
+            manager = self._manager(ImmediateExecutor())
+            # A mandate that bounds outputs but declares no authority authorizes
+            # nothing at the job scope: any job-scoped capability is rejected.
+            parent = await manager.start(self.project, "parent work", "high")
+            parent_id = str(parent["job_id"])
+            await wait_for_status(manager, self.project, parent_id, {"completed"})
+            child = await manager.delegate(
+                self.project,
+                parent_id,
+                "child work",
+                "high",
+                mandate={"outputs": ["candidate.txt"]},
+            )
+            child_id = str(child["job_id"])
+            await wait_for_status(manager, self.project, child_id, {"completed"})
+            with self.assertRaisesRegex(
+                DevelopmentJobError, "not authorized for capability"
+            ):
+                await manager.require_job_capability(
+                    self.project, child_id, ProjectCapability.CLAUDE_EDIT
+                )
+
+        asyncio.run(exercise())
+
+    def test_non_delegated_job_is_unrestricted(self) -> None:
+        async def exercise() -> None:
+            manager = self._manager(ImmediateExecutor())
+            parent = await manager.start(self.project, "parent work", "high")
+            parent_id = str(parent["job_id"])
+            await wait_for_status(manager, self.project, parent_id, {"completed"})
+            # A plain job has no mandate, so the project-level gate is the whole
+            # of the enforcement: any capability is allowed here.
+            await manager.require_job_capability(
+                self.project, parent_id, ProjectCapability.OPEN_PULL_REQUEST
+            )
+            await manager.require_job_capability(
+                self.project, parent_id, ProjectCapability.CANDIDATE_REVIEW
+            )
+
+        asyncio.run(exercise())
+
+    def test_server_handler_rejects_out_of_scope_capability_on_child(self) -> None:
+        async def exercise() -> None:
+            manager = self._manager(ImmediateExecutor())
+            child_id = await self._child(manager, ["repository_read"])
+            server = create_server(
+                self.settings,
+                ProjectRegistry({"test-project": self.project}),
+                jobs=manager,
+                executor=ImmediateExecutor(),
+            )
+            # get_development_job invokes claude_edit on the child, which its
+            # mandate authority (repository_read only) does not include.
+            with self.assertRaisesRegex(ToolError, "not authorized for capability"):
+                await server.call_tool(
+                    "get_development_job",
+                    {"project_id": "test-project", "job_id": child_id},
+                )
+
+        asyncio.run(exercise())
 
 
 if __name__ == "__main__":

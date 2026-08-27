@@ -2061,6 +2061,44 @@ class DevelopmentJobManager:
             self._persist_job(child)
             return self._snapshot(child)
 
+    async def require_job_capability(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        capability: ProjectCapability,
+    ) -> None:
+        """M-GV-06: enforce a delegated child's mandate-authority subset.
+
+        A plain (non-delegated) job is governed only by the caller's existing
+        project-level capability check and is always allowed here. A delegated
+        child is additionally bounded to the capability names its mandate
+        ``authority`` list declares: invoking a capability outside that subset
+        on the child's job is rejected. Fail-closed — a child whose mandate has
+        no ``authority`` list is authorized for nothing at the job scope, so any
+        job-scoped invocation is rejected. Server handlers call this after
+        their ``ProjectRegistry.resolve`` gate, so the project must still hold
+        the capability before the subset is consulted.
+        """
+        async with self._state_lock:
+            job = self._require_job(project, job_id)
+            if job.parent_job_id is None:
+                # Not a delegated child: the project-level capability gate is
+                # the whole of the enforcement.
+                return
+            mandate = job.delegation_mandate or {}
+            authority = mandate.get("authority")
+            allowed = (
+                {str(item) for item in authority}
+                if isinstance(authority, list)
+                else set()
+            )
+            if capability.value not in allowed:
+                raise DevelopmentJobError(
+                    f"delegated child job {job_id!r} is not authorized for "
+                    f"capability {capability.value!r}; its mandate authority "
+                    f"is limited to {sorted(allowed)}"
+                )
+
     async def get(
         self,
         project: ProjectPolicy,

@@ -526,6 +526,10 @@ def create_server(
         ],
     ) -> dict[str, Any]:
         project = active_registry.resolve(project_id, ProjectCapability.CLAUDE_EDIT)
+        # M-GV-06: a delegated child is bounded to its mandate authority subset.
+        await active_jobs.require_job_capability(
+            project, job_id, ProjectCapability.CLAUDE_EDIT
+        )
         return await active_jobs.get(project, job_id)
 
     @mcp.tool(
@@ -573,6 +577,10 @@ def create_server(
         ] = None,
     ) -> dict[str, Any]:
         project = active_registry.resolve(project_id, ProjectCapability.CLAUDE_EDIT)
+        # M-GV-06: a delegated child is bounded to its mandate authority subset.
+        await active_jobs.require_job_capability(
+            project, job_id, ProjectCapability.CLAUDE_EDIT
+        )
         return await active_jobs.resume(project, job_id, text, effort)
 
     @mcp.tool(
@@ -603,6 +611,10 @@ def create_server(
         ],
     ) -> dict[str, Any]:
         project = active_registry.resolve(project_id, ProjectCapability.CLAUDE_EDIT)
+        # M-GV-06: a delegated child is bounded to its mandate authority subset.
+        await active_jobs.require_job_capability(
+            project, job_id, ProjectCapability.CLAUDE_EDIT
+        )
         return await active_jobs.cancel(project, job_id)
 
     @mcp.tool(
@@ -643,6 +655,10 @@ def create_server(
         project = active_registry.resolve(
             project_id, ProjectCapability.VERIFICATION_COMMIT
         )
+        # M-GV-06: a delegated child is bounded to its mandate authority subset.
+        await active_jobs.require_job_capability(
+            project, job_id, ProjectCapability.VERIFICATION_COMMIT
+        )
         return await active_verification.verify(project, job_id, expected_head)
 
     @mcp.tool(
@@ -669,6 +685,10 @@ def create_server(
     ) -> dict[str, Any]:
         project = active_registry.resolve(
             project_id, ProjectCapability.CANDIDATE_REVIEW
+        )
+        # M-GV-06: a delegated child is bounded to its mandate authority subset.
+        await active_jobs.require_job_capability(
+            project, job_id, ProjectCapability.CANDIDATE_REVIEW
         )
         return await active_review.list_candidate_changes(project, job_id)
 
@@ -723,6 +743,10 @@ def create_server(
         project = active_registry.resolve(
             project_id, ProjectCapability.CANDIDATE_REVIEW
         )
+        # M-GV-06: a delegated child is bounded to its mandate authority subset.
+        await active_jobs.require_job_capability(
+            project, job_id, ProjectCapability.CANDIDATE_REVIEW
+        )
         return await active_review.read_candidate_file(
             project, job_id, path, start_line, end_line, expected_sha256
         )
@@ -773,6 +797,10 @@ def create_server(
         project = active_registry.resolve(
             project_id, ProjectCapability.CANDIDATE_REVIEW
         )
+        # M-GV-06: a delegated child is bounded to its mandate authority subset.
+        await active_jobs.require_job_capability(
+            project, job_id, ProjectCapability.CANDIDATE_REVIEW
+        )
         return await active_review.record_candidate_review(
             project, job_id, verdict, reviewer_id
         )
@@ -819,6 +847,10 @@ def create_server(
         project = active_registry.resolve(
             project_id, ProjectCapability.CANDIDATE_REVIEW
         )
+        # M-GV-06: a delegated child is bounded to its mandate authority subset.
+        await active_jobs.require_job_capability(
+            project, job_id, ProjectCapability.CANDIDATE_REVIEW
+        )
         return await active_review.run_independent_review(project, job_id, effort)
 
     @mcp.tool(
@@ -850,6 +882,10 @@ def create_server(
     ) -> dict[str, Any]:
         project = active_registry.resolve(
             project_id, ProjectCapability.CANDIDATE_REVIEW
+        )
+        # M-GV-06: a delegated child is bounded to its mandate authority subset.
+        await active_jobs.require_job_capability(
+            project, job_id, ProjectCapability.CANDIDATE_REVIEW
         )
         return await active_review.get_candidate_review(project, job_id, review_id)
 
@@ -943,6 +979,10 @@ def create_server(
     ) -> dict[str, Any]:
         project = active_registry.resolve(
             project_id, ProjectCapability.VERIFICATION_COMMIT
+        )
+        # M-GV-06: a delegated child is bounded to its mandate authority subset.
+        await active_jobs.require_job_capability(
+            project, job_id, ProjectCapability.VERIFICATION_COMMIT
         )
         if project.requires_review:
             if review_id is None:
@@ -1066,6 +1106,10 @@ def create_server(
     ) -> dict[str, Any]:
         project = active_registry.resolve(
             project_id, ProjectCapability.PUSH_DEVELOPMENT_COMMIT
+        )
+        # M-GV-06: a delegated child is bounded to its mandate authority subset.
+        await active_jobs.require_job_capability(
+            project, job_id, ProjectCapability.PUSH_DEVELOPMENT_COMMIT
         )
         # Durable authorization check for push, if enabled and auth ID provided
         if active_settings.enable_durable_authz and authorization_id is not None:
@@ -1239,6 +1283,10 @@ def create_server(
         project = active_registry.resolve(
             project_id, ProjectCapability.EXPORT_EVIDENCE_BUNDLE
         )
+        # M-GV-06: a delegated child is bounded to its mandate authority subset.
+        await active_jobs.require_job_capability(
+            project, job_id, ProjectCapability.EXPORT_EVIDENCE_BUNDLE
+        )
         try:
             return await active_evidence.export_bundle(
                 project,
@@ -1302,6 +1350,10 @@ def create_server(
     ) -> dict[str, Any]:
         project = active_registry.resolve(
             project_id, ProjectCapability.OPEN_PULL_REQUEST
+        )
+        # M-GV-06: a delegated child is bounded to its mandate authority subset.
+        await active_jobs.require_job_capability(
+            project, job_id, ProjectCapability.OPEN_PULL_REQUEST
         )
         try:
             return await active_pr.open_pull_request(
