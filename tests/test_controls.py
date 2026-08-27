@@ -937,5 +937,85 @@ class PauseDevelopmentJobTests(unittest.TestCase):
         asyncio.run(exercise())
 
 
+class ControlSurfaceSchemaTests(unittest.TestCase):
+    """Final M-CC-08 schema lock: 38 tools with the six controls present."""
+
+    def test_control_surface_is_registered_with_expected_annotations(self) -> None:
+        async def exercise() -> dict[str, Any]:
+            base = Path(tempfile.mkdtemp())
+            root = base / "repo"
+            initialize_git_repository(root)
+            policy = project(root, ["{python}", "-c", "print('ok')"])
+            server = server_for(base, policy)
+            return {
+                tool.name: tool
+                for tool in await server.list_tools()
+                if not tool.name.startswith("__")
+            }
+
+        tools = asyncio.run(exercise())
+        self.assertEqual(
+            len(tools), 38, "control surface must lock the tool count at 38"
+        )
+        controls = {
+            "pause_development_job": (False, False, True),
+            "extend_budget": (False, False, True),
+            "narrow_scope": (False, False, True),
+            "replace_worker": (False, False, False),
+            "discard_candidate": (False, True, True),
+            "revoke_authorization": (False, False, True),
+        }
+        for name, (read_only, destructive, idempotent) in controls.items():
+            tool = tools.get(name)
+            self.assertIsNotNone(tool, f"{name} must be registered")
+            self.assertEqual(tool.annotations.readOnlyHint, read_only, name)
+            self.assertEqual(tool.annotations.destructiveHint, destructive, name)
+            self.assertEqual(tool.annotations.idempotentHint, idempotent, name)
+            self.assertFalse(tool.annotations.openWorldHint, name)
+
+    def test_control_tools_are_dormant_without_capabilities(self) -> None:
+        async def exercise() -> None:
+            base = Path(tempfile.mkdtemp())
+            root = base / "repo"
+            initialize_git_repository(root)
+            policy = project(
+                root,
+                ["{python}", "-c", "print('ok')"],
+                capabilities=["repository_read", "claude_edit", "verification_commit"],
+            )
+            server = server_for(base, policy)
+            from fastmcp.exceptions import ToolError
+
+            for name in (
+                "pause_development_job",
+                "extend_budget",
+                "discard_candidate",
+            ):
+                with self.assertRaises(ToolError, msg=name):
+                    await server.call_tool(
+                        name, {"project_id": "test-project", "job_id": "0" * 32}
+                    )
+            # narrow_scope and replace_worker take extra required arguments that
+            # must be present for argument validation to pass and reach the
+            # capability gate; revoke_authorization keys off authorization_id
+            # instead of job_id.
+            for name, extra in (
+                ("narrow_scope", {"paths": ["README.md"]}),
+                ("replace_worker", {"text": "redo"}),
+            ):
+                with self.assertRaises(ToolError, msg=name):
+                    await server.call_tool(
+                        name,
+                        {"project_id": "test-project", "job_id": "0" * 32, **extra},
+                    )
+            with self.assertRaises(ToolError):
+                await server.call_tool(
+                    "revoke_authorization",
+                    {"project_id": "test-project", "authorization_id": "0" * 32},
+                )
+
+        asyncio.run(exercise())
+
+
 if __name__ == "__main__":
     unittest.main()
