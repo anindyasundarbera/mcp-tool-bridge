@@ -76,8 +76,10 @@
 ## Current state (2026-08-27) — supersedes the audit rows below
 
 Verified against the source on 2026-08-27 (grep/symbol evidence, not just
-commit messages). **All R1 Continuity and R2 Evidence milestones are now
-DONE**, and R3/Cross-cutting is substantially advanced:
+commit messages). **All R1 Continuity, R2 Evidence, R3 Governance, and the
+cross-cutting M-CC set are now DONE.** The 2026-08-27 integration re-landed
+the full capability set onto `main` (22 cherry-picked commits, full suite
+green: **572 tests**), closing every item in the prior "definitive open set":
 
 - **M-CT-02 … M-CT-07 all DONE** — `CLAUDE_HARD_WALL_SECONDS` +
   compute-proxy (`config.py`), `job_checkpoint_detail` sidecar (`store.py`),
@@ -91,35 +93,31 @@ DONE**, and R3/Cross-cutting is substantially advanced:
   `revision_resolves_finding`, `source_classifications` +
   `authority_records`, `export_evidence_bundle`, `nondeterminism_labeled`,
   `gc_artifacts`.
-- **M-GV-01 DONE** (`authorization.py:AuthorizationManager` + `authorizations`
-  table, wired into server handlers).
-- **M-GV-06 mostly DONE** — `parent_job_id` + `delegation_mandate` on
-  `DevelopmentJob`, store columns, `MAX_DELEGATIONS_PER_JOB`, fail-closed
-  mandate validation + scope bounding (`jobs.py:1282`), `tests/test_delegation.py`
-  (10 cases). **Remaining:** enforce the child's invoked capabilities ⊆
-  mandate `authority` at runtime.
-- **M-GV-07 mostly DONE** — `reconcile_reviews` built + wired into the commit
-  gate with tests (`review.py:1024`, `tests/test_review.py:1409+`).
-  **Remaining:** run verify + independent review concurrently via
-  `asyncio.gather` once the candidate is stable.
-- **M-CC-05 mostly DONE** — `open_pull_request` is discover-then-create/update
-  and race-safe (`pr.py:218`). **Remaining:** the concurrency test
-  (two `open_pull_request` under `asyncio.gather` + mocked `_gh` → exactly one
-  create + one edit).
-- **M-CC-11 partial** — `supply_chain_scans` exist and run pre-commit;
-  missing per-job `filesystem_policy`/`credential_policy`, signed manifests,
-  sensitivity-classification-before-export.
+- **M-GV-01 … M-GV-07 all DONE** — `authorization.py:AuthorizationManager` +
+  `authorizations` table wired into server handlers; named roles Planner /
+  Evidence-officer / Supervisor (read-only command builders +
+  `tests/test_roles.py`); `apex_authority_ref` + `REQUIRE_APEX_GROUNDING`
+  (`tests/test_registry.py`); `ratified_spec_commit` spec-gating
+  (`tests/test_jobs.py`); `drafter_id` self-certification guard
+  (`tests/test_review.py`); capability-subset runtime enforcement for
+  delegated children (`require_job_capability`, `tests/test_delegation.py`);
+  parallel verify + independent review with `reconcile_reviews`
+  (`review.py:1024`, `tests/test_review.py:1409+`).
+- **M-CC-01 … M-CC-11 all DONE** — `pr.py:218` discover-then-create/update
+  open_pull_request + race-safe idempotency concurrency test; `ratify_candidate`
+  + `ratifications` sidecar (Option A, merge stays prohibited); `unexpected_paths`
+  commit-gate detection; `recover_completed_worktree` read-only re-attach
+  (`worktrees.py:672`); the full M-CC-08 control surface (6 new controls, each
+  `ProjectCapability`-gated, dormant by default — schema locked at 38 tools);
+  hermetic verification lab (`PIN_TOOLCHAIN` / `DEPS_CACHE_DIR` /
+  `NETWORK_POLICY`); failure-recovery hardening (`reset_worktree_to_base`,
+  `recreate_detached`, `remove`, `tests/test_recovery.py`); security hardening
+  tail (filesystem/credential policies, signed manifests, sensitivity
+  classification, `security.py` + `tests/test_security.py`).
 
-**Definitive open set (the milestones being closed on 2026-08-27):**
-M-GV-02 (named roles), M-GV-03 (apex grounding), M-GV-04 (spec-gated runtime),
-M-GV-05 (self-certification guard), M-GV-06 tail (capability-subset runtime
-enforcement), M-GV-07 tail (parallel verify+review), M-CC-03 (successor job),
-M-CC-04 (ratification, Option A), M-CC-05 tail (concurrency test),
-M-CC-06 (unexpected-files policy), M-CC-07 (completed-worktree recovery),
-M-CC-08 (control surface), M-CC-09 (lab determinism: PIN_TOOLCHAIN /
-DEPS_CACHE_DIR / NETWORK_POLICY / baseline), M-CC-10 (failure-recovery
-hardening), M-CC-11 tail (fs/credential policy, signed manifests, sensitivity
-classification). **M-IN-01 (P3) stays a non-goal.**
+**No open milestones remain** in R1–R3 or Cross-cutting. **M-IN-01 (P3)
+stays a non-goal.** The next session's work is release/versioning and any
+follow-on hardening, not new capability gaps.
 
 ## What MCPB-010 closed (do not rebuild)
 
@@ -334,23 +332,23 @@ authoritative input to the implementation order in "Recommended next action".
 | M-EV-07 | Nondeterminism detection + deterministic replay | DONE | — (verification.py:verify runs each command `verification_deterministic_repetitions` times and labels divergence via `_commands_diverge` comparing status/exit_code/stderr → `nondeterminism_labeled` + `infrastructure_status=DEGRADED`; `compute_environment_digest` + per-command `command_digest` (M-EV-02) persisted; tests/test_verification.py M-EV-07 flaky + deterministic-control cases; `replay_verification` NEW-SURFACE tool intentionally deferred — no new surface shipped here) |
 | M-EV-08 | Artifact retention + GC policy | DONE | — (`config.py` `evidence_retention_days`/`checkpoint_retention_days` (env `EVIDENCE_RETENTION_DAYS`/`CHECKPOINT_RETENTION_DAYS`, default 0 = disabled); `store.gc_artifacts` deletes non-promoted non-structural checkpoint+detail rows older than retention, never verifications/reviews/publications/syncs; promoted-evidence guard via protected job_id/checkpoint_id sets; testable via `now_iso` cutoff param; additive `idx_job_checkpoints_recorded_at` index; tests/test_checkpoints.py `ArtifactGcTests`) |
 | M-GV-01 | Durable authorization objects | DONE | |
-| M-GV-02 | Named roles Planner / Evidence-officer / Supervisor | PARTIAL | Implement `build_planner_command`/`build_evidence_officer_command`/`build_supervisor_command` (read-only, Read/Glob/Grep only); wire as capability-gated invocations; tests/test_roles.py. |
-| M-GV-03 | External grounding for genesis/apex authority | MISSING | `ProjectPolicy.apex_authority_ref`; `REQUIRE_APEX_GROUNDING` opt-in; registry rejects ungrounded policy; genesis jobs require ref present+unchanged; tests. |
-| M-GV-04 | Spec-gated runtime under ratified spec commit | MISSING | `ProjectPolicy.ratified_spec_commit`; jobs.create requires job spec pinned to that commit; reject spec drift; tests. |
-| M-GV-05 | Self-certification prevention | PARTIAL | Record drafter identity on job; `record_candidate_review` rejects reviewer_id == drafter with clear error; self-review test. |
-| M-GV-06 | Sub-agent delegation + parent/child task trees | PARTIAL | Enforce capability-subset bound at runtime (child invoked caps ⊆ mandate authority); reconcile scoping wording; expose parent_job_id via start()/create() or document delegate() as canonical; tests. |
-| M-GV-07 | Parallel verify + review + conflict reconciliation | PARTIAL | `asyncio.gather` verify+review once candidate stable; wire `reconcile_reviews` into commit gate (require reconciled pass over multiple review_ids); reconcile tie-breaker wording with stricter impl; parallel+gate tests. |
+| M-GV-02 | Named roles Planner / Evidence-officer / Supervisor | DONE | — (`claude.py` role builders `build_planner_command`/`build_evidence_officer_command`/`build_supervisor_command`, read-only Read/Glob/Grep only; capability-gated invocations; tests/test_roles.py) |
+| M-GV-03 | External grounding for genesis/apex authority | DONE | — (`ProjectPolicy.apex_authority_ref` + `require_apex_grounding`; `registered_apex_authority` table; registry rejects ungrounded policy; genesis jobs require ref present+unchanged; tests/test_registry.py) |
+| M-GV-04 | Spec-gated runtime under ratified spec commit | DONE | — (`ProjectPolicy.ratified_spec_commit`; `create_development_job` requires job spec pinned to that commit, rejects spec drift; tests/test_jobs.py) |
+| M-GV-05 | Self-certification prevention | DONE | — (`drafter_id` recorded on the job; `record_candidate_review` rejects reviewer_id == drafter; self-review test; tests/test_review.py) |
+| M-GV-06 | Sub-agent delegation + parent/child task trees | DONE | — (`parent_job_id` + `delegation_mandate_json`; `MAX_DELEGATIONS_PER_JOB`; fail-closed mandate validation; `require_job_capability` enforces child's invoked caps ⊆ mandate authority at runtime; tests/test_delegation.py) |
+| M-GV-07 | Parallel verify + review + conflict reconciliation | DONE | — (`asyncio.gather` verify + independent review once the candidate is stable; `reconcile_reviews` wired into the commit gate (reconciled pass over multiple review_ids); tie-breaker review with distinct reviewer_id; tests/test_review.py) |
 | M-CC-01 | PR creation + existing-PR discovery + update draft PR | DONE | — (pr.py PullRequestManager; open_pull_request tool server.py:1202; OPEN_PULL_REQUEST cap; gh pr list/create/edit; tests/test_pr.py) |
 | M-CC-02 | Confirm remote branch/PR state | DONE | — (pr.py:364-365 remote_branch_state+pr_state; introspection.py:717) |
-| M-CC-03 | Successor job from immutable completed candidate | PARTIAL | Add `create_successor_job(parent_job_id, instructions)` pinning base_head to parent's `CommittedCandidate.committed_sha` (not canonical HEAD); preserve immutable parent; record via parent/child tree; tests. |
-| M-CC-04 | Merge-vs-ratification + separate authz | PARTIAL | `ratifications` sidecar table; internal `ratify_candidate` act; ProjectCapability+ToolAnnotations (off by default) + authz gate; tests; Option B merge tool only if user authorizes. |
-| M-CC-05 | Branch/PR race-safe idempotency | PARTIAL | Add concurrency test (two open_pull_request via asyncio.gather under shared manager + mocked _gh → exactly one create + one edit); note cross-process TOCTOU scope limit (in-process lock only). |
-| M-CC-06 | Unexpected-files / generated-artifact / submodule detection | MISSING | Configurable `unexpected_paths` policy per project (block `*.lock`/`dist/`/`node_modules/`/generated artifacts not in declared changed set); flag + reject at commit gate; tests. |
-| M-CC-07 | Read-only completed-worktree recovery | MISSING | `worktrees.recover_completed_worktree(job_id)` re-attaches vanished completed worktree from content-addressed candidate (detached checkout, verify fingerprint), read-only; tests. |
-| M-CC-08 | Human control surface | PARTIAL | Dashboard: add `requirements_covered` (M-EV-01) + `authorities_in_force` (M-GV-01) to `_snapshot`. Control tools (NEW SURFACE each, opt-in): pause_development_job, extend_budget, narrow_scope, replace_worker, discard_candidate, revoke_authorization (+export_evidence=M-EV-06). All currently MISSING. |
-| M-CC-09 | Verification-lab determinism | PARTIAL | Has TZ=UTC/SOURCE_DATE_EPOCH/PYTHONHASHSEED/deterministic_repetitions/baseline_fingerprint. Missing: `PIN_TOOLCHAIN` (pinned venv/lockfile), `DEPS_CACHE_DIR` (read-only cached deps), `NETWORK_POLICY` (none\|allowlist); tests. |
-| M-CC-10 | Failure-recovery hardening | PARTIAL | `FAILED_INFRASTRUCTURE` reachable (jobs.py:1722); `QUARANTINED_PROVENANCE` defined but only test-injected. Missing: tool-failure retry→isolate, corruption rollback to last verified checkpoint, lost-worktree reconstruction from content-addressed patch, quarantine machinery; tests/test_recovery.py. |
-| M-CC-11 | Security hardening | PARTIAL | Has supply_chain_scans, bwrap sandbox, reader_injection_defense. Missing: per-job filesystem_policy/network_policy/credential_policy (least-priv short-lived), signed_manifests, sensitivity_classification-before-export. |
+| M-CC-03 | Successor job from immutable completed candidate | DONE | — (`create_successor_job(parent_job_id, instructions)` pins `successor_base_head` to the parent's `committed_sha` (not canonical HEAD), requires parent COMPLETED + committed_sha + worktree; parent preserved immutable; tests/test_checkpoints.py + test_jobs.py) |
+| M-CC-04 | Merge-vs-ratification + separate authz | DONE | — (`ratifications` sidecar table + internal `ratify_candidate` act, distinct from merge (Option A); merge/tag/release/deploy stay prohibited; tests) |
+| M-CC-05 | Branch/PR race-safe idempotency | DONE | — (concurrency test: two `open_pull_request` via asyncio.gather under shared manager + mocked `_gh` → exactly one create + one edit; tests/test_pr.py) |
+| M-CC-06 | Unexpected-files / generated-artifact / submodule detection | DONE | — (configurable `unexpected_paths` policy; flag + reject at commit gate; tests/test_verification.py) |
+| M-CC-07 | Read-only completed-worktree recovery | DONE | — (`worktrees.recover_completed_worktree` re-attaches the vanished completed worktree as a detached checkout at `committed_sha`, re-derives + verifies the candidate fingerprint via `committed_state`, returns `JobWorktree(read_only=True)`; tests) |
+| M-CC-08 | Human control surface | DONE | — (`authorities_in_force` dashboard surface; 6 control tools `pause_development_job`/`extend_budget`/`narrow_scope`/`replace_worker`/`discard_candidate`/`revoke_authorization`, each ProjectCapability-gated, dormant by default; schema locked at 38 tools; tests/test_controls.py + test_server.py/test_checkpoints.py/test_persistence.py canaries) |
+| M-CC-09 | Verification-lab determinism | DONE | — (hermetic `_run_command`: `PIN_TOOLCHAIN` pinned venv, `DEPS_CACHE_DIR` read-only deps cache, `NETWORK_POLICY` none\|allowlist; TZ=UTC/SOURCE_DATE_EPOCH/PYTHONHASHSEED; `verification_deterministic_repetitions` flaky labeling + baseline; tests/test_verification.py) |
+| M-CC-10 | Failure-recovery hardening | DONE | — (`reset_worktree_to_base` corruption rollback, `recreate_detached` lost-worktree reconstruction at `base_head`, `remove` discard; tool-failure retry→isolate as FAILED_INFRASTRUCTURE; quarantine machinery; `job_worktree_meta` table; tests/test_recovery.py) |
+| M-CC-11 | Security hardening | DONE | — (`security.py` filesystem/credential policies, signed manifests, sensitivity classification; bwrap sandbox; supply_chain_scans pre-commit; reader_injection_defense; tests/test_security.py) |
 | M-IN-01 | P3 capability learning & reconstruction | MISSING | Explicitly deferred (non-goal) until R1–R3 prove out. No P3 tables exist. |
 | **X-MCPB-011** | Governed host runtime verification (extra) | DONE | — (RUNTIME_VERIFICATION cap models.py:34; runtime_verification_commands; docs/MCPB-011.md) |
 | **X-MCPB-012** | Working-tree candidate capture (extra) | DONE | — (WORKING_TREE_CANDIDATE_CAPTURE cap models.py:43; docs/MCPB-012.md) |
@@ -1053,27 +1051,25 @@ vision.
 
 ## Recommended next action (2026-08-27)
 
-1. **MCPB-001 → MCPB-012, M-AL-01, all R1 (M-CT-02…07), all R2 (M-EV-01…08),
-   M-GV-01/06/07-reconcile, M-CC-01/02/05-code are shipped.** The CKS-002B
-   blockers (M-CT-04, M-CT-05, M-EV-01) are all closed.
-2. **Close the definitive open set in parallel worktrees**, one capability per
-   commit, merged into `main` in dependency order:
-   - **R3 Governance:** M-GV-02 (named roles), M-GV-03 (apex grounding),
-     M-GV-04 (spec-gated runtime), M-GV-05 (self-cert guard), M-GV-06 tail
-     (capability-subset runtime enforcement), M-GV-07 tail (parallel
-     verify+review).
-   - **Cross-cutting:** M-CC-03 (successor job), M-CC-04 (ratification,
-     Option A), M-CC-05 tail (concurrency test), M-CC-06 (unexpected-files
-     policy), M-CC-07 (completed-worktree recovery), M-CC-08 (control
-     surface), M-CC-09 (lab determinism), M-CC-10 (failure recovery),
-     M-CC-11 tail (fs/credential policy + signed manifests + sensitivity
-     classification).
-   - **M-IN-01 (P3) stays a non-goal.**
-3. Each milestone: implement → run the full core suite
-   (`PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v`) →
-   inspect → commit (AGENTS.md §3). NEW SURFACE milestones add a
+1. **The entire roadmap R1–R3 + Cross-cutting is now DONE.** MCPB-001 → 012,
+   M-AL-01, all R1 (M-CT-02…07), all R2 (M-EV-01…08), all R3 (M-GV-01…07),
+   and all M-CC-01…11 shipped. The 2026-08-27 integration cherry-picked all 22
+   capability commits onto `main` in dependency order; the full suite is green
+   (**572 tests**). The CKS-002B blockers (M-CT-04, M-CT-05, M-EV-01) are all
+   closed.
+2. **No capability gaps remain to close.** Future work is optional hardening:
+   - **M-IN-01 (P3)** stays a non-goal (explicitly deferred).
+   - Optional: run a fresh audit (the 149-item table's P1/P2 rows were
+     verified against pre-integration code; re-verify a few against the merged
+     `main` if new gaps are suspected).
+   - Release/versioning: bump the version (currently `0.10.4` at HEAD through
+     all cherry-picks) to the next appropriate release, per the user's
+     versioning choice.
+3. The build discipline recorded here is now historical: implement → run the
+   full core suite (`PYTHONPATH=src .venv/bin/python -m unittest discover -s
+   tests -v`) → inspect → commit (AGENTS.md §3); NEW SURFACE milestones add a
    `ProjectCapability` + `ToolAnnotations`, dormant by default, and bump the
-   tool-count canary (currently 32).
+   tool-count canary (now 38).
 
 ## Non-goals (explicitly out of scope for the unblock)
 
@@ -1094,17 +1090,21 @@ vision.
 ## How to resume from here
 
 1. Read `docs/MCPB-ROADMAP.md` (this file) first — it is the single source of
-   truth for what is closed, what remains, and the build order.
+   truth for what is closed, what remains, and the build order. As of the
+   2026-08-27 integration, **R1–R3 + Cross-cutting are all DONE**; no
+   capability gaps remain open (M-IN-01/P3 stays a non-goal).
 2. Check `AGENTS.md` "Current resume pointer" for the phase pending
    acceptance, and the canonical accepted-sequence table for what is merged.
 3. Check the memory file `mcpb-roadmap-and-state.md` for the current PR state
    and the next gap.
-4. Pick the next milestone from "Recommended next action" (currently M-EV-01).
-   Branch off `main` (or the latest merged phase branch), follow the
-   additive-table + lazy-import + zero-surface pattern, and add a
+4. If the user asks for new work, branch off `main` and follow the
+   additive-table + lazy-import + zero-surface pattern, adding a
    `test_<area>_adds_no_new_mcp_tools` assertion unless the milestone is
    flagged **NEW SURFACE** (in which case add a new `ProjectCapability`,
-   `ToolAnnotations`, dormant-by-default, and bump the tool-count assertion).
+   `ToolAnnotations`, dormant-by-default, and bump the tool-count assertion,
+   currently 38). Run the full suite
+   (`PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v`) before
+   committing.
 5. Preserve the verbatim security constraints above; route any new push
    surface through the opt-in `push_development_commit` / `open_pull_request`
    path (non-trunk, origin-only, no-force); ChatGPT confirmation remains the

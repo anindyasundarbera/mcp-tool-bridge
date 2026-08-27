@@ -228,16 +228,16 @@ core tests and must be identified as such. Do not fabricate their results.
 
 ## 10. Current resume pointer
 
-Resume by reviewing and accepting **M-AL-01** (read-only introspection) — see
-[`docs/M-AL-01.md`](docs/M-AL-01.md). M-AL-01 adds three dormant-by-default,
-capability-gated read-only introspection tools plus the
-`job_introspection` / `policy_introspection` / `canonical_history_read`
-capabilities (each gated on its prerequisite). It is the agent-lab Phase-0
-enabler, named M-AL-01 (not MCPB-011, which the roadmap reserves for the
-Evidence release M-EV-01).
+**All roadmap capability milestones R1–R3 and Cross-cutting are DONE** as of
+the 2026-08-27 integration: MCPB-001→012, M-AL-01, M-CT-02…07, M-EV-01…08,
+M-GV-01…07, M-CC-01…11 — 22 capability commits cherry-picked onto `main` in
+dependency order; the full suite is green (**572 tests**). See
+[`docs/MCPB-ROADMAP.md`](docs/MCPB-ROADMAP.md) for the authoritative status.
+**M-IN-01 (P3) remains a non-goal.** No capability gaps are open.
 
-Next gap after M-AL-01: Evidence release → requirement traceability (see
-[`docs/MCPB-ROADMAP.md`](docs/MCPB-ROADMAP.md)).
+Next work if requested: release/versioning (HEAD is pinned at `0.10.4`
+through the cherry-picks) or any follow-on hardening; branch off `main` and
+follow §3.
 
 When you land any capability change from this point on, follow §3 and commit
 it; explicitly authorize any desired push, PR, live installation/restart, or
