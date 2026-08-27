@@ -73,6 +73,54 @@
 > `ProjectCapability` (requiring its dependency capability), register a tool
 > with `ToolAnnotations`, and ship off by default.
 
+## Current state (2026-08-27) — supersedes the audit rows below
+
+Verified against the source on 2026-08-27 (grep/symbol evidence, not just
+commit messages). **All R1 Continuity and R2 Evidence milestones are now
+DONE**, and R3/Cross-cutting is substantially advanced:
+
+- **M-CT-02 … M-CT-07 all DONE** — `CLAUDE_HARD_WALL_SECONDS` +
+  compute-proxy (`config.py`), `job_checkpoint_detail` sidecar (`store.py`),
+  `completed_milestones`/`remaining_milestones` (`jobs.py`),
+  `QUARANTINED_PROVENANCE` reachable (`jobs.py:2288`), `diff_summary` +
+  `validation_evidence` (`jobs.py:1512`), `_detect_progress_intelligence`
+  (`jobs.py:892`).
+- **M-EV-01 … M-EV-08 all DONE** — `requirements.py` + `RequirementManager`
+  wired into jobs/snapshots (`requirements_covered` at `jobs.py:1491-1502`),
+  `environment_digest`, bindings sidecars, `verdict_hash` +
+  `revision_resolves_finding`, `source_classifications` +
+  `authority_records`, `export_evidence_bundle`, `nondeterminism_labeled`,
+  `gc_artifacts`.
+- **M-GV-01 DONE** (`authorization.py:AuthorizationManager` + `authorizations`
+  table, wired into server handlers).
+- **M-GV-06 mostly DONE** — `parent_job_id` + `delegation_mandate` on
+  `DevelopmentJob`, store columns, `MAX_DELEGATIONS_PER_JOB`, fail-closed
+  mandate validation + scope bounding (`jobs.py:1282`), `tests/test_delegation.py`
+  (10 cases). **Remaining:** enforce the child's invoked capabilities ⊆
+  mandate `authority` at runtime.
+- **M-GV-07 mostly DONE** — `reconcile_reviews` built + wired into the commit
+  gate with tests (`review.py:1024`, `tests/test_review.py:1409+`).
+  **Remaining:** run verify + independent review concurrently via
+  `asyncio.gather` once the candidate is stable.
+- **M-CC-05 mostly DONE** — `open_pull_request` is discover-then-create/update
+  and race-safe (`pr.py:218`). **Remaining:** the concurrency test
+  (two `open_pull_request` under `asyncio.gather` + mocked `_gh` → exactly one
+  create + one edit).
+- **M-CC-11 partial** — `supply_chain_scans` exist and run pre-commit;
+  missing per-job `filesystem_policy`/`credential_policy`, signed manifests,
+  sensitivity-classification-before-export.
+
+**Definitive open set (the milestones being closed on 2026-08-27):**
+M-GV-02 (named roles), M-GV-03 (apex grounding), M-GV-04 (spec-gated runtime),
+M-GV-05 (self-certification guard), M-GV-06 tail (capability-subset runtime
+enforcement), M-GV-07 tail (parallel verify+review), M-CC-03 (successor job),
+M-CC-04 (ratification, Option A), M-CC-05 tail (concurrency test),
+M-CC-06 (unexpected-files policy), M-CC-07 (completed-worktree recovery),
+M-CC-08 (control surface), M-CC-09 (lab determinism: PIN_TOOLCHAIN /
+DEPS_CACHE_DIR / NETWORK_POLICY / baseline), M-CC-10 (failure-recovery
+hardening), M-CC-11 tail (fs/credential policy, signed manifests, sensitivity
+classification). **M-IN-01 (P3) stays a non-goal.**
+
 ## What MCPB-010 closed (do not rebuild)
 
 - **Resumable checkpoints** — `store.py:91-123` `job_checkpoints`/`job_events`/
@@ -1003,28 +1051,25 @@ milestones — PARTIAL), M-CT-05 (the two dormant states — PARTIAL,
 PARTIAL, not wired in). M-CT-01 is now DONE. Everything else is hardening or
 vision.
 
-## Recommended next action
+## Recommended next action (2026-08-27)
 
-1. **MCPB-001 → MCPB-012 and M-AL-01 are all shipped.** The PR-#5 / merge
-   step is historical.
-2. **Close the three remaining CKS-002B blockers first**, in this order:
-   - **M-CT-04** (atomic milestones): add `completed_milestones`/
-     `remaining_milestones` to `_snapshot` and test the
-     `acceptance_command_id` branches. Small, additive, zero-new-surface.
-   - **M-CT-05** (dormant states): make `_run` enter
-     `QUARANTINED_PROVENANCE` on real provenance corruption and add the
-     stream-json `input required` signal. Zero-new-surface.
-   - **M-EV-01** (requirement traceability): wire the existing
-     `RequirementManager` into jobs/server, surface `requirements_covered`
-     in the snapshots, and implement the full matrix + deferrals. Internal,
-     additive, no new tool.
-3. **Then the R1 Continuity tail** (M-CT-02/03/06/07) — small additive
-   pieces (wall budget, checkpoint rich fields, diff/validation in report,
-   progress intelligence).
-4. **Then R2 Evidence** (M-EV-02 → M-EV-08), then R3 Governance (M-GV-02 →
-   M-GV-07, building on M-GV-01 handler wiring), then Cross-cutting
-   (M-CC-03 → M-CC-11). Defer M-IN-01 (P3) per the priorities above.
-5. Each milestone: implement → run the full core suite
+1. **MCPB-001 → MCPB-012, M-AL-01, all R1 (M-CT-02…07), all R2 (M-EV-01…08),
+   M-GV-01/06/07-reconcile, M-CC-01/02/05-code are shipped.** The CKS-002B
+   blockers (M-CT-04, M-CT-05, M-EV-01) are all closed.
+2. **Close the definitive open set in parallel worktrees**, one capability per
+   commit, merged into `main` in dependency order:
+   - **R3 Governance:** M-GV-02 (named roles), M-GV-03 (apex grounding),
+     M-GV-04 (spec-gated runtime), M-GV-05 (self-cert guard), M-GV-06 tail
+     (capability-subset runtime enforcement), M-GV-07 tail (parallel
+     verify+review).
+   - **Cross-cutting:** M-CC-03 (successor job), M-CC-04 (ratification,
+     Option A), M-CC-05 tail (concurrency test), M-CC-06 (unexpected-files
+     policy), M-CC-07 (completed-worktree recovery), M-CC-08 (control
+     surface), M-CC-09 (lab determinism), M-CC-10 (failure recovery),
+     M-CC-11 tail (fs/credential policy + signed manifests + sensitivity
+     classification).
+   - **M-IN-01 (P3) stays a non-goal.**
+3. Each milestone: implement → run the full core suite
    (`PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v`) →
    inspect → commit (AGENTS.md §3). NEW SURFACE milestones add a
    `ProjectCapability` + `ToolAnnotations`, dormant by default, and bump the
