@@ -18,7 +18,11 @@ from .reader import RepositoryReader
 from .registry import ProjectLockManager, ProjectRegistry
 from .review import ReviewError, ReviewManager
 from .writer import RepositoryWriter, WriteMode
-from .verification import PublicationManager, VerificationCommitManager
+from .verification import (
+    PublicationManager,
+    VerificationCommitManager,
+    VerificationError,
+)
 from .sync import SyncError, SyncManager
 from .runtime_verification import (
     RuntimeVerificationError,
@@ -939,6 +943,47 @@ def create_server(
             project, job_id, ProjectCapability.VERIFICATION_COMMIT
         )
         return await active_verification.verify(project, job_id, expected_head)
+
+    @mcp.tool(
+        name="replay_verification",
+        description=(
+            "Read-only deterministic replay of a recorded verification. Re-runs "
+            "the recorded verification commands in the hermetic lab against the "
+            "recorded base and reports whether the persisted evidence envelope "
+            "(environment digest, per-command digests, outcomes) still "
+            "reproduces. Never writes canonical, candidate, or publication "
+            "state. A command whose definition changed since the verification "
+            "is surfaced as a digest mismatch, never silently re-run. Opt-in "
+            "via the replay_verification project capability (requires "
+            "verification_commit)."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
+    async def replay_verification(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        verification_id: Annotated[
+            str,
+            Field(
+                description="Opaque verification ID returned by verify_development_job.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.REPLAY_VERIFICATION
+        )
+        try:
+            return await active_verification.replay(project, verification_id)
+        except VerificationError as exc:
+            raise ValueError(str(exc)) from exc
 
     @mcp.tool(
         name="list_candidate_changes",

@@ -1154,5 +1154,149 @@ class VerificationCommitTests(unittest.TestCase):
         self.assertIn("expired", message)
 
 
+class TestKindTests(unittest.TestCase):
+    """M-ROADMAP test-kind coverage: kind round-trip, property seeds, mutation
+    stats parsing, and invalid-kind rejection. Additive — the default ``unit``
+    keeps every existing project unchanged."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        initialize_git_repository(self.root)
+        (self.root / "src").mkdir()
+        (self.root / "src" / "marker.py").write_text("VALUE = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "src"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-qm", "Add source"], check=True
+        )
+        # A generous output bound so a 64-hex seed or mutation summary survives.
+        self.settings = Settings.from_env(
+            {
+                "PROJECTS_CONFIG_PATH": str(self.base / "projects.json"),
+                "JOB_WORKTREE_ROOT": str(self.base / "jobs"),
+                "VERIFICATION_COMMAND_TIMEOUT_SECONDS": "2",
+                "MAX_VERIFICATION_OUTPUT_BYTES": "4096",
+            }
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _policy(self, command: list[str], *, kind: str) -> ProjectPolicy:
+        return project(
+            self.root,
+            command,
+            verification_commands=[
+                {
+                    "id": "core",
+                    "argv": command,
+                    "python_path": ["src"],
+                    "kind": kind,
+                }
+            ],
+        )
+
+    async def _verify(
+        self, policy: ProjectPolicy
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        locks = ProjectLockManager()
+        jobs = DevelopmentJobManager(
+            self.settings,
+            locks,
+            EditingExecutor(
+                lambda root: (root / "candidate.txt").write_text(
+                    "candidate", encoding="utf-8"
+                )
+            ),  # type: ignore[arg-type]
+            projects=(policy,),
+        )
+        manager = VerificationCommitManager(
+            self.settings, locks, jobs, projects=(policy,)
+        )
+        started = await jobs.start(policy, "candidate", "high")
+        completed = await wait_completed(jobs, policy, str(started["job_id"]))
+        verified = await manager.verify(
+            policy, str(completed["job_id"]), str(completed["base_head"])
+        )
+        return verified, completed
+
+    def test_each_kind_round_trips_with_kind_in_result(self) -> None:
+        """Every TestKind labels its command result; unit stays the default."""
+        async def run_one(kind: str) -> str:
+            policy = self._policy(["{python}", "-c", "pass"], kind=kind)
+            verified, _ = await self._verify(policy)
+            assert verified["status"] == "passed", verified
+            return str(verified["commands"][0]["kind"])
+
+        for kind in ("unit", "integration", "property", "mutation", "ad_hoc"):
+            self.assertEqual(asyncio.run(run_one(kind)), kind)
+
+    def test_unit_is_the_default_kind(self) -> None:
+        async def exercise() -> str:
+            policy = project(self.root, ["{python}", "-c", "pass"])
+            verified, _ = await self._verify(policy)
+            assert verified["status"] == "passed"
+            return str(verified["commands"][0]["kind"])
+
+        self.assertEqual(asyncio.run(exercise()), "unit")
+
+    def test_property_command_receives_deterministic_seed(self) -> None:
+        """A property command sees PROPERTY_TEST_SEED (64-hex) derived from the
+        base commit + command id, stable across re-verifies."""
+        async def run_one() -> str:
+            policy = self._policy(
+                [
+                    "{python}",
+                    "-c",
+                    "import os; print(os.environ['PROPERTY_TEST_SEED'])",
+                ],
+                kind="property",
+            )
+            verified, _ = await self._verify(policy)
+            assert verified["status"] == "passed", verified
+            return str(verified["commands"][0]["stdout"]["text"]).strip()
+
+        seed_a = asyncio.run(run_one())
+        seed_b = asyncio.run(run_one())
+        self.assertRegex(seed_a, r"^[0-9a-f]{64}$")
+        self.assertEqual(seed_a, seed_b)
+
+    def test_mutation_output_parses_into_stats(self) -> None:
+        async def exercise() -> dict[str, Any]:
+            policy = self._policy(
+                [
+                    "{python}",
+                    "-c",
+                    "print('Killed: 5'); print('Survived: 1'); "
+                    "print('Percentage: 83.3%')",
+                ],
+                kind="mutation",
+            )
+            verified, _ = await self._verify(policy)
+            assert verified["status"] == "passed", verified
+            return dict(verified["commands"][0]["mutation_stats"])
+
+        stats = asyncio.run(exercise())
+        self.assertEqual(stats, {"killed": 5, "survived": 1, "kill_ratio": 83.3})
+
+    def test_unparseable_mutation_output_yields_none(self) -> None:
+        """Advisory: a mutation command whose output cannot be parsed reports
+        mutation_stats=None rather than failing the verification."""
+        async def exercise() -> None:
+            policy = self._policy(
+                ["{python}", "-c", "print('hello world')"], kind="mutation"
+            )
+            verified, _ = await self._verify(policy)
+            assert verified["status"] == "passed", verified
+            self.assertIsNone(verified["commands"][0]["mutation_stats"])
+
+        asyncio.run(exercise())
+
+    def test_invalid_kind_rejected_at_policy_validation(self) -> None:
+        with self.assertRaises(Exception):
+            self._policy(["{python}", "-c", "pass"], kind="bogus")
+
+
 if __name__ == "__main__":
     unittest.main()

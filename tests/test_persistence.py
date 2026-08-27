@@ -330,9 +330,10 @@ class PersistenceTests(unittest.TestCase):
             tools = {tool.name for tool in asyncio.run(server.list_tools())}
 
         # Persistence is internal; it must not add any MCP tool. The count is the
-        # current tool surface (33 after the M-CC-08 human control surface added
-        # pause_development_job); persistence itself adds none.
-        self.assertEqual(len(tools), 38)
+        # current tool surface (39 after the M-CC-08 human control surface and
+        # the roadmap-partial replay_verification tool); persistence itself adds
+        # none.
+        self.assertEqual(len(tools), 39)
         for leaked in ("persist_job", "reload_jobs"):
             self.assertNotIn(leaked, tools)
         # resume still takes job_id, never session_id.

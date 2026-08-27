@@ -938,7 +938,7 @@ class PauseDevelopmentJobTests(unittest.TestCase):
 
 
 class ControlSurfaceSchemaTests(unittest.TestCase):
-    """Final M-CC-08 schema lock: 38 tools with the six controls present."""
+    """Final M-CC-08 schema lock: 39 tools with the six controls present."""
 
     def test_control_surface_is_registered_with_expected_annotations(self) -> None:
         async def exercise() -> dict[str, Any]:
@@ -955,7 +955,7 @@ class ControlSurfaceSchemaTests(unittest.TestCase):
 
         tools = asyncio.run(exercise())
         self.assertEqual(
-            len(tools), 38, "control surface must lock the tool count at 38"
+            len(tools), 39, "control surface must lock the tool count at 39"
         )
         controls = {
             "pause_development_job": (False, False, True),

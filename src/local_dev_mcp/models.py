@@ -11,6 +11,27 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 Effort = Literal["high", "ultracode"]
 
 
+class TestKind(StrEnum):
+    """Test-kind label for one verification command (M-ROADMAP).
+
+    ``unit`` and ``integration`` run the fixed argv in the hermetic lab
+    unchanged; ``unit`` is the default, so every existing project is
+    unaffected. ``property`` runs the argv with a deterministic
+    ``PROPERTY_TEST_SEED`` (and ``HYPOTHESIS_SEED``) injected so property-based
+    runs are reproducible and broadened across deterministic repetitions.
+    ``mutation`` runs the declared mutation command and best-effort parses its
+    kill ratio into ``mutation_stats`` (unparseable output is non-fatal).
+    ``ad_hoc`` labels a one-off bounded run. The label is surfaced per command
+    in the verification result so test-kind coverage is observable.
+    """
+
+    UNIT = "unit"
+    INTEGRATION = "integration"
+    PROPERTY = "property"
+    MUTATION = "mutation"
+    AD_HOC = "ad_hoc"
+
+
 class ProjectCapability(StrEnum):
     REPOSITORY_READ = "repository_read"
     MARKDOWN_WRITE = "markdown_write"
@@ -56,6 +77,15 @@ class ProjectCapability(StrEnum):
     REPLACE_WORKER = "replace_worker"
     DISCARD_CANDIDATE = "discard_candidate"
     REVOKE_AUTHORIZATION = "revoke_authorization"
+    # M-ROADMAP: deterministic replay of a recorded verification. The
+    # ``replay_verification`` tool re-runs a recorded verification's commands in
+    # the hermetic lab against the recorded base and reports whether the
+    # persisted evidence envelope (environment digest, per-command digests,
+    # outcomes) still reproduces. Read-only (never writes canonical, candidate,
+    # or publication state). Dormant by default; requires verification_commit —
+    # replaying is re-running verification commands, the same authority surface
+    # a project already grants for verification.
+    REPLAY_VERIFICATION = "replay_verification"
 
 
 def _policy_path(value: str) -> str:
@@ -271,6 +301,10 @@ class VerificationCommand(BaseModel):
     argv: tuple[str, ...]
     python_path: tuple[str, ...] = ()
     sandbox: bool = False
+    # M-ROADMAP: test-kind label (additive; defaults to unit so every existing
+    # project is unchanged). Folds into the command/environment digests only
+    # when non-unit, so unit digests stay byte-identical.
+    kind: TestKind = TestKind.UNIT
 
     @field_validator("argv", mode="before")
     @classmethod
@@ -865,6 +899,14 @@ class ProjectPolicy(BaseModel):
             and ProjectCapability.PUSH_DEVELOPMENT_COMMIT not in self.capabilities
         ):
             raise ValueError("open_pull_request requires push_development_commit")
+        # M-ROADMAP: deterministic replay is read-only but re-runs verification
+        # commands, so it must never widen the authorization boundary beyond the
+        # project's existing verification grant.
+        if (
+            ProjectCapability.REPLAY_VERIFICATION in self.capabilities
+            and ProjectCapability.VERIFICATION_COMMIT not in self.capabilities
+        ):
+            raise ValueError("replay_verification requires verification_commit")
         # M-AL-01 introspection capabilities: read-only observation gated on the
         # prerequisite mutation/read capability they introspect, so a project
         # cannot introspect a surface it is not already authorized to use.

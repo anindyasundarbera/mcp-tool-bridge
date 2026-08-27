@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import secrets
 import signal
 import stat
@@ -20,7 +21,7 @@ from . import store
 from .config import Settings
 from .git import GitCommandError, run_git
 from .jobs import DevelopmentJobError, DevelopmentJobManager
-from .models import ProjectPolicy, SupplyChainCommand, VerificationCommand
+from .models import ProjectPolicy, SupplyChainCommand, TestKind, VerificationCommand
 from .registry import ProjectLockManager
 from .worktrees import GitWorktreeManager, JobWorktree, WorktreeError
 
@@ -96,11 +97,15 @@ def _command_digest(command: VerificationCommand) -> str:
     vector), not the expanded argv (``{python}`` substitution, sandbox
     wrapping, PYTHONPATH injection), so it is stable across runs and does not
     leak absolute paths. A changed argv or id therefore changes the digest.
+    The test ``kind`` (M-ROADMAP) folds in only when non-unit, so unit
+    digests stay byte-identical to pre-kind records.
     """
     digest = hashlib.sha256()
     digest.update(_frame(command.id.encode("utf-8")))
     for argument in command.argv:
         digest.update(_frame(argument.encode("utf-8")))
+    if command.kind is not TestKind.UNIT:
+        digest.update(_frame(command.kind.value.encode("utf-8")))
     return digest.hexdigest()
 
 
@@ -130,6 +135,8 @@ def compute_environment_digest(
         digest.update(_frame(command.id.encode("utf-8")))
         for argument in command.argv:
             digest.update(_frame(argument.encode("utf-8")))
+        if command.kind is not TestKind.UNIT:
+            digest.update(_frame(command.kind.value.encode("utf-8")))
     if toolchain_pin_digest is not None:
         digest.update(_frame(b"toolchain"))
         digest.update(_frame(toolchain_pin_digest.encode("ascii")))
@@ -1353,6 +1360,48 @@ def _credential_names(project: ProjectPolicy) -> tuple[str, ...]:
     )
 
 
+def _parse_mutation_stats(result: dict[str, Any]) -> dict[str, Any] | None:
+    """Best-effort parse of mutation-testing output (M-ROADMAP test-kind).
+
+    Recognises the conventional mutmut ``Killed`` / ``Survived`` summary lines
+    and a ``Percentage`` coverage line in stdout or stderr. Returns
+    ``{"killed": int, "survived": int, "kill_ratio": float}`` when parseable,
+    else ``None`` — mutation coverage is advisory, never fatal.
+    """
+    texts: list[str] = []
+    for stream in (result.get("stdout"), result.get("stderr")):
+        if isinstance(stream, str):
+            texts.append(stream)
+        elif isinstance(stream, dict):
+            text = stream.get("text")
+            if isinstance(text, str):
+                texts.append(text)
+    output = "\n".join(texts)
+    killed: int | None = None
+    survived: int | None = None
+    kill_ratio: float | None = None
+    for line in output.splitlines():
+        if killed is None:
+            match = re.search(r"\bKilled[:\s]+(\d+)", line)
+            if match:
+                killed = int(match.group(1))
+        if survived is None:
+            match = re.search(r"\bSurvived[:\s]+(\d+)", line)
+            if match:
+                survived = int(match.group(1))
+        if kill_ratio is None:
+            match = re.search(r"\bPercentage[:\s]*([\d.]+)\s*%", line)
+            if match:
+                kill_ratio = float(match.group(1))
+    if killed is None and survived is None and kill_ratio is None:
+        return None
+    return {
+        "killed": killed,
+        "survived": survived,
+        "kill_ratio": kill_ratio,
+    }
+
+
 async def _run_command(
     settings: Settings,
     worktree: JobWorktree,
@@ -1360,6 +1409,7 @@ async def _run_command(
     *,
     project: ProjectPolicy | None = None,
     credential_names: tuple[str, ...] = (),
+    property_seed: str | None = None,
 ) -> dict[str, Any]:
     """Run one verification command under the hermetic lab, opt-in per project.
 
@@ -1374,11 +1424,19 @@ async def _run_command(
       the sandbox.
     The fail-closed cases return a failed command result (no exit code), which
     fails the whole verification without granting any commit authority.
+    M-ROADMAP: a ``property`` test-kind command receives a deterministic seed
+    (``PROPERTY_TEST_SEED``, plus ``HYPOTHESIS_SEED`` when a Hypothesis-style
+    runner is used) so its runs are reproducible.
     """
     python_path = _python_paths(worktree.path, command.python_path)
     extra_env: dict[str, str] | None = (
         {"PYTHONPATH": python_path} if python_path is not None else None
     )
+    if property_seed is not None:
+        merged = dict(extra_env) if extra_env is not None else {}
+        merged["PROPERTY_TEST_SEED"] = property_seed
+        merged["HYPOTHESIS_SEED"] = property_seed
+        extra_env = merged
     argv = list(command.argv)
 
     hosts_file: str | None = None
@@ -1646,13 +1704,26 @@ class VerificationCommitManager:
                     # diverge, label the verification as nondeterministic and
                     # degrade the infrastructure status.
                     first: dict[str, Any] | None = None
-                    for _ in range(repetitions):
+                    for repetition in range(repetitions):
+                        # M-ROADMAP: a property command runs with a
+                        # deterministic seed derived from the base commit + its
+                        # own id (repetition-suffixed so each repetition widens
+                        # coverage without losing reproducibility).
+                        property_seed: str | None = None
+                        if command.kind is TestKind.PROPERTY:
+                            seed_source = f"{before.base_head}:{command.id}"
+                            if repetitions > 1:
+                                seed_source = f"{seed_source}:{repetition}"
+                            property_seed = hashlib.sha256(
+                                seed_source.encode("utf-8")
+                            ).hexdigest()
                         result = await _run_command(
                             self.settings,
                             worktree,
                             command,
                             project=project,
                             credential_names=_credential_names(project),
+                            property_seed=property_seed,
                         )
                         bounded = _bound_redacted_output(
                             _redact(result, redacted_paths),
@@ -1665,10 +1736,15 @@ class VerificationCommitManager:
                     # M-EV-02: per-command structured fields (additive aliases +
                     # digest). ``id`` aliases the existing ``command_id``;
                     # ``command_digest`` is the SHA-256 over the declared argv
-                    # so a changed command vector is detectable.
+                    # so a changed command vector is detectable. M-ROADMAP: the
+                    # test-kind label rides on every command result, and a
+                    # mutation command's parsed stats (advisory) when available.
                     if first is not None:
                         first["id"] = first.get("command_id", command.id)
                         first["command_digest"] = _command_digest(command)
+                        first["kind"] = command.kind.value
+                        if command.kind is TestKind.MUTATION:
+                            first["mutation_stats"] = _parse_mutation_stats(first)
                     command_results.append(first)
                 results = tuple(command_results)
                 after = await self._candidate_state_or_rollback(
@@ -1776,6 +1852,195 @@ class VerificationCommitManager:
             if record.used:
                 raise VerificationError("verification_id has already been used")
             return record
+
+    async def replay(
+        self,
+        project: ProjectPolicy,
+        verification_id: str,
+    ) -> dict[str, Any]:
+        """M-ROADMAP: re-run a recorded verification read-only (deterministic replay).
+
+        A recorded verification persists its ``environment_digest``, per-command
+        ``command_digest``, and outcomes — but nothing ever re-runs it. This
+        method re-runs the recorded commands in the hermetic lab (the SAME
+        ``_run_command``/``_run_exec`` path ``verify()`` uses, so replay inherits
+        PIN_TOOLCHAIN / DEPS_CACHE_DIR / NETWORK_POLICY / bwrap / deterministic
+        env) against a fresh read-only detached checkout at the recorded
+        ``base_head``, then reports whether the persisted evidence envelope
+        still reproduces.
+
+        Replay does NOT re-derive the candidate worktree or re-verify content —
+        that is ``verify()``. A command whose outcome depends on the candidate's
+        un-persisted edits is reported honestly as not reproducing from the
+        persisted envelope alone. Command argv edits since the verification are
+        surfaced as digest mismatches and are never silently re-run. No
+        canonical, candidate, or publication state is written.
+        """
+        async with self._records_lock:
+            record = self._records.get(verification_id)
+            if record is None:
+                raise VerificationError("unknown verification_id")
+            if record.project_id != project.id:
+                raise VerificationError(
+                    "verification_id does not belong to this project"
+                )
+
+        # Recompute the environment digest over the project's CURRENT declared
+        # commands + toolchain pin. A changed command set or pin therefore
+        # surfaces as an environment digest mismatch — never a silent re-run.
+        toolchain_pin_digest = (
+            _toolchain_pin_digest(project.toolchain_pin)
+            if project.toolchain_pin is not None
+            else None
+        )
+        recomputed_env_digest = compute_environment_digest(
+            project.verification_commands,
+            toolchain_pin_digest=toolchain_pin_digest,
+        )
+        environment_match = (
+            record.environment_digest is not None
+            and record.environment_digest == recomputed_env_digest
+        )
+
+        declared = {command.id: command for command in project.verification_commands}
+        # A deterministic per-record path; a stale replay worktree (from a hard
+        # crash) is removed first so replay is repeat-safe.
+        replay_job_id = f"replay-{record.verification_id[:12]}"
+        replay_path = (
+            self._worktrees._root_for(project) / project.id / replay_job_id
+        )
+        try:
+            await self._worktrees.remove(
+                project,
+                JobWorktree(
+                    path=replay_path,
+                    base_head=record.base_head,
+                    read_only=True,
+                ),
+            )
+            replay_worktree = await self._worktrees.recreate_detached(
+                project, replay_job_id, record.base_head
+            )
+        except WorktreeError as exc:
+            raise VerificationError(str(exc)) from exc
+        replay_worktree = JobWorktree(
+            path=replay_worktree.path,
+            base_head=replay_worktree.base_head,
+            read_only=True,
+        )
+        redacted_paths = (
+            replay_worktree.path,
+            project.root,
+            self.settings.job_worktree_root,
+            self.settings.projects_config_path,
+            *self._project_roots,
+        )
+
+        notes: list[str] = []
+        command_entries: list[dict[str, Any]] = []
+        try:
+            for recorded_command in record.commands:
+                command_id = recorded_command.get("id") or recorded_command.get(
+                    "command_id"
+                )
+                entry: dict[str, Any] = {
+                    "command_id": command_id,
+                    "reconstructed": False,
+                    "digest_match": False,
+                    "result_match": False,
+                    "replayed_status": None,
+                    "replayed_exit_code": None,
+                    "notes": [],
+                }
+                command = declared.get(command_id) if command_id else None
+                if command is None:
+                    entry["notes"].append(
+                        "no declared verification command with this id exists today; "
+                        "not re-run"
+                    )
+                    command_entries.append(entry)
+                    continue
+                entry["reconstructed"] = True
+                entry["kind"] = command.kind.value
+                digest_match = (
+                    _command_digest(command)
+                    == recorded_command.get("command_digest")
+                )
+                entry["digest_match"] = digest_match
+                if not digest_match:
+                    entry["notes"].append(
+                        "command argv/id changed since the verification was "
+                        "recorded; not re-run"
+                    )
+                    command_entries.append(entry)
+                    continue
+                # M-ROADMAP: replay a property command under the same
+                # deterministic seed verify() used (the recorded result is the
+                # first repetition, whose seed carries no repetition suffix), so
+                # its replay is reproducible.
+                property_seed: str | None = None
+                if command.kind is TestKind.PROPERTY:
+                    property_seed = hashlib.sha256(
+                        f"{record.base_head}:{command.id}".encode("utf-8")
+                    ).hexdigest()
+                result = await _run_command(
+                    self.settings,
+                    replay_worktree,
+                    command,
+                    project=project,
+                    credential_names=_credential_names(project),
+                    property_seed=property_seed,
+                )
+                bounded = _bound_redacted_output(
+                    _redact(result, redacted_paths),
+                    self.settings.max_verification_output_bytes,
+                )
+                entry["replayed_status"] = bounded.get("status")
+                entry["replayed_exit_code"] = bounded.get("exit_code")
+                entry["result_match"] = (
+                    bounded.get("status") == recorded_command.get("status")
+                    and bounded.get("exit_code") == recorded_command.get("exit_code")
+                )
+                if not entry["result_match"]:
+                    entry["notes"].append(
+                        "replayed outcome differs from the recorded outcome "
+                        "(replay runs against the recorded base, not the candidate)"
+                    )
+                command_entries.append(entry)
+        finally:
+            try:
+                await self._worktrees.remove(project, replay_worktree)
+            except WorktreeError:
+                # Cleanup is best-effort: a leftover read-only replay checkout is
+                # never trusted, only removed on a later replay of the same id.
+                pass
+
+        reproducible = environment_match and all(
+            entry["reconstructed"]
+            and entry["digest_match"]
+            and entry["result_match"]
+            for entry in command_entries
+        )
+        if not environment_match:
+            notes.append(
+                "environment digest differs: the recorded verification ran in a "
+                "different environment (interpreter, deterministic env keys, "
+                "command definitions, or toolchain pin)"
+            )
+        return {
+            "verification_id": record.verification_id,
+            "project_id": record.project_id,
+            "job_id": record.job_id,
+            "base_head": record.base_head,
+            "environment_digest": {
+                "recorded": record.environment_digest,
+                "recomputed": recomputed_env_digest,
+                "match": environment_match,
+            },
+            "commands": command_entries,
+            "reproducible": reproducible,
+            "notes": notes,
+        }
 
     async def commit(
         self,
