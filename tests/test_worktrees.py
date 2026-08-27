@@ -1,9 +1,11 @@
 import asyncio
+import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
+from local_dev_mcp import verification as verification_module
 from local_dev_mcp.config import Settings
 from local_dev_mcp.models import ProjectPolicy
 from local_dev_mcp.worktrees import GitWorktreeManager, WorktreeError
@@ -275,6 +277,240 @@ class StaleBaseGuardTests(unittest.TestCase):
             self.manager.create(self.project, "d" * 32, requested_base=tip)
         )
         self.assertEqual(worktree.base_head, tip.lower())
+
+
+class CompletedWorktreeRecoveryTests(unittest.TestCase):
+    """M-CC-07: read-only recovery of a vanished completed worktree."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        initialize_git_repository(self.root)
+        self.settings = settings(self.base)
+        self.manager = GitWorktreeManager(self.settings)
+        self.project = ProjectPolicy.model_validate(
+            {
+                "id": "test-project",
+                "display_name": "Test Project",
+                "description": "Worktree recovery tests",
+                "root": str(self.root),
+                "capabilities": ["repository_read", "claude_edit"],
+                "commit_roots": ["."],
+            }
+        )
+        self.job_id = "a1" * 16
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _committed_candidate(self) -> dict[str, object]:
+        """Create a detached candidate commit in a job worktree.
+
+        Returns the verification-style metadata recovery needs: ``base_head``,
+        ``committed_sha``, ``paths``, and the ``_candidate_state`` fingerprint
+        verification would have recorded before the commit.
+        """
+        worktree = asyncio.run(self.manager.create(self.project, self.job_id))
+        (worktree.path / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+        state = asyncio.run(
+            verification_module._candidate_state(
+                self.settings, self.project, worktree
+            )
+        )
+        subprocess.run(
+            ["git", "-C", str(worktree.path), "add", "candidate.txt"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(worktree.path), "commit", "-qm", "candidate"],
+            check=True,
+        )
+        committed_sha = subprocess.run(
+            ["git", "-C", str(worktree.path), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        return {
+            "worktree": worktree,
+            "base_head": worktree.base_head,
+            "committed_sha": committed_sha,
+            "paths": state.paths,
+            "fingerprint": state.fingerprint,
+        }
+
+    def _refs(self) -> str:
+        return subprocess.run(
+            ["git", "-C", str(self.root), "for-each-ref"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+    def test_recovers_vanished_completed_worktree_read_only(self) -> None:
+        candidate = self._committed_candidate()
+        worktree = candidate["worktree"]
+        base_head = str(candidate["base_head"])
+        committed_sha = str(candidate["committed_sha"])
+        paths = tuple(candidate["paths"])
+        fingerprint = str(candidate["fingerprint"])
+        canonical_head_before = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        refs_before = self._refs()
+
+        # The completed worktree vanishes (e.g. a manual rm -rf of the job dir).
+        shutil.rmtree(worktree.path)
+
+        recovered = asyncio.run(
+            self.manager.recover_completed_worktree(
+                self.project,
+                self.job_id,
+                committed_sha,
+                base_head,
+                paths,
+                fingerprint,
+            )
+        )
+
+        # Exposed read-only, re-attached at the original job path.
+        self.assertTrue(recovered.read_only)
+        self.assertEqual(recovered.base_head, base_head.lower())
+        self.assertEqual(
+            recovered.path,
+            (self.settings.job_worktree_root / "test-project" / self.job_id).resolve(),
+        )
+        recovered_head = subprocess.run(
+            ["git", "-C", str(recovered.path), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertEqual(recovered_head, committed_sha.lower())
+        branch = subprocess.run(
+            ["git", "-C", str(recovered.path), "branch", "--show-current"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertEqual(branch, "")
+        status = subprocess.run(
+            ["git", "-C", str(recovered.path), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        self.assertEqual(status, "")
+
+        # The recovered checkout re-derives the verified candidate fingerprint.
+        rederived = asyncio.run(
+            verification_module.committed_state(
+                self.settings,
+                self.project,
+                recovered,
+                committed_sha,
+                base_head,
+                paths,
+            )
+        )
+        self.assertEqual(rederived.fingerprint, fingerprint)
+
+        # Canonical checkout is untouched: HEAD unchanged, clean, no new refs.
+        canonical_head_after = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertEqual(canonical_head_after, canonical_head_before)
+        self.assertEqual(self._refs(), refs_before)
+        self.assertEqual(
+            subprocess.run(
+                ["git", "-C", str(self.root), "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout,
+            "",
+        )
+
+    def test_recover_rejects_mismatched_fingerprint_and_cleans_up(self) -> None:
+        candidate = self._committed_candidate()
+        worktree = candidate["worktree"]
+        base_head = str(candidate["base_head"])
+        committed_sha = str(candidate["committed_sha"])
+        paths = tuple(candidate["paths"])
+        shutil.rmtree(worktree.path)
+
+        bogus = "0" * 64
+        with self.assertRaisesRegex(WorktreeError, "fingerprint"):
+            asyncio.run(
+                self.manager.recover_completed_worktree(
+                    self.project,
+                    self.job_id,
+                    committed_sha,
+                    base_head,
+                    paths,
+                    bogus,
+                )
+            )
+        # The partially-created checkout was removed; no stale registration.
+        self.assertFalse(worktree.path.exists())
+        self.assertNotIn(
+            self.job_id,
+            subprocess.run(
+                ["git", "-C", str(self.root), "worktree", "list", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout,
+        )
+
+    def test_recover_rejects_existing_path(self) -> None:
+        candidate = self._committed_candidate()
+        base_head = str(candidate["base_head"])
+        committed_sha = str(candidate["committed_sha"])
+        paths = tuple(candidate["paths"])
+        fingerprint = str(candidate["fingerprint"])
+        # The job worktree still exists (it never vanished): recovery must refuse.
+        with self.assertRaisesRegex(WorktreeError, "already exists"):
+            asyncio.run(
+                self.manager.recover_completed_worktree(
+                    self.project,
+                    self.job_id,
+                    committed_sha,
+                    base_head,
+                    paths,
+                    fingerprint,
+                )
+            )
+
+    def test_recover_rejects_invalid_job_id_and_sha(self) -> None:
+        with self.assertRaisesRegex(WorktreeError, "invalid job_id"):
+            asyncio.run(
+                self.manager.recover_completed_worktree(
+                    self.project,
+                    "../escape",
+                    "a" * 40,
+                    "a" * 40,
+                    ("candidate.txt",),
+                    "b" * 64,
+                )
+            )
+        with self.assertRaisesRegex(WorktreeError, "40-character hex"):
+            asyncio.run(
+                self.manager.recover_completed_worktree(
+                    self.project,
+                    self.job_id,
+                    "not-a-sha",
+                    "a" * 40,
+                    ("candidate.txt",),
+                    "b" * 64,
+                )
+            )
 
 
 if __name__ == "__main__":

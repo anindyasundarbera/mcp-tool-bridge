@@ -18,6 +18,11 @@ class WorktreeError(RuntimeError):
 class JobWorktree:
     path: Path
     base_head: str
+    # M-CC-07: recovered completed worktrees are exposed read-only. The flag is
+    # additive (defaults False) so every existing construction is untouched; a
+    # read-only worktree is a detached checkout of an immutable committed
+    # candidate and must never be used as a resume/verify target.
+    read_only: bool = False
 
 
 def _is_within(path: Path, parent: Path) -> bool:
@@ -663,3 +668,172 @@ class GitWorktreeManager:
             raise WorktreeError("job path is no longer a Git worktree root")
         if actual_head != worktree.base_head:
             raise WorktreeError("job worktree HEAD moved since the job started")
+
+    async def recover_completed_worktree(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        committed_sha: str,
+        base_head: str,
+        paths: tuple[str, ...],
+        expected_fingerprint: str,
+    ) -> JobWorktree:
+        """Re-attach a vanished completed worktree read-only (M-CC-07).
+
+        Recreates the completed job's isolated worktree as a detached checkout
+        of the bridge-created ``committed_sha`` (the immutable committed
+        candidate), then re-derives the candidate fingerprint from the committed
+        object and proves it matches the verified ``expected_fingerprint``. The
+        recreated worktree is exposed READ-ONLY: no branch is created, no refs
+        are mutated, and the canonical checkout is never written. The only
+        mutations are git worktree administrative entries — ``worktree prune``
+        clears the stale registration left behind by the vanished directory so
+        ``worktree add --detach`` can register the new checkout at the original
+        job path. The returned ``JobWorktree`` carries ``read_only=True``.
+
+        ``base_head`` and ``expected_fingerprint`` must be the exact values
+        recorded at verification time (the verification record's ``base_head``
+        and ``diff_fingerprint``), and ``paths`` the verified ordered path list;
+        a mismatch fails closed rather than exposing unverified content.
+        """
+        # Lazy import breaks the verification<->worktrees module cycle
+        # (verification imports worktrees at module load). Done at the top of
+        # the method so the names are bound before any except clause runs.
+        from .verification import VerificationError, committed_state
+
+        root = self._root_for(project)
+        project_directory = _ensure_private_directory(root / project.id)
+        path = project_directory / job_id
+        if path.exists() or path.is_symlink():
+            raise WorktreeError("job worktree path already exists")
+        if not job_id or "/" in job_id or "\\" in job_id or job_id in {".", ".."}:
+            raise WorktreeError("invalid job_id")
+        target = committed_sha.lower()
+        if len(target) != 40 or any(
+            character not in "0123456789abcdef" for character in target
+        ):
+            raise WorktreeError("committed_sha must be a 40-character hex SHA-1")
+        if not paths:
+            raise WorktreeError("cannot recover a candidate with no changed paths")
+
+        timeout = self.settings.git_command_timeout_seconds
+        canonical_head = await run_git(
+            project.root,
+            "rev-parse",
+            "--verify",
+            "HEAD",
+            timeout_seconds=timeout,
+        )
+        created = False
+        completed = False
+        try:
+            # Drop the stale worktree registration whose working tree vanished
+            # so ``worktree add`` can re-attach at the original job path. Only
+            # registrations whose worktree directory is missing are pruned;
+            # live worktrees, refs, and the canonical checkout are untouched.
+            await run_git(
+                project.root,
+                "worktree",
+                "prune",
+                timeout_seconds=timeout,
+            )
+            await run_git(
+                project.root,
+                "worktree",
+                "add",
+                "--detach",
+                "--",
+                str(path),
+                target,
+                timeout_seconds=timeout,
+            )
+            created = True
+
+            resolved = path.resolve(strict=True)
+            if resolved.parent != project_directory.resolve(strict=True):
+                raise WorktreeError("job worktree escaped the configured worktree root")
+            worktree_root = await run_git(
+                resolved,
+                "rev-parse",
+                "--show-toplevel",
+                timeout_seconds=timeout,
+            )
+            worktree_head = await run_git(
+                resolved,
+                "rev-parse",
+                "--verify",
+                "HEAD",
+                timeout_seconds=timeout,
+            )
+            worktree_status = await run_git(
+                resolved,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                timeout_seconds=timeout,
+            )
+            branch = await run_git(
+                resolved,
+                "branch",
+                "--show-current",
+                timeout_seconds=timeout,
+            )
+            after_canonical_head = await run_git(
+                project.root,
+                "rev-parse",
+                "--verify",
+                "HEAD",
+                timeout_seconds=timeout,
+            )
+            if Path(worktree_root).resolve(strict=True) != resolved:
+                raise WorktreeError("created job path is not a Git worktree root")
+            if worktree_head.lower() != target:
+                raise WorktreeError(
+                    "recovered worktree HEAD does not match the committed candidate"
+                )
+            if worktree_status or branch:
+                raise WorktreeError(
+                    "recovered worktree is not a clean detached checkout"
+                )
+            if after_canonical_head.lower() != canonical_head.lower():
+                raise WorktreeError("canonical HEAD moved during recovery")
+
+            # Re-derive the candidate fingerprint from the committed object and
+            # compare it against the fingerprint recorded at verification time.
+            recovered_state = await committed_state(
+                self.settings,
+                project,
+                JobWorktree(path=resolved, base_head=base_head.lower()),
+                target,
+                base_head.lower(),
+                paths,
+            )
+            if recovered_state.fingerprint.lower() != expected_fingerprint.lower():
+                raise WorktreeError(
+                    "recovered worktree fingerprint does not match the verified candidate"
+                )
+            completed = True
+            return JobWorktree(
+                path=resolved,
+                base_head=base_head.lower(),
+                read_only=True,
+            )
+        except (GitCommandError, VerificationError, OSError) as exc:
+            raise WorktreeError(str(exc)) from exc
+        finally:
+            if created and not completed:
+                # Git may have registered a partially-created worktree. A forced
+                # removal is safe here because this path was allocated by this call
+                # and has not been handed to any caller.
+                try:
+                    await run_git(
+                        project.root,
+                        "worktree",
+                        "remove",
+                        "--force",
+                        "--",
+                        str(path),
+                        timeout_seconds=timeout,
+                    )
+                except (GitCommandError, OSError):
+                    pass
