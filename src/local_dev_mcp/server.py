@@ -705,6 +705,55 @@ def create_server(
         )
 
     @mcp.tool(
+        name="narrow_scope",
+        description=(
+            "Reduce a development job's allowed changed-path set to the given "
+            "relative, non-traversal paths. Narrowing is monotonic: when a scope "
+            "is already in force the allowed set becomes the intersection, so "
+            "repeated calls can only shrink it. Paths must be relative and must "
+            "not name hidden, protected, or parent-directory entries. Records a "
+            "control_narrow_scope audit event. Opt-in via the narrow_scope "
+            "project capability."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
+    async def narrow_scope(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        job_id: Annotated[
+            str,
+            Field(
+                description="Opaque job ID returned by send_to_local_dev.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+        paths: Annotated[
+            list[str],
+            Field(description="Relative allowed paths the candidate may touch."),
+        ],
+        reason: Annotated[
+            str | None,
+            Field(
+                description="Optional free-text justification for the audit record.",
+                max_length=2000,
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.NARROW_SCOPE
+        )
+        return await active_jobs.narrow_scope(
+            project, job_id, paths=paths, reason=reason
+        )
+
+    @mcp.tool(
         name="verify_development_job",
         description=(
             "Run only the fixed verification commands configured for a completed "

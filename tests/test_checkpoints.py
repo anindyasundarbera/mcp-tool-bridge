@@ -1186,6 +1186,7 @@ class CheckpointStoreTests(unittest.TestCase):
                 self.assertIn("wall_seconds_used", columns)
                 self.assertIn("pause_requested", columns)
                 self.assertIn("manual_extensions_granted", columns)
+                self.assertIn("scope_paths_json", columns)
                 # The progress upsert that crashed on the live server now works.
                 upsert_progress_row(
                     connection,
@@ -1205,6 +1206,7 @@ class CheckpointStoreTests(unittest.TestCase):
                         "parent_job_id": None,
                         "delegation_mandate_json": None,
                         "successor_base_head": None,
+                        "scope_paths_json": None,
                         "updated_at": "2026-08-12T00:00:00Z",
                     },
                 )
@@ -1237,6 +1239,7 @@ class CheckpointStoreTests(unittest.TestCase):
                         "parent_job_id": None,
                         "delegation_mandate_json": None,
                         "successor_base_head": None,
+                        "scope_paths_json": None,
                         "updated_at": "2026-08-12T00:00:01Z",
                     },
                 )
@@ -1693,10 +1696,10 @@ class ContinuityToolSurfaceTests(unittest.TestCase):
             tools = {tool.name for tool in _asyncio.run(server.list_tools())}
 
         # Continuity is internal to the job lifecycle: it must not add tools.
-        # The count is the current tool surface (34: the M-CC-08 human control
-        # surface added pause_development_job and extend_budget); continuity
-        # itself adds none.
-        self.assertEqual(len(tools), 34)
+        # The count is the current tool surface (35: the M-CC-08 human control
+        # surface added pause_development_job, extend_budget, and narrow_scope);
+        # continuity itself adds none.
+        self.assertEqual(len(tools), 35)
         for leaked in (
             "checkpoint_development_job",
             "extend_development_job",
@@ -1707,6 +1710,7 @@ class ContinuityToolSurfaceTests(unittest.TestCase):
         self.assertIn("resume_development_job", tools)
         self.assertIn("pause_development_job", tools)
         self.assertIn("extend_budget", tools)
+        self.assertIn("narrow_scope", tools)
 
 
 if __name__ == "__main__":

@@ -472,13 +472,13 @@ INSERT INTO job_progress (
     extensions_granted, manual_extensions_granted, no_progress_turns,
     tool_failures, soft_warned, wall_seconds_used, milestones_json,
     parent_job_id, delegation_mandate_json, drafter_id, successor_base_head,
-    updated_at
+    scope_paths_json, updated_at
 ) VALUES (
     :job_id, :pause_reason, :pause_requested, :turns_used, :tokens_used,
     :extensions_granted, :manual_extensions_granted, :no_progress_turns,
     :tool_failures, :soft_warned, :wall_seconds_used, :milestones_json,
     :parent_job_id, :delegation_mandate_json, :drafter_id, :successor_base_head,
-    :updated_at
+    :scope_paths_json, :updated_at
 )
 ON CONFLICT(job_id) DO UPDATE SET
     pause_reason = excluded.pause_reason,
@@ -496,6 +496,7 @@ ON CONFLICT(job_id) DO UPDATE SET
     delegation_mandate_json = excluded.delegation_mandate_json,
     drafter_id = excluded.drafter_id,
     successor_base_head = excluded.successor_base_head,
+    scope_paths_json = excluded.scope_paths_json,
     updated_at = excluded.updated_at
 """
 
@@ -572,6 +573,9 @@ _ADDITIVE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         # (separate from auto-granted extensions so manual top-ups never consume
         # the auto-extension headroom).
         ("manual_extensions_granted", "INTEGER NOT NULL DEFAULT 0"),
+        # M-CC-08: the allowed changed-path set narrowed by the narrow_scope
+        # human control (JSON array of relative paths; NULL means unrestricted).
+        ("scope_paths_json", "TEXT"),
     ),
     # M-EV-01: additive columns on the requirements + requirement_links tables
     # so the full matrix semantics (kind, status, deferred_authority,

@@ -18,7 +18,7 @@ from typing import Any
 from local_dev_mcp import store
 from local_dev_mcp.authorization import AuthorizationManager
 from local_dev_mcp.config import Settings
-from local_dev_mcp.jobs import DevelopmentJobManager
+from local_dev_mcp.jobs import DevelopmentJobError, DevelopmentJobManager
 from local_dev_mcp.models import ProjectCapability, ProjectPolicy
 from local_dev_mcp.registry import ProjectLockManager, ProjectRegistryError
 from local_dev_mcp.server import create_server
@@ -357,6 +357,142 @@ class ExtendBudgetTests(unittest.TestCase):
                         "capabilities": [
                             "repository_read",
                             ProjectCapability.EXTEND_BUDGET.value,
+                        ],
+                    }
+                )
+
+        asyncio.run(exercise())
+
+
+class NarrowScopeTests(unittest.TestCase):
+    """narrow_scope: monotonic allowed-path reduction + audit event."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        initialize_git_repository(self.root)
+        self.settings = control_settings(self.base)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_narrow_scope_sets_allowed_paths_and_records_event(self) -> None:
+        async def exercise() -> None:
+            policy = project(self.root, ["{python}", "-c", "print('ok')"])
+            jobs, authorization = job_managers(self.settings, policy)
+            completed = await start_completed(jobs, policy)
+            job_id = str(completed["job_id"])
+            self.assertNotIn("scope_paths", completed)
+
+            result = await jobs.narrow_scope(
+                policy, job_id, ["src/a.py", "tests/test_a.py"], reason="focus"
+            )
+            self.assertEqual(
+                result["scope"]["allowed"], ["src/a.py", "tests/test_a.py"]
+            )
+            self.assertEqual(
+                result["scope"]["requested"], ["src/a.py", "tests/test_a.py"]
+            )
+            self.assertIsNone(result["scope"]["narrowed_from"])
+            self.assertEqual(result["scope"]["reason"], "focus")
+            # The snapshot surfaces the narrowed allowed set.
+            self.assertEqual(
+                result["scope_paths"], ["src/a.py", "tests/test_a.py"]
+            )
+            events = event_types(jobs._db, job_id)
+            self.assertEqual(events.count("control_narrow_scope"), 1)
+
+        asyncio.run(exercise())
+
+    def test_narrow_scope_is_monotonic_intersection(self) -> None:
+        async def exercise() -> None:
+            policy = project(self.root, ["{python}", "-c", "print('ok')"])
+            jobs, authorization = job_managers(self.settings, policy)
+            completed = await start_completed(jobs, policy)
+            job_id = str(completed["job_id"])
+
+            first = await jobs.narrow_scope(
+                policy, job_id, ["src/a.py", "tests/test_a.py"], reason="focus"
+            )
+            self.assertEqual(
+                first["scope"]["allowed"], ["src/a.py", "tests/test_a.py"]
+            )
+
+            # A second call can only shrink the allowed set (intersection).
+            second = await jobs.narrow_scope(
+                policy, job_id, ["src/a.py", "docs/other.md"], reason="tighter"
+            )
+            self.assertEqual(second["scope"]["allowed"], ["src/a.py"])
+            self.assertEqual(
+                second["scope"]["narrowed_from"],
+                ["src/a.py", "tests/test_a.py"],
+            )
+            self.assertEqual(second["scope_paths"], ["src/a.py"])
+            events = event_types(jobs._db, job_id)
+            self.assertEqual(events.count("control_narrow_scope"), 2)
+
+        asyncio.run(exercise())
+
+    def test_narrow_scope_rejects_traversal_absolute_and_hidden(self) -> None:
+        async def exercise() -> None:
+            policy = project(self.root, ["{python}", "-c", "print('ok')"])
+            jobs, authorization = job_managers(self.settings, policy)
+            completed = await start_completed(jobs, policy)
+            job_id = str(completed["job_id"])
+            for bad in (
+                "../escape",
+                "/absolute",
+                "a/../../b",
+                ".hidden",
+                "",
+                "sub/..",
+            ):
+                with self.assertRaises(DevelopmentJobError):
+                    await jobs.narrow_scope(policy, job_id, [bad])
+            # Nothing was persisted for any rejected call.
+            refreshed = await jobs.get(policy, job_id)
+            self.assertNotIn("scope_paths", refreshed)
+            self.assertEqual(
+                event_types(jobs._db, job_id).count("control_narrow_scope"), 0
+            )
+
+        asyncio.run(exercise())
+
+    def test_narrow_scope_is_capability_gated_via_server(self) -> None:
+        async def exercise() -> None:
+            from fastmcp.exceptions import ToolError
+
+            policy = project(
+                self.root,
+                ["{python}", "-c", "print('ok')"],
+                capabilities=["repository_read", "claude_edit", "verification_commit"],
+            )
+            server = server_for(self.base, policy)
+            with self.assertRaises(ToolError):
+                await server.call_tool(
+                    "narrow_scope",
+                    {
+                        "project_id": "test-project",
+                        "job_id": "0" * 32,
+                        "paths": ["src/a.py"],
+                    },
+                )
+
+        asyncio.run(exercise())
+
+    def test_narrow_scope_capability_requires_claude_edit_in_policy(self) -> None:
+        async def exercise() -> None:
+            with self.assertRaises(ValueError):
+                ProjectPolicy.model_validate(
+                    {
+                        "id": "test-project",
+                        "display_name": "T",
+                        "description": "T",
+                        "root": str(self.root),
+                        "capabilities": [
+                            "repository_read",
+                            ProjectCapability.NARROW_SCOPE.value,
                         ],
                     }
                 )

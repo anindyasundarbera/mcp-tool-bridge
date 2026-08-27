@@ -317,7 +317,7 @@ class RequirementToolSurfaceTests(unittest.TestCase):
             tools = {tool.name: tool for tool in await mcp.list_tools()}
             tool_names = set(tools.keys())
             temporary.cleanup()
-            self.assertEqual(len(tool_names), 34)
+            self.assertEqual(len(tool_names), 35)
             self.assertNotIn("get_requirement_coverage", tool_names)
             self.assertNotIn("export_requirement_matrix", tool_names)
 

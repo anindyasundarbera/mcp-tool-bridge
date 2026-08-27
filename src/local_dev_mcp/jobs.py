@@ -355,6 +355,12 @@ class DevelopmentJob:
     # .committed_sha``; persisted in the ``job_progress`` sidecar (additive) so
     # the ``jobs`` schema is untouched. ``None`` for ordinary jobs.
     successor_base_head: str | None = None
+    # M-CC-08: the set of paths the candidate is allowed to touch, narrowed by
+    # the narrow_scope human control. ``None`` (default) means unrestricted;
+    # an empty tuple means the worktree is frozen. Persisted in the
+    # ``job_progress`` sidecar (additive ``scope_paths_json`` column) so the
+    # ``jobs`` schema is untouched.
+    scope_paths: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,6 +377,32 @@ class CommittedCandidate:
 
 
 _VALID_EFFORTS = frozenset({"high", "ultracode"})
+
+
+def _validate_scope_path(path: str) -> str:
+    """Validate a narrow_scope allowed path.
+
+    M-CC-08 security: scope entries are declarative path constraints, not file
+    operations, but they still must be relative, non-traversal, non-hidden-root,
+    NUL-free POSIX paths so a narrowed scope can never name the worktree root,
+    an absolute location, or a parent directory. Returns the canonical form
+    (no leading ``./``, no trailing ``/``, single ``/`` separators).
+    """
+    if "\x00" in path:
+        raise DevelopmentJobError("scope path must not contain NUL bytes")
+    if path.startswith(("\\", "/")) or ":" in path.split("/", 1)[0]:
+        raise DevelopmentJobError("scope path must be relative")
+    if path.startswith(".") and not path.startswith("./"):
+        raise DevelopmentJobError(
+            "scope path must not name a hidden or protected entry"
+        )
+    parts = [part for part in path.split("/") if part]
+    if not parts:
+        raise DevelopmentJobError("scope path must not be empty")
+    for part in parts:
+        if part in (".", ".."):
+            raise DevelopmentJobError("scope path must not traverse directories")
+    return "/".join(parts)
 
 
 def _json_dumps(value: Any) -> str | None:
@@ -756,6 +788,11 @@ class DevelopmentJobManager:
             "delegation_mandate_json": _json_dumps(job.delegation_mandate),
             "drafter_id": job.drafter_id,
             "successor_base_head": job.successor_base_head,
+            "scope_paths_json": (
+                _json_dumps(list(job.scope_paths))
+                if job.scope_paths is not None
+                else None
+            ),
             "updated_at": _timestamp(),
         }
 
@@ -792,6 +829,9 @@ class DevelopmentJobManager:
             job.delegation_mandate = mandate
         job.drafter_id = row.get("drafter_id")
         job.successor_base_head = row.get("successor_base_head")
+        scope = _json_loads(row.get("scope_paths_json"))
+        if isinstance(scope, list):
+            job.scope_paths = tuple(str(path) for path in scope)
 
     def _record_event(
         self,
@@ -1671,6 +1711,10 @@ class DevelopmentJobManager:
         # branched off the immutable completed candidate, not canonical HEAD.
         if job.successor_base_head is not None:
             snapshot["successor_base_head"] = job.successor_base_head
+        # M-CC-08: the narrowed allowed-path set. Present whenever a human has
+        # exercised narrow_scope; absent means the candidate is unrestricted.
+        if job.scope_paths is not None:
+            snapshot["scope_paths"] = list(job.scope_paths)
         # M-GV-06: surface the parent/child delegation tree (children of this
         # job, from the delegations ledger) so an orchestrator can query it.
         children = store.load_delegation_rows_for_parent(self._db, job.job_id)
@@ -2707,6 +2751,78 @@ class DevelopmentJobManager:
                 extension["status"] = "no_extension_remaining"
             snapshot = self._snapshot(job)
         return {**snapshot, "extension": extension}
+
+    async def narrow_scope(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        paths: list[str],
+        *,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """M-CC-08: reduce a job's allowed changed-path set.
+
+        Each call validates the requested paths (relative, non-traversal,
+        non-hidden, NUL-free) and narrows the job's persisted ``scope_paths``.
+        Narrowing is monotonic: when a scope is already in force the new allowed
+        set is the intersection, so repeated calls can only shrink it and are
+        repeat-safe (no duplicate audit events for identical results). Records a
+        ``control_narrow_scope`` audit event. A committed job is immutable and
+        cannot be narrowed.
+        """
+        reason = (reason or "").strip()
+        if len(reason) > 2000:
+            raise DevelopmentJobError("reason must be at most 2000 characters")
+        if not isinstance(paths, list) or not paths:
+            raise DevelopmentJobError("paths must be a non-empty list")
+        try:
+            cleaned = tuple(_validate_scope_path(path) for path in paths)
+        except TypeError as exc:
+            raise DevelopmentJobError("paths must contain only strings") from exc
+        async with self._state_lock:
+            job = self._require_job(project, job_id)
+            if job.committed_sha is not None:
+                raise DevelopmentJobError(
+                    "a committed development job cannot be narrowed"
+                )
+            previous = job.scope_paths
+            if previous is None:
+                narrowed = cleaned
+            else:
+                previous_set = set(previous)
+                narrowed = tuple(
+                    path for path in cleaned if path in previous_set
+                )
+            job.scope_paths = narrowed
+            job.updated_at = _timestamp()
+            self._persist_progress(job)
+            self._persist_job(job)
+            self._record_event(
+                job,
+                "control_narrow_scope",
+                {
+                    "requested": list(cleaned),
+                    "allowed": list(narrowed),
+                    "previous": list(previous) if previous is not None else None,
+                    "reason": reason or None,
+                },
+                authority={
+                    "actor": "ChatGPT",
+                    "authority_source": "chatgpt_confirmation",
+                    "scope": "narrow_scope",
+                    "classification": "canonical",
+                },
+            )
+            scope = {
+                "allowed": list(narrowed),
+                "requested": list(cleaned),
+                "narrowed_from": (
+                    list(previous) if previous is not None else None
+                ),
+                "reason": reason or None,
+            }
+            snapshot = self._snapshot(job)
+        return {**snapshot, "scope": scope}
 
     async def verification_worktree(
         self,
