@@ -10,3 +10,6 @@ build/
 projects.json
 openai-connectors-mtls-ca.pem
 
+
+# bridge state directory (committed by mistake in db7a712; never staged or committed)
+.reasonix/
