@@ -801,12 +801,6 @@ def create_server(
         return await active_jobs.replace_worker(
             project, job_id, text, effort=effort
         )
-        project = active_registry.resolve(
-            project_id, ProjectCapability.REPLACE_WORKER
-        )
-        return await active_jobs.replace_worker(
-            project, job_id, text, effort=effort
-        )
 
     @mcp.tool(
         name="discard_candidate",
