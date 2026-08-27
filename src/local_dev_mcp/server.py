@@ -805,6 +805,50 @@ def create_server(
         )
 
     @mcp.tool(
+        name="discard_candidate",
+        description=(
+            "Permanently remove a development job's candidate worktree and "
+            "clear its session, so the candidate can never be resumed, "
+            "verified, or promoted. Refuses committed and running jobs. "
+            "Idempotent: discarding a job with no retained worktree is a no-op "
+            "success. Records a control_discard audit event. Opt-in via the "
+            "discard_candidate project capability."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
+    async def discard_candidate(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        job_id: Annotated[
+            str,
+            Field(
+                description="Opaque job ID returned by send_to_local_dev.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+        reason: Annotated[
+            str | None,
+            Field(
+                description="Optional free-text justification for the audit record.",
+                max_length=2000,
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.DISCARD_CANDIDATE
+        )
+        return await active_jobs.discard_candidate(
+            project, job_id, reason=reason
+        )
+
+    @mcp.tool(
         name="verify_development_job",
         description=(
             "Run only the fixed verification commands configured for a completed "

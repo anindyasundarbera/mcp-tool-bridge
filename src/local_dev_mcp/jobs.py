@@ -2926,6 +2926,70 @@ class DevelopmentJobManager:
             },
         }
 
+    async def discard_candidate(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        *,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """M-CC-08: discard a job's candidate worktree.
+
+        Permanently removes the retained worktree (``git worktree remove
+        --force``) and clears the session, so the candidate can never be
+        resumed, verified, or promoted. Refuses committed jobs (the immutable
+        completed candidate is never discarded) and running jobs. Idempotent:
+        discarding a job with no retained worktree is a no-op success. Records
+        a ``control_discard`` audit event.
+        """
+        reason = (reason or "").strip()
+        if len(reason) > 2000:
+            raise DevelopmentJobError("reason must be at most 2000 characters")
+        async with self._state_lock:
+            job = self._require_job(project, job_id)
+            if job.committed_sha is not None:
+                raise DevelopmentJobError(
+                    "a committed development job cannot be discarded"
+                )
+            if job.task is not None:
+                raise DevelopmentJobError(
+                    "a running development job cannot be discarded"
+                )
+            if job.worktree is None:
+                # Already discarded (or never retained): idempotent success, no
+                # duplicate audit event.
+                snapshot = self._snapshot(job)
+                return {**snapshot, "discard": {"discarded": False}}
+            discarded_path = job.worktree.path
+            await self._worktrees.remove(project, job.worktree)
+            job.worktree = None
+            job.session_id = None
+            job.updated_at = _timestamp()
+            self._persist_job(job)
+            self._record_event(
+                job,
+                "control_discard",
+                {
+                    "discarded_path": str(discarded_path),
+                    "reason": reason or None,
+                },
+                authority={
+                    "actor": "ChatGPT",
+                    "authority_source": "chatgpt_confirmation",
+                    "scope": "discard_candidate",
+                    "classification": "canonical",
+                },
+            )
+            snapshot = self._snapshot(job)
+        return {
+            **snapshot,
+            "discard": {
+                "discarded": True,
+                "path": str(discarded_path),
+                "reason": reason or None,
+            },
+        }
+
     async def verification_worktree(
         self,
         project: ProjectPolicy,

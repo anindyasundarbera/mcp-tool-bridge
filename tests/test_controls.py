@@ -612,6 +612,103 @@ class ReplaceWorkerTests(unittest.TestCase):
         asyncio.run(exercise())
 
 
+class DiscardCandidateTests(unittest.TestCase):
+    """discard_candidate: remove the worktree, idempotent, audit event."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        initialize_git_repository(self.root)
+        self.settings = control_settings(self.base)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_discard_candidate_removes_worktree_and_is_idempotent(self) -> None:
+        async def exercise() -> None:
+            policy = project(self.root, ["{python}", "-c", "print('ok')"])
+            jobs, authorization = job_managers(self.settings, policy)
+            completed = await start_completed(jobs, policy)
+            job_id = str(completed["job_id"])
+            self.assertIn("base_head", completed)
+            self.assertTrue(completed["resume_available"])
+
+            discarded = await jobs.discard_candidate(
+                policy, job_id, reason="wrong approach"
+            )
+            self.assertTrue(discarded["discard"]["discarded"])
+            # The worktree directory is gone from disk.
+            self.assertFalse(Path(discarded["discard"]["path"]).exists())
+            # The job no longer retains a resumable candidate.
+            self.assertFalse(discarded["resume_available"])
+            self.assertNotIn("base_head", discarded)
+            events = event_types(jobs._db, job_id)
+            self.assertEqual(events.count("control_discard"), 1)
+
+            # Idempotent: a second discard is a no-op success with no new event.
+            again = await jobs.discard_candidate(policy, job_id)
+            self.assertFalse(again["discard"]["discarded"])
+            self.assertEqual(
+                event_types(jobs._db, job_id).count("control_discard"), 1
+            )
+
+        asyncio.run(exercise())
+
+    def test_discard_candidate_refuses_a_running_job(self) -> None:
+        async def exercise() -> None:
+            policy = project(self.root, ["{python}", "-c", "print('ok')"])
+            locks = ProjectLockManager()
+            blocking = BlockingExecutor()
+            jobs = DevelopmentJobManager(
+                self.settings, locks, blocking, projects=(policy,)
+            )
+            started = await jobs.start(policy, "make candidate", "high")
+            job_id = str(started["job_id"])
+            await asyncio.wait_for(blocking.entered.wait(), timeout=2)
+            with self.assertRaises(DevelopmentJobError):
+                await jobs.discard_candidate(policy, job_id)
+            blocking.release.set()
+
+        asyncio.run(exercise())
+
+    def test_discard_candidate_is_capability_gated_via_server(self) -> None:
+        async def exercise() -> None:
+            from fastmcp.exceptions import ToolError
+
+            policy = project(
+                self.root,
+                ["{python}", "-c", "print('ok')"],
+                capabilities=["repository_read", "claude_edit", "verification_commit"],
+            )
+            server = server_for(self.base, policy)
+            with self.assertRaises(ToolError):
+                await server.call_tool(
+                    "discard_candidate",
+                    {"project_id": "test-project", "job_id": "0" * 32},
+                )
+
+        asyncio.run(exercise())
+
+    def test_discard_candidate_capability_requires_claude_edit_in_policy(self) -> None:
+        async def exercise() -> None:
+            with self.assertRaises(ValueError):
+                ProjectPolicy.model_validate(
+                    {
+                        "id": "test-project",
+                        "display_name": "T",
+                        "description": "T",
+                        "root": str(self.root),
+                        "capabilities": [
+                            "repository_read",
+                            ProjectCapability.DISCARD_CANDIDATE.value,
+                        ],
+                    }
+                )
+
+        asyncio.run(exercise())
+
+
 class PauseDevelopmentJobTests(unittest.TestCase):
     """pause_development_job: capability-gated, idempotent, audit event."""
 

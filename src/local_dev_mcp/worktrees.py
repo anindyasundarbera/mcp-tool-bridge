@@ -993,3 +993,43 @@ class GitWorktreeManager:
                     )
                 except (GitCommandError, OSError):
                     pass
+
+    async def remove(
+        self,
+        project: ProjectPolicy,
+        worktree: JobWorktree,
+    ) -> None:
+        """M-CC-08: permanently remove a job worktree (discard_candidate).
+
+        The path must still be inside this project's configured worktree root
+        and must not be a symlink (a symlink or an escaped path is refused, not
+        followed). The removal is ``git worktree remove --force -- <path>`` from
+        the project root — a fixed argument vector, no shell. Already-removed
+        worktrees are a no-op success so the control is repeat-safe.
+        """
+        root = self._root_for(project)
+        expected_parent = (root / project.id).resolve(strict=True)
+        try:
+            metadata = os.lstat(worktree.path)
+        except FileNotFoundError:
+            # Already removed (or never created): idempotent success.
+            return
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise WorktreeError("job worktree is not a trusted directory")
+        resolved = worktree.path.resolve(strict=True)
+        if resolved.parent != expected_parent:
+            raise WorktreeError("job worktree escaped the configured worktree root")
+        try:
+            await run_git(
+                project.root,
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                str(resolved),
+                timeout_seconds=self.settings.git_command_timeout_seconds,
+            )
+        except (GitCommandError, OSError) as exc:
+            raise WorktreeError(str(exc)) from exc
+        if resolved.exists() or resolved.is_symlink():
+            raise WorktreeError("git worktree remove left the candidate in place")
