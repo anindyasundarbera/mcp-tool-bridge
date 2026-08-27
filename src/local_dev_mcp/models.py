@@ -324,6 +324,44 @@ class VerificationCommand(BaseModel):
         return paths
 
 
+class StaticSchemaCheck(BaseModel):
+    """One repo-level schema validation check (M-ROADMAP static analysis).
+
+    Validates changed candidate files matching ``path_glob`` with the standard
+    library only — ``json`` / ``tomllib`` for ``json``, ``xml.etree`` for
+    ``xml``, ``tomllib`` for ``yaml`` (TOML is the stdlib-safe YAML surrogate;
+    a full YAML/JSON-Schema engine runs via a declared ``commands`` entry
+    instead). Advisory by default; ``fail_on="error"`` is the opt-in gate.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    path_glob: str
+    schema_kind: Literal["json", "yaml", "xml"]
+
+
+class StaticAnalysis(BaseModel):
+    """Advisory repo static-analysis block (M-ROADMAP), internal — no new tool.
+
+    ``commands`` are declared analyzers (``ruff check``, ``mypy``,
+    ``check-jsonschema``, ...) run read-only over the candidate via the same
+    hermetic runner as the verification commands, so the analysis inherits
+    PIN_TOOLCHAIN / DEPS_CACHE_DIR / NETWORK_POLICY / bwrap / deterministic
+    env. Findings are parsed best-effort into a structured list; an
+    unparseable analyzer reports no findings (advisory, never fatal).
+    ``fail_on`` defaults to ``"never"`` so a static-analysis finding never
+    breaks an existing project unless it opts in; ``"error"`` flips the overall
+    verification conclusion to FAIL when a finding is reported.
+    ``schema_checks`` validate changed files by kind with stdlib only.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    commands: tuple[VerificationCommand, ...] = ()
+    fail_on: Literal["never", "error"] = "never"
+    schema_checks: tuple[StaticSchemaCheck, ...] = ()
+
+
 class SupplyChainCommand(BaseModel):
     """One severity-gated supply-chain scan run at commit time (M-CC-11).
 
@@ -650,6 +688,12 @@ class ProjectPolicy(BaseModel):
     markdown_write_roots: tuple[str, ...] = ()
     commit_roots: tuple[str, ...] = ()
     verification_commands: tuple[VerificationCommand, ...] = ()
+    # M-ROADMAP: advisory repo static analysis (internal; no new tool, no new
+    # capability). Declared analyzers run read-only over the candidate via the
+    # same hermetic runner as the verification commands; ``fail_on="error"``
+    # (opt-in) flips the verification conclusion to FAIL. The default ``None``
+    # leaves every existing project's results unchanged.
+    static_analysis: StaticAnalysis | None = None
     supply_chain_scans: tuple[SupplyChainCommand, ...] = ()
     runtime_verification_commands: tuple[RuntimeVerificationCommand, ...] = ()
     working_tree_capture_scope: WorkingTreeCaptureScope | None = None

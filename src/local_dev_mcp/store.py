@@ -293,6 +293,17 @@ CREATE TABLE IF NOT EXISTS verification_bindings (
     FOREIGN KEY (verification_id) REFERENCES verifications(verification_id)
       ON DELETE CASCADE
 );
+-- M-ROADMAP: additive sidecar persisting a verification's advisory static
+-- analysis (declared analyzers + schema checks) so a replay or audit can see
+-- the analysis that accompanied a passed verification. ``results_json`` is the
+-- full structured list (findings + counts), empty when a project declares no
+-- ``static_analysis``. Additive only; ``SCHEMA_VERSION`` stays 1.
+CREATE TABLE IF NOT EXISTS verification_static_analysis (
+    verification_id TEXT PRIMARY KEY,
+    results_json TEXT NOT NULL,
+    FOREIGN KEY (verification_id) REFERENCES verifications(verification_id)
+      ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS review_bindings (
     review_id TEXT PRIMARY KEY,
     toolchain_digest TEXT,
@@ -891,6 +902,43 @@ def load_verification_binding_rows(
             "SELECT * FROM verification_bindings"
         ).fetchall()
     ]
+
+
+_UPSERT_VERIFICATION_STATIC_ANALYSIS = """
+INSERT INTO verification_static_analysis (
+    verification_id, results_json
+) VALUES (
+    :verification_id, :results_json
+)
+ON CONFLICT(verification_id) DO UPDATE SET
+    results_json = excluded.results_json
+"""
+
+
+def upsert_verification_static_analysis_row(
+    connection: sqlite3.Connection, row: dict[str, Any]
+) -> None:
+    """Persist one verification static-analysis sidecar row (M-ROADMAP).
+
+    A 1:1 sidecar to ``verifications`` keyed by ``verification_id`` (FK with
+    ``ON DELETE CASCADE``). Holds the advisory static-analysis results
+    (declared analyzers + schema checks, structured as findings + counts) that
+    accompanied the verification. Additive: ``CREATE TABLE IF NOT EXISTS``,
+    never alters ``verifications``, ``SCHEMA_VERSION`` stays 1.
+    """
+    with connection:
+        connection.execute(_UPSERT_VERIFICATION_STATIC_ANALYSIS, row)
+
+
+def load_verification_static_analysis_row(
+    connection: sqlite3.Connection, verification_id: str
+) -> dict[str, Any] | None:
+    """Return one verification static-analysis sidecar row, or None."""
+    row = connection.execute(
+        "SELECT * FROM verification_static_analysis WHERE verification_id = ?",
+        (verification_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
 
 
 def load_verification_binding_row(

@@ -12,6 +12,8 @@ import signal
 import stat
 import sys
 import tempfile
+import tomllib
+from xml.etree import ElementTree
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -21,7 +23,14 @@ from . import store
 from .config import Settings
 from .git import GitCommandError, run_git
 from .jobs import DevelopmentJobError, DevelopmentJobManager
-from .models import ProjectPolicy, SupplyChainCommand, TestKind, VerificationCommand
+from .models import (
+    ProjectPolicy,
+    StaticAnalysis,
+    StaticSchemaCheck,
+    SupplyChainCommand,
+    TestKind,
+    VerificationCommand,
+)
 from .registry import ProjectLockManager
 from .worktrees import GitWorktreeManager, JobWorktree, WorktreeError
 
@@ -647,6 +656,11 @@ class VerificationRecord:
     verified_at: str
     commands: tuple[dict[str, Any], ...]
     used: bool = False
+    # M-ROADMAP: advisory static-analysis results (declared analyzers + schema
+    # checks) that accompanied this verification, persisted in the
+    # ``verification_static_analysis`` sidecar (not on ``verifications``) so
+    # the schema stays additive. Empty tuple when the project declares none.
+    static_analysis: tuple[dict[str, Any], ...] = ()
     # M-EV-02: SHA-256 over the Python interpreter version + the allowlisted
     # deterministic env keys + the verification command argv + an optional
     # toolchain-pin digest. Persisted in the ``verification_environment``
@@ -1402,6 +1416,147 @@ def _parse_mutation_stats(result: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+_STATIC_SEVERITY_PATTERN = re.compile(
+    r"^(?P<path>[^:]+):(?P<line>\d+):(?P<col>\d+):\s+"
+    r"(?P<code>[A-Z][A-Z0-9]*)\s+(?P<message>.+)$"
+)
+_STATIC_EXPLICIT_PATTERN = re.compile(
+    r"^(?P<path>[^:]+):(?P<line>\d+):\s+"
+    r"(?P<severity>error|warning|note):\s+(?P<message>.+)$"
+)
+_STATIC_RUFF_NOCOL_PATTERN = re.compile(
+    r"^(?P<path>[^:]+):(?P<line>\d+):\s+"
+    r"(?P<code>[A-Z][A-Z0-9]*)\s+(?P<message>.+)$"
+)
+_STATIC_BARE_PATTERN = re.compile(r"^(?P<path>[^:]+):\s+(?P<message>.+)$")
+
+
+def _parse_static_findings(text: str) -> list[dict[str, Any]]:
+    """Best-effort parse of common analyzer output into structured findings.
+
+    Recognises ruff/mypy-style ``path:line:col:``/``path:line:`` lines and a
+    bare ``path: message`` fallback. Severity comes from the analyzer's own
+    label (mypy ``error:``/``warning:``/``note:``) or the ruff code letter
+    (``W`` → warning, ``I`` → info, else error). Unparseable lines are
+    ignored — a parse miss is advisory, never fatal.
+    """
+    findings: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = _STATIC_SEVERITY_PATTERN.match(stripped)
+        if match is not None:
+            code = match.group("code")
+            severity = (
+                "warning" if code.startswith("W")
+                else "info" if code.startswith("I")
+                else "error"
+            )
+            findings.append(
+                {
+                    "severity": severity,
+                    "message": match.group("message"),
+                    "path": match.group("path"),
+                    "line": int(match.group("line")),
+                }
+            )
+            continue
+        match = _STATIC_EXPLICIT_PATTERN.match(stripped)
+        if match is not None:
+            findings.append(
+                {
+                    "severity": match.group("severity"),
+                    "message": match.group("message"),
+                    "path": match.group("path"),
+                    "line": int(match.group("line")),
+                }
+            )
+            continue
+        match = _STATIC_RUFF_NOCOL_PATTERN.match(stripped)
+        if match is not None:
+            code = match.group("code")
+            severity = (
+                "warning" if code.startswith("W")
+                else "info" if code.startswith("I")
+                else "error"
+            )
+            findings.append(
+                {
+                    "severity": severity,
+                    "message": match.group("message"),
+                    "path": match.group("path"),
+                    "line": int(match.group("line")),
+                }
+            )
+            continue
+        match = _STATIC_BARE_PATTERN.match(stripped)
+        if match is not None:
+            findings.append(
+                {
+                    "severity": "error",
+                    "message": match.group("message"),
+                    "path": match.group("path"),
+                    "line": None,
+                }
+            )
+    return findings
+
+
+def _schema_check_changed_paths(
+    worktree: JobWorktree,
+    changed_paths: tuple[str, ...],
+    checks: tuple[StaticSchemaCheck, ...],
+) -> list[dict[str, Any]]:
+    """Validate changed candidate files against declared schema checks.
+
+    Stdlib only (M-ROADMAP): ``json`` / ``tomllib`` / ``xml.etree`` parse each
+    changed file matching a check's glob; a parse failure becomes an ``error``
+    finding. ``yaml`` uses TOML as its stdlib-safe surrogate (a full YAML /
+    JSON-Schema engine runs via a declared analyzer command instead).
+    """
+    findings: list[dict[str, Any]] = []
+    if not checks:
+        return findings
+    for check in checks:
+        for relative_path in changed_paths:
+            if not fnmatch.fnmatch(relative_path, check.path_glob):
+                continue
+            target = worktree.path / relative_path
+            try:
+                if check.schema_kind == "json":
+                    with target.open("r", encoding="utf-8") as handle:
+                        json.load(handle)
+                elif check.schema_kind == "xml":
+                    ElementTree.parse(str(target))
+                else:  # "yaml" → TOML surrogate via stdlib tomllib
+                    with target.open("rb") as handle:
+                        tomllib.load(handle)
+            except Exception as exc:  # noqa: BLE001 — report any parse failure
+                findings.append(
+                    {
+                        "severity": "error",
+                        "message": (
+                            f"{check.schema_kind} schema validation failed: {exc}"
+                        ),
+                        "path": relative_path,
+                        "line": None,
+                    }
+                )
+    return findings
+
+
+def _stream_text(value: Any) -> str:
+    """Extract text from a command-result stream (dict or raw string)."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        text = value.get("text")
+        if isinstance(text, str):
+            return text
+    return ""
+
+
 async def _run_command(
     settings: Settings,
     worktree: JobWorktree,
@@ -1622,6 +1777,16 @@ class VerificationCommitManager:
                 "authority_ref": record.authority_ref,
             },
         )
+        if record.static_analysis:
+            store.upsert_verification_static_analysis_row(
+                self._db,
+                {
+                    "verification_id": record.verification_id,
+                    "results_json": json.dumps(
+                        list(record.static_analysis), ensure_ascii=False
+                    ),
+                },
+            )
 
     def _new_verification_id(self) -> str:
         for _ in range(10):
@@ -1671,6 +1836,93 @@ class VerificationCommitManager:
                 except Exception:
                     pass
             raise
+
+    async def _run_static_analysis(
+        self,
+        project: ProjectPolicy,
+        worktree: JobWorktree,
+        changed_paths: tuple[str, ...],
+    ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        """Run declared static-analysis commands + schema checks over the candidate.
+
+        M-ROADMAP (internal; no new tool). Advisory: findings never fail the
+        verification unless the project opted into ``static_analysis.fail_on =
+        "error"``. Declared analyzers run read-only over the candidate via the
+        SAME hermetic runner as the verification commands (PIN_TOOLCHAIN /
+        DEPS_CACHE_DIR / NETWORK_POLICY / bwrap / deterministic env); their
+        output is parsed best-effort into a structured findings list and the
+        counts are rolled up. Schema checks validate each changed candidate
+        file matching a glob with stdlib only. ``project.static_analysis`` is
+        ``None`` (the default) → returns empty results, no-op.
+        """
+        analysis: StaticAnalysis | None = project.static_analysis
+        if analysis is None:
+            return [], {"error_count": 0, "warning_count": 0}
+        results: list[dict[str, Any]] = []
+        error_count = 0
+        warning_count = 0
+        redacted_paths = (
+            worktree.path,
+            project.root,
+            self.settings.job_worktree_root,
+            self.settings.projects_config_path,
+            *self._project_roots,
+        )
+        for command in analysis.commands:
+            result = await _run_command(
+                self.settings,
+                worktree,
+                command,
+                project=project,
+                credential_names=_credential_names(project),
+            )
+            bounded = _bound_redacted_output(
+                _redact(result, redacted_paths),
+                self.settings.max_verification_output_bytes,
+            )
+            entry: dict[str, Any] = {
+                "command_id": command.id,
+                "kind": command.kind.value,
+                "status": bounded.get("status"),
+                "exit_code": bounded.get("exit_code"),
+                "findings": _parse_static_findings(
+                    _stream_text(bounded.get("stdout"))
+                    + "\n"
+                    + _stream_text(bounded.get("stderr"))
+                ),
+                "error": bounded.get("error"),
+            }
+            error_count += sum(
+                1 for f in entry["findings"] if f["severity"] == "error"
+            )
+            warning_count += sum(
+                1 for f in entry["findings"] if f["severity"] == "warning"
+            )
+            results.append(entry)
+        schema_findings = _schema_check_changed_paths(
+            worktree, changed_paths, analysis.schema_checks
+        )
+        error_count += sum(
+            1 for f in schema_findings if f["severity"] == "error"
+        )
+        warning_count += sum(
+            1 for f in schema_findings if f["severity"] == "warning"
+        )
+        if schema_findings:
+            schema_errors = any(
+                f["severity"] == "error" for f in schema_findings
+            )
+            results.append(
+                {
+                    "command_id": None,
+                    "kind": "schema",
+                    "status": "failed" if schema_errors else "passed",
+                    "exit_code": 1 if schema_errors else 0,
+                    "findings": schema_findings,
+                    "error": None,
+                }
+            )
+        return results, {"error_count": error_count, "warning_count": warning_count}
 
     async def verify(
         self,
@@ -1750,11 +2002,37 @@ class VerificationCommitManager:
                 after = await self._candidate_state_or_rollback(
                     project, job_id, worktree
                 )
+                # M-ROADMAP: advisory static analysis runs after the
+                # verification commands AND after the after-state snapshot, so
+                # analyzers' read-only runs never affect the state-unchanged
+                # check. ``fail_on="error"`` (opt-in) flips the conclusion to
+                # FAIL; the default keeps findings advisory.
+                static_analysis_results: list[dict[str, Any]] = []
+                static_analysis_summary: dict[str, int] = {
+                    "error_count": 0,
+                    "warning_count": 0,
+                }
+                static_analysis_failed = False
+                if project.static_analysis is not None:
+                    (
+                        static_analysis_results,
+                        static_analysis_summary,
+                    ) = await self._run_static_analysis(
+                        project, worktree, before.paths
+                    )
+                    static_analysis_failed = (
+                        project.static_analysis.fail_on == "error"
+                        and static_analysis_summary["error_count"] > 0
+                    )
             except (DevelopmentJobError, WorktreeError, GitCommandError) as exc:
                 raise VerificationError(str(exc)) from exc
 
             unchanged = before == after
-            passed = unchanged and all(result["status"] == "passed" for result in results)
+            passed = (
+                unchanged
+                and all(result["status"] == "passed" for result in results)
+                and not static_analysis_failed
+            )
             # M-EV-02: environment/toolchain fingerprint (SHA-256 over the
             # Python interpreter version + the allowlisted deterministic env
             # keys + the verification command argv). Stable across identical-env
@@ -1796,10 +2074,19 @@ class VerificationCommitManager:
                 "base_commit": before.base_head,
                 "environment_digest": environment_digest,
                 "conclusion": "PASS" if passed else "FAIL",
+                # M-ROADMAP: advisory static-analysis results (empty when the
+                # project declares none) — surfaced for visibility, never part
+                # of the commit-authority envelope.
+                "static_analysis": static_analysis_results,
+                "static_analysis_summary": static_analysis_summary,
             }
             if not passed:
                 if not unchanged:
                     response["error"] = "verification commands changed the candidate state"
+                elif static_analysis_failed:
+                    response["error"] = (
+                        "static analysis reported errors (fail_on=error)"
+                    )
                 else:
                     response["error"] = "one or more verification commands failed"
                 return response
@@ -1827,6 +2114,7 @@ class VerificationCommitManager:
                 verified_at=_timestamp(),
                 commands=results,
                 environment_digest=environment_digest,
+                static_analysis=tuple(static_analysis_results),
             )
             async with self._records_lock:
                 self._records[record.verification_id] = record

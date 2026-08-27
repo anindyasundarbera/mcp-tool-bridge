@@ -1298,5 +1298,172 @@ class TestKindTests(unittest.TestCase):
             self._policy(["{python}", "-c", "pass"], kind="bogus")
 
 
+class StaticAnalysisTests(unittest.TestCase):
+    """M-ROADMAP static analysis: advisory by default, opt-in fail_on=error,
+    schema checks, and empty-by-default. Internal — no new tool, no new
+    capability; the tool surface stays at 39."""
+
+    LINT_OUTPUT = [
+        "{python}",
+        "-c",
+        "print('src/marker.py:3:5: E501 Line too long (88 > 79)'); "
+        "print('src/marker.py:9:1: W291 Trailing whitespace')",
+    ]
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        initialize_git_repository(self.root)
+        (self.root / "src").mkdir()
+        (self.root / "src" / "marker.py").write_text("VALUE = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "src"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-qm", "Add source"], check=True
+        )
+        self.settings = Settings.from_env(
+            {
+                "PROJECTS_CONFIG_PATH": str(self.base / "projects.json"),
+                "JOB_WORKTREE_ROOT": str(self.base / "jobs"),
+                "VERIFICATION_COMMAND_TIMEOUT_SECONDS": "2",
+                "MAX_VERIFICATION_OUTPUT_BYTES": "4096",
+            }
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _verify(
+        self, policy: ProjectPolicy, edit: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        async def exercise() -> tuple[dict[str, Any], dict[str, Any]]:
+            locks = ProjectLockManager()
+            jobs = DevelopmentJobManager(
+                self.settings,
+                locks,
+                EditingExecutor(edit),  # type: ignore[arg-type]
+                projects=(policy,),
+            )
+            manager = VerificationCommitManager(
+                self.settings, locks, jobs, projects=(policy,)
+            )
+            started = await jobs.start(policy, "candidate", "high")
+            completed = await wait_completed(jobs, policy, str(started["job_id"]))
+            verified = await manager.verify(
+                policy, str(completed["job_id"]), str(completed["base_head"])
+            )
+            return verified, completed
+
+        return asyncio.run(exercise())
+
+    def test_lint_output_parses_into_findings_and_counts(self) -> None:
+        policy = project(
+            self.root,
+            ["{python}", "-c", "pass"],
+            static_analysis={
+                "commands": [
+                    {"id": "lint", "argv": self.LINT_OUTPUT, "python_path": ["src"]}
+                ]
+            },
+        )
+        verified, _ = self._verify(
+            policy,
+            lambda root: (root / "candidate.txt").write_text(
+                "candidate", encoding="utf-8"
+            ),
+        )
+        self.assertEqual(verified["status"], "passed", verified)
+        self.assertEqual(verified["static_analysis_summary"]["error_count"], 1)
+        self.assertEqual(verified["static_analysis_summary"]["warning_count"], 1)
+        entry = verified["static_analysis"][0]
+        self.assertEqual(entry["command_id"], "lint")
+        self.assertEqual(entry["status"], "passed")
+        self.assertEqual(len(entry["findings"]), 2)
+        self.assertEqual(entry["findings"][0]["severity"], "error")
+        self.assertEqual(entry["findings"][0]["line"], 3)
+        self.assertEqual(entry["findings"][1]["severity"], "warning")
+        self.assertEqual(entry["findings"][1]["line"], 9)
+
+    def test_fail_on_never_keeps_findings_advisory(self) -> None:
+        policy = project(
+            self.root,
+            ["{python}", "-c", "pass"],
+            static_analysis={
+                "commands": [
+                    {"id": "lint", "argv": self.LINT_OUTPUT, "python_path": ["src"]}
+                ],
+                "fail_on": "never",
+            },
+        )
+        verified, _ = self._verify(
+            policy,
+            lambda root: (root / "candidate.txt").write_text(
+                "candidate", encoding="utf-8"
+            ),
+        )
+        self.assertEqual(verified["status"], "passed", verified)
+        self.assertEqual(verified["conclusion"], "PASS")
+        self.assertGreater(verified["static_analysis_summary"]["error_count"], 0)
+        self.assertIn("verification_id", verified)
+
+    def test_fail_on_error_flips_conclusion_to_fail(self) -> None:
+        policy = project(
+            self.root,
+            ["{python}", "-c", "pass"],
+            static_analysis={
+                "commands": [
+                    {"id": "lint", "argv": self.LINT_OUTPUT, "python_path": ["src"]}
+                ],
+                "fail_on": "error",
+            },
+        )
+        verified, _ = self._verify(
+            policy,
+            lambda root: (root / "candidate.txt").write_text(
+                "candidate", encoding="utf-8"
+            ),
+        )
+        self.assertEqual(verified["status"], "failed", verified)
+        self.assertEqual(verified["conclusion"], "FAIL")
+        self.assertIn("static analysis", verified["error"])
+        self.assertNotIn("verification_id", verified)
+
+    def test_schema_check_reports_invalid_changed_json(self) -> None:
+        policy = project(
+            self.root,
+            ["{python}", "-c", "pass"],
+            static_analysis={
+                "schema_checks": [{"path_glob": "*.json", "schema_kind": "json"}]
+            },
+        )
+
+        def edit(root: Path) -> None:
+            (root / "config.json").write_text("{invalid json", encoding="utf-8")
+
+        verified, _ = self._verify(policy, edit)
+        self.assertEqual(verified["status"], "passed", verified)
+        self.assertEqual(verified["static_analysis_summary"]["error_count"], 1)
+        entry = verified["static_analysis"][0]
+        self.assertEqual(entry["kind"], "schema")
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["findings"][0]["path"], "config.json")
+        self.assertEqual(entry["findings"][0]["severity"], "error")
+
+    def test_default_static_analysis_leaves_results_empty(self) -> None:
+        policy = project(self.root, ["{python}", "-c", "pass"])
+        verified, _ = self._verify(
+            policy,
+            lambda root: (root / "candidate.txt").write_text(
+                "candidate", encoding="utf-8"
+            ),
+        )
+        self.assertEqual(verified["status"], "passed")
+        self.assertEqual(verified["static_analysis"], [])
+        self.assertEqual(
+            verified["static_analysis_summary"],
+            {"error_count": 0, "warning_count": 0},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
