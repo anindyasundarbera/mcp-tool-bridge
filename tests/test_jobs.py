@@ -782,5 +782,127 @@ class EffortResolutionTests(unittest.TestCase):
         asyncio.run(exercise())
 
 
+class SuccessorJobTests(unittest.TestCase):
+    """M-CC-03: successor jobs branch off an immutable completed candidate.
+
+    A successor job's ``base_head`` is the parent job's *published* commit
+    (``CommittedCandidate.committed_sha``), not the canonical HEAD, and the
+    parent stays immutable. Internal-first: no new MCP tool.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        initialize_git_repository(self.root)
+        self.settings = settings(self.base)
+        self.project = policy(self.root)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _manager(self, executor: Any) -> DevelopmentJobManager:
+        return DevelopmentJobManager(
+            self.settings,
+            ProjectLockManager(),
+            executor,  # type: ignore[arg-type]
+            projects=(self.project,),
+        )
+
+    @staticmethod
+    def _commit_candidate(worktree: Path, message: str = "parent candidate") -> str:
+        subprocess.run(
+            ["git", "-C", str(worktree), "add", "candidate.txt"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(worktree), "commit", "-qm", message], check=True
+        )
+        return subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    def test_successor_branches_off_parent_published_commit(self) -> None:
+        async def exercise() -> None:
+            executor = ImmediateExecutor()
+            manager = self._manager(executor)
+            parent = await manager.start(self.project, "parent work", "high")
+            parent_id = str(parent["job_id"])
+            await wait_for_status(manager, self.project, parent_id, {"completed"})
+
+            # Publish the parent's candidate: commit its worktree contents and
+            # record the SHA as the parent's committed candidate.
+            parent_worktree = executor.calls[0]["root"]
+            sha = self._commit_candidate(parent_worktree)
+            await manager.record_commit(self.project, parent_id, sha)
+
+            parent_before = await manager.get(self.project, parent_id)
+            self.assertEqual(parent_before["status"], "completed")
+            self.assertEqual(parent_before["commit_sha"], sha)
+
+            successor = await manager.create_successor_job(
+                self.project, parent_id, "successor work", "high"
+            )
+            successor_id = str(successor["job_id"])
+            self.assertEqual(successor["parent_job_id"], parent_id)
+            self.assertEqual(successor["successor_base_head"], sha)
+
+            await wait_for_status(
+                manager, self.project, successor_id, {"completed"}
+            )
+            snapshot = await manager.get(self.project, successor_id)
+            self.assertEqual(snapshot["status"], "completed")
+            self.assertEqual(snapshot["base_head"], sha)
+            self.assertEqual(snapshot["successor_base_head"], sha)
+            self.assertEqual(snapshot["parent_job_id"], parent_id)
+            # The successor runs in a fresh worktree of its own, not the parent's.
+            self.assertNotEqual(executor.calls[1]["root"], parent_worktree)
+
+            # The parent stays immutable: still completed, same committed SHA,
+            # and never gains a successor_base_head of its own.
+            parent_after = await manager.get(self.project, parent_id)
+            self.assertEqual(parent_after["status"], "completed")
+            self.assertEqual(parent_after["commit_sha"], sha)
+            self.assertNotIn("successor_base_head", parent_after)
+            self.assertEqual(
+                parent_after["updated_at"], parent_before["updated_at"]
+            )
+
+        asyncio.run(exercise())
+
+    def test_successor_requires_published_parent_commit(self) -> None:
+        async def exercise() -> None:
+            manager = self._manager(ImmediateExecutor())
+            parent = await manager.start(self.project, "parent work", "high")
+            parent_id = str(parent["job_id"])
+            await wait_for_status(manager, self.project, parent_id, {"completed"})
+            # The parent completed but was never published; fail closed.
+            with self.assertRaisesRegex(DevelopmentJobError, "no published commit"):
+                await manager.create_successor_job(
+                    self.project, parent_id, "successor work", "high"
+                )
+
+        asyncio.run(exercise())
+
+    def test_successor_requires_completed_parent(self) -> None:
+        async def exercise() -> None:
+            executor = BlockingExecutor()
+            manager = self._manager(executor)
+            parent = await manager.start(self.project, "parent work", "high")
+            parent_id = str(parent["job_id"])
+            await asyncio.wait_for(executor.entered.wait(), timeout=2)
+            # Parent is still running; it cannot spawn a successor.
+            with self.assertRaisesRegex(DevelopmentJobError, "only a completed"):
+                await manager.create_successor_job(
+                    self.project, parent_id, "successor work", "high"
+                )
+            # Unblock the running parent so the test exits cleanly.
+            await manager.cancel(self.project, parent_id)
+
+        asyncio.run(exercise())
+
+
 if __name__ == "__main__":
     unittest.main()

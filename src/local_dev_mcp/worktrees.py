@@ -385,6 +385,131 @@ class GitWorktreeManager:
                 except (GitCommandError, OSError):
                     pass
 
+    async def create_at_commit(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        base_head: str,
+    ) -> JobWorktree:
+        """Create a detached worktree pinned to an exact local commit (M-CC-03).
+
+        Unlike ``create`` (which pins to the local canonical HEAD or the fetched
+        ``origin/<default>`` tip) and ``create_detached_at_head`` (which requires
+        the canonical checkout itself to be AT ``base_head``), this pins the
+        worktree to an arbitrary commit that already exists in the shared object
+        store — e.g. a completed job's published ``committed_sha``, so a
+        successor job branches off the immutable completed candidate rather than
+        the canonical HEAD. Linked worktrees share the canonical repository's
+        object database, so a commit created in an earlier job worktree is
+        resolvable here.
+
+        The canonical checkout must be clean (same invariant as ``create``): the
+        successor is a fresh development job, so a dirty source checkout fails
+        closed before any worktree is created. ``base_head`` must be a 40-hex
+        commit that resolves in the object store; anything else (a short SHA, a
+        branch name, a missing commit) is rejected so the worktree can never be
+        pinned to an ambiguous or fabricated base.
+        """
+        root = self._root_for(project)
+        project_directory = _ensure_private_directory(root / project.id)
+
+        path = project_directory / job_id
+        if path.exists() or path.is_symlink():
+            raise WorktreeError("job worktree path already exists")
+
+        before_status, local_head = await self._source_state(project)
+        if before_status:
+            raise WorktreeError(
+                "configured project checkout must be clean before starting a job"
+            )
+
+        # Resolve the exact commit: reject short SHAs, branch names, and commits
+        # absent from the shared object store (fail closed, never guess).
+        try:
+            resolved_head = await run_git(
+                project.root,
+                "rev-parse",
+                "--verify",
+                f"{base_head}^{{commit}}",
+                timeout_seconds=self.settings.git_command_timeout_seconds,
+            )
+        except GitCommandError as exc:
+            raise WorktreeError(
+                f"base commit {base_head[:12]} is not a resolvable commit in "
+                "the local object store"
+            ) from exc
+        pin = resolved_head.strip().lower()
+
+        created = False
+        completed = False
+        try:
+            await run_git(
+                project.root,
+                "worktree",
+                "add",
+                "--detach",
+                "--",
+                str(path),
+                pin,
+                timeout_seconds=self.settings.git_command_timeout_seconds,
+            )
+            created = True
+
+            after_status, after_head = await self._source_state(project)
+            if after_status or after_head != local_head:
+                raise WorktreeError(
+                    "configured project checkout changed during worktree creation"
+                )
+
+            resolved = path.resolve(strict=True)
+            if resolved.parent != project_directory.resolve(strict=True):
+                raise WorktreeError("job worktree escaped the configured worktree root")
+            worktree_root = await run_git(
+                resolved,
+                "rev-parse",
+                "--show-toplevel",
+                timeout_seconds=self.settings.git_command_timeout_seconds,
+            )
+            worktree_head = await run_git(
+                resolved,
+                "rev-parse",
+                "--verify",
+                "HEAD",
+                timeout_seconds=self.settings.git_command_timeout_seconds,
+            )
+            worktree_status = await run_git(
+                resolved,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                timeout_seconds=self.settings.git_command_timeout_seconds,
+            )
+            if Path(worktree_root).resolve(strict=True) != resolved:
+                raise WorktreeError("created job path is not a Git worktree root")
+            if worktree_head.lower() != pin or worktree_status:
+                raise WorktreeError("created job worktree has an invalid baseline")
+            completed = True
+            return JobWorktree(path=resolved, base_head=pin)
+        except (GitCommandError, OSError) as exc:
+            raise WorktreeError(str(exc)) from exc
+        finally:
+            if created and not completed:
+                # Git may have registered a partially-created worktree. A forced
+                # removal is safe here because this path was allocated by this call
+                # and has not been handed to Claude.
+                try:
+                    await run_git(
+                        project.root,
+                        "worktree",
+                        "remove",
+                        "--force",
+                        "--",
+                        str(path),
+                        timeout_seconds=self.settings.git_command_timeout_seconds,
+                    )
+                except (GitCommandError, OSError):
+                    pass
+
     async def create_detached_at_head(
         self,
         project: ProjectPolicy,

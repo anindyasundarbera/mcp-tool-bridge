@@ -1200,6 +1200,7 @@ class CheckpointStoreTests(unittest.TestCase):
                         "milestones_json": None,
                         "parent_job_id": None,
                         "delegation_mandate_json": None,
+                        "successor_base_head": None,
                         "updated_at": "2026-08-12T00:00:00Z",
                     },
                 )
@@ -1229,6 +1230,7 @@ class CheckpointStoreTests(unittest.TestCase):
                         "milestones_json": None,
                         "parent_job_id": None,
                         "delegation_mandate_json": None,
+                        "successor_base_head": None,
                         "updated_at": "2026-08-12T00:00:01Z",
                     },
                 )

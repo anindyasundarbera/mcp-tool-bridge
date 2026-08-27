@@ -330,6 +330,12 @@ class DevelopmentJob:
     # self-review (``reviewer_id == drafter``). Persisted in the
     # ``job_progress`` sidecar (additive).
     drafter_id: str | None = None
+    # M-CC-03: successor jobs branch off an immutable completed candidate's
+    # published commit rather than the canonical HEAD. ``successor_base_head``
+    # pins the worktree base to the parent job's ``CommittedCandidate
+    # .committed_sha``; persisted in the ``job_progress`` sidecar (additive) so
+    # the ``jobs`` schema is untouched. ``None`` for ordinary jobs.
+    successor_base_head: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -673,6 +679,7 @@ class DevelopmentJobManager:
             "parent_job_id": job.parent_job_id,
             "delegation_mandate_json": _json_dumps(job.delegation_mandate),
             "drafter_id": job.drafter_id,
+            "successor_base_head": job.successor_base_head,
             "updated_at": _timestamp(),
         }
 
@@ -704,6 +711,7 @@ class DevelopmentJobManager:
         if isinstance(mandate, dict):
             job.delegation_mandate = mandate
         job.drafter_id = row.get("drafter_id")
+        job.successor_base_head = row.get("successor_base_head")
 
     def _record_event(
         self,
@@ -1516,6 +1524,11 @@ class DevelopmentJobManager:
             snapshot["delegation_mandate"] = job.delegation_mandate
         if job.drafter_id is not None:
             snapshot["drafter_id"] = job.drafter_id
+        # M-CC-03: surface the pinned base of a successor job (the parent job's
+        # published committed SHA) so an orchestrator can see the successor
+        # branched off the immutable completed candidate, not canonical HEAD.
+        if job.successor_base_head is not None:
+            snapshot["successor_base_head"] = job.successor_base_head
         # M-GV-06: surface the parent/child delegation tree (children of this
         # job, from the delegations ledger) so an orchestrator can query it.
         children = store.load_delegation_rows_for_parent(self._db, job.job_id)
@@ -2098,6 +2111,73 @@ class DevelopmentJobManager:
                     f"capability {capability.value!r}; its mandate authority "
                     f"is limited to {sorted(allowed)}"
                 )
+
+    async def create_successor_job(
+        self,
+        project: ProjectPolicy,
+        parent_job_id: str,
+        text: str,
+        effort: Effort | None = None,
+    ) -> dict[str, Any]:
+        """M-CC-03: create a successor job branching off an immutable completed candidate.
+
+        The successor's ``base_head`` is the parent job's *published* commit —
+        ``CommittedCandidate.committed_sha`` — NOT the canonical HEAD. The
+        parent stays immutable: it is never mutated here, and ``resume`` already
+        rejects completed/committed jobs, so no path can alter a completed
+        candidate. The parent/child link is recorded via the existing
+        ``parent_job_id`` field (M-GV-06). Internal-first: no new MCP tool.
+        """
+        effort = resolve_effort(project, effort, self.settings)
+        specification = self._validate_input(project, text, effort)
+        async with self._state_lock:
+            parent = self._require_job(project, parent_job_id)
+            if parent.status != JobStatus.COMPLETED:
+                raise DevelopmentJobError(
+                    "only a completed development job can spawn a successor"
+                )
+            if parent.committed_sha is None:
+                raise DevelopmentJobError(
+                    "parent job has no published commit to branch from"
+                )
+            if parent.worktree is None:
+                raise DevelopmentJobError(
+                    "parent job has no retained worktree to branch from"
+                )
+            successor = DevelopmentJob(
+                job_id=self._new_job_id(),
+                project_id=project.id,
+                effort=effort,
+                parent_job_id=parent_job_id,
+                successor_base_head=parent.committed_sha,
+            )
+            self._jobs[successor.job_id] = successor
+            self._persist_progress(successor)
+            self._record_event(
+                successor,
+                "created",
+                {
+                    "effort": effort,
+                    "parent_job_id": parent_job_id,
+                    "successor_base": parent.committed_sha,
+                },
+                authority={
+                    "actor": "ChatGPT",
+                    "authority_source": "chatgpt_confirmation",
+                    "scope": "job_creation",
+                    "classification": "canonical",
+                    "detail": {
+                        "parent_job_id": parent_job_id,
+                        "base_head": parent.committed_sha,
+                    },
+                },
+            )
+            successor.task = asyncio.create_task(
+                self._run(successor, project, specification, effort, resume=False),
+                name=f"development-job-{successor.job_id}",
+            )
+            self._persist_job(successor)
+            return self._snapshot(successor)
 
     async def get(
         self,
@@ -2696,9 +2776,20 @@ class DevelopmentJobManager:
                     assert job.worktree is not None
                     await self._worktrees.validate_resume(project, job.worktree)
                 else:
-                    worktree = await self._worktrees.create(
-                        project, job.job_id, requested_base=job.requested_base
-                    )
+                    # M-CC-03: a successor job pins its worktree to the parent
+                    # job's published committed SHA (which exists in the shared
+                    # object store), NOT the canonical HEAD or the origin tip.
+                    # All other jobs keep the canonical/requested-base path.
+                    if job.successor_base_head is not None:
+                        worktree = await self._worktrees.create_at_commit(
+                            project, job.job_id, job.successor_base_head
+                        )
+                    else:
+                        worktree = await self._worktrees.create(
+                            project,
+                            job.job_id,
+                            requested_base=job.requested_base,
+                        )
                     async with self._state_lock:
                         job.worktree = worktree
                         job.updated_at = _timestamp()
@@ -2819,7 +2910,14 @@ class DevelopmentJobManager:
                         # error) rejects the child rather than promoting it.
                         # Gate on parent_job_id (not delegation_mandate) so a
                         # legacy child row with a NULL mandate still enforces.
-                        if job.parent_job_id is not None:
+                        # M-CC-03: a successor job also carries parent_job_id
+                        # (the linked parent), but it is a fresh development job
+                        # with successor_base_head set, NOT a bounded delegated
+                        # child — so it is exempt from the mandate scope check.
+                        if (
+                            job.parent_job_id is not None
+                            and job.successor_base_head is None
+                        ):
                             if job.delegation_mandate is None:
                                 # A legacy child row with a NULL mandate cannot
                                 # be scope-checked; fail closed rather than
