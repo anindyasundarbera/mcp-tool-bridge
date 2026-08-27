@@ -2824,6 +2824,108 @@ class DevelopmentJobManager:
             snapshot = self._snapshot(job)
         return {**snapshot, "scope": scope}
 
+    async def replace_worker(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+        text: str,
+        effort: Effort | None = None,
+    ) -> dict[str, Any]:
+        """M-CC-08: re-spawn the drafter on the same candidate.
+
+        Re-queues a terminal (e.g. paused) job so a brand-new Claude session
+        resumes the SAME retained worktree and candidate seed — the previous
+        worker's session is discarded (``session_id`` cleared) rather than
+        resumed, and the worker gets a fresh slice budget. Refuses committed
+        jobs. Records a ``control_replace_worker`` audit event.
+        """
+        effort = resolve_effort(project, effort, self.settings)
+        specification = self._validate_input(project, text, effort)
+        async with self._state_lock:
+            job = self._require_job(project, job_id)
+            if job.task is not None:
+                raise DevelopmentJobError(
+                    "only a terminal development job can replace its worker"
+                )
+            if job.status not in TERMINAL_STATUSES:
+                raise DevelopmentJobError(
+                    "only a terminal development job can replace its worker"
+                )
+            if job.status in NON_RESUMABLE_STATUSES:
+                raise DevelopmentJobError(
+                    "this development job is not resumable"
+                )
+            if job.committed_sha is not None:
+                raise DevelopmentJobError(
+                    "a committed development job cannot replace its worker"
+                )
+            if job.worktree is None:
+                raise DevelopmentJobError(
+                    "job has no retained worktree to resume"
+                )
+            checkpoint = store.load_latest_checkpoint(self._db, job.job_id)
+            previous_session = job.session_id
+            job.effort = effort
+            job.attempt += 1
+            job.status = JobStatus.QUEUED
+            job.updated_at = _timestamp()
+            job.cancel_requested = False
+            job.result = None
+            job.candidate = None
+            job.error = None
+            job.pause_reason = None
+            # New drafter: a fresh session on the same candidate/worktree.
+            job.session_id = None
+            self._last_changed_paths.pop(job.job_id, None)
+            self._progress_intel_reasons.pop(job.job_id, None)
+            self._test_assertion_baselines.pop(job.job_id, None)
+            # Fresh worker budget on the retained candidate.
+            job.turns_used = 0
+            job.tokens_used = 0
+            job.extensions_granted = 0
+            job.manual_extensions_granted = 0
+            job.no_progress_turns = 0
+            job.tool_failures = 0
+            job.soft_warned = False
+            self._persist_progress(job)
+            self._record_event(
+                job,
+                "control_replace_worker",
+                {
+                    "attempt": job.attempt,
+                    "previous_session_id": previous_session,
+                    "same_candidate": True,
+                },
+                authority={
+                    "actor": "ChatGPT",
+                    "authority_source": "chatgpt_confirmation",
+                    "scope": "replace_worker",
+                    "classification": "canonical",
+                },
+            )
+            job.task = asyncio.create_task(
+                self._run(
+                    job,
+                    project,
+                    specification,
+                    effort,
+                    resume=True,
+                    resume_seed=self._resume_seed(checkpoint),
+                ),
+                name=f"development-job-{job.job_id}-worker-{job.attempt}",
+            )
+            self._persist_job(job)
+            snapshot = self._snapshot(job)
+        return {
+            **snapshot,
+            "worker": {
+                "replaced": True,
+                "attempt": job.attempt,
+                "same_candidate": True,
+                "previous_session_id": previous_session,
+            },
+        }
+
     async def verification_worktree(
         self,
         project: ProjectPolicy,

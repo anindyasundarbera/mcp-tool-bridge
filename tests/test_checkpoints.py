@@ -1696,10 +1696,10 @@ class ContinuityToolSurfaceTests(unittest.TestCase):
             tools = {tool.name for tool in _asyncio.run(server.list_tools())}
 
         # Continuity is internal to the job lifecycle: it must not add tools.
-        # The count is the current tool surface (35: the M-CC-08 human control
-        # surface added pause_development_job, extend_budget, and narrow_scope);
-        # continuity itself adds none.
-        self.assertEqual(len(tools), 35)
+        # The count is the current tool surface (36: the M-CC-08 human control
+        # surface added pause_development_job, extend_budget, narrow_scope, and
+        # replace_worker); continuity itself adds none.
+        self.assertEqual(len(tools), 36)
         for leaked in (
             "checkpoint_development_job",
             "extend_development_job",
@@ -1711,6 +1711,7 @@ class ContinuityToolSurfaceTests(unittest.TestCase):
         self.assertIn("pause_development_job", tools)
         self.assertIn("extend_budget", tools)
         self.assertIn("narrow_scope", tools)
+        self.assertIn("replace_worker", tools)
 
 
 if __name__ == "__main__":

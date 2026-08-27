@@ -754,6 +754,57 @@ def create_server(
         )
 
     @mcp.tool(
+        name="replace_worker",
+        description=(
+            "Re-spawn the drafter for a development job that is terminal (for "
+            "example paused): a brand-new Claude session resumes the same "
+            "retained worktree and candidate seed, with a fresh slice budget. "
+            "The previous worker's session is discarded, not resumed. Records a "
+            "control_replace_worker audit event. Opt-in via the replace_worker "
+            "project capability."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=False,
+        ),
+    )
+    async def replace_worker(
+        project_id: Annotated[
+            str,
+            Field(description="Exact project ID returned by list_allowed_projects."),
+        ],
+        job_id: Annotated[
+            str,
+            Field(
+                description="Opaque job ID returned by send_to_local_dev.",
+                pattern=r"^[0-9a-f]{32}$",
+            ),
+        ],
+        text: Annotated[
+            str,
+            Field(description="Direction for the replacement worker."),
+        ],
+        effort: Annotated[
+            Effort | None,
+            Field(description="Effort override (high or ultracode)."),
+        ] = None,
+    ) -> dict[str, Any]:
+        project = active_registry.resolve(
+            project_id, ProjectCapability.REPLACE_WORKER
+        )
+        return await active_jobs.replace_worker(
+            project, job_id, text, effort=effort
+        )
+        project = active_registry.resolve(
+            project_id, ProjectCapability.REPLACE_WORKER
+        )
+        return await active_jobs.replace_worker(
+            project, job_id, text, effort=effort
+        )
+
+    @mcp.tool(
         name="verify_development_job",
         description=(
             "Run only the fixed verification commands configured for a completed "

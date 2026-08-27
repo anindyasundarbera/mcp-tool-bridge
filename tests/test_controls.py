@@ -115,6 +115,7 @@ class SessionedBlockingExecutor:
 
     def __init__(self) -> None:
         self.calls = 0
+        self.resume_sessions: list[str | None] = []
         self.blocked = asyncio.Event()
         self.release = asyncio.Event()
 
@@ -130,6 +131,7 @@ class SessionedBlockingExecutor:
     ) -> dict[str, Any]:
         assert root is not None
         self.calls += 1
+        self.resume_sessions.append(resume_session_id)
         if self.calls == 1:
             (root / "step1.txt").write_text("step 1\n", encoding="utf-8")
             return {
@@ -493,6 +495,116 @@ class NarrowScopeTests(unittest.TestCase):
                         "capabilities": [
                             "repository_read",
                             ProjectCapability.NARROW_SCOPE.value,
+                        ],
+                    }
+                )
+
+        asyncio.run(exercise())
+
+
+class ReplaceWorkerTests(unittest.TestCase):
+    """replace_worker: re-spawn the drafter on the same candidate."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "repo"
+        initialize_git_repository(self.root)
+        self.settings = control_settings(self.base)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_replace_worker_respawns_same_candidate(self) -> None:
+        async def exercise() -> None:
+            policy = project(self.root, ["{python}", "-c", "print('ok')"])
+            locks = ProjectLockManager()
+            executor = SessionedBlockingExecutor()
+            jobs = DevelopmentJobManager(
+                sessioned_settings(self.base), locks, executor, projects=(policy,)
+            )
+            started = await jobs.start(policy, "make candidate", "high")
+            job_id = str(started["job_id"])
+            # Call 1 returned a resumable max_turns slice; call 2 (extended
+            # slice) is in flight and blocked.
+            await asyncio.wait_for(executor.blocked.wait(), timeout=2)
+            paused = await jobs.pause(policy, job_id)
+            self.assertEqual(paused["status"], "paused_interrupted")
+            self.assertTrue(paused["resume_available"])
+
+            replaced = await jobs.replace_worker(policy, job_id, "new drafter")
+            self.assertEqual(replaced["status"], "queued")
+            self.assertEqual(replaced["worker"]["replaced"], True)
+            self.assertEqual(replaced["worker"]["same_candidate"], True)
+            self.assertEqual(
+                replaced["worker"]["previous_session_id"], "control-session"
+            )
+            # The candidate worktree is retained.
+            self.assertIn("base_head", replaced)
+            events = event_types(jobs._db, job_id)
+            self.assertEqual(events.count("control_replace_worker"), 1)
+
+            # The replacement worker completes the same candidate, starting a
+            # FRESH session (resume_session_id None) rather than resuming the
+            # previous worker's session.
+            completed = await wait_completed(jobs, policy, job_id)
+            self.assertEqual(completed["status"], "completed")
+            self.assertIn("base_head", completed)
+            self.assertIsNone(executor.resume_sessions[-1])
+
+        asyncio.run(exercise())
+
+    def test_replace_worker_refuses_a_running_job(self) -> None:
+        async def exercise() -> None:
+            policy = project(self.root, ["{python}", "-c", "print('ok')"])
+            locks = ProjectLockManager()
+            blocking = BlockingExecutor()
+            jobs = DevelopmentJobManager(
+                self.settings, locks, blocking, projects=(policy,)
+            )
+            started = await jobs.start(policy, "make candidate", "high")
+            job_id = str(started["job_id"])
+            await asyncio.wait_for(blocking.entered.wait(), timeout=2)
+            with self.assertRaises(DevelopmentJobError):
+                await jobs.replace_worker(policy, job_id, "no")
+            blocking.release.set()
+
+        asyncio.run(exercise())
+
+    def test_replace_worker_is_capability_gated_via_server(self) -> None:
+        async def exercise() -> None:
+            from fastmcp.exceptions import ToolError
+
+            policy = project(
+                self.root,
+                ["{python}", "-c", "print('ok')"],
+                capabilities=["repository_read", "claude_edit", "verification_commit"],
+            )
+            server = server_for(self.base, policy)
+            with self.assertRaises(ToolError):
+                await server.call_tool(
+                    "replace_worker",
+                    {
+                        "project_id": "test-project",
+                        "job_id": "0" * 32,
+                        "text": "take over",
+                    },
+                )
+
+        asyncio.run(exercise())
+
+    def test_replace_worker_capability_requires_claude_edit_in_policy(self) -> None:
+        async def exercise() -> None:
+            with self.assertRaises(ValueError):
+                ProjectPolicy.model_validate(
+                    {
+                        "id": "test-project",
+                        "display_name": "T",
+                        "description": "T",
+                        "root": str(self.root),
+                        "capabilities": [
+                            "repository_read",
+                            ProjectCapability.REPLACE_WORKER.value,
                         ],
                     }
                 )
