@@ -29,6 +29,7 @@ from .working_tree_capture import (
     WorkingTreeCaptureManager,
 )
 from .authorization import AuthorizationManager
+from .open_hands_action import OpenHandsActionManager
 
 
 def create_server(
