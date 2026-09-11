@@ -1936,7 +1936,17 @@ class VerificationCommitManager:
                 worktree = await self._jobs.verification_worktree(project, job_id)
                 if expected_head != worktree.base_head:
                     raise VerificationError("expected_head does not match the job base HEAD")
-                await self._worktrees.validate_resume(project, worktree)
+                # MCPB-012: origin-aware clean-source exception. A retained
+                # candidate whose trusted durable origin is the working-tree
+                # capture is verifiable while the canonical checkout remains
+                # dirty (the capture left it that way by design); ordinary
+                # candidates keep the clean-source rule.
+                allow_dirty_source = await self._jobs.is_working_tree_capture_candidate(
+                    project, job_id
+                )
+                await self._worktrees.validate_resume(
+                    project, worktree, allow_dirty_source=allow_dirty_source
+                )
                 before = await self._candidate_state_or_rollback(
                     project, job_id, worktree
                 )
@@ -2370,7 +2380,18 @@ class VerificationCommitManager:
 
             worktree = await self._jobs.verification_worktree(project, job_id)
             try:
-                await self._worktrees.validate_resume(project, worktree)
+                # MCPB-012: origin-aware clean-source exception (mirrors
+                # ``verify``) so a captured candidate can be committed while
+                # the canonical checkout remains dirty with the captured
+                # source state; ordinary candidates keep the clean-source rule.
+                allow_dirty_source = (
+                    await self._jobs.is_working_tree_capture_candidate(
+                        project, job_id
+                    )
+                )
+                await self._worktrees.validate_resume(
+                    project, worktree, allow_dirty_source=allow_dirty_source
+                )
                 current = await _candidate_state(self.settings, project, worktree)
             except (DevelopmentJobError, WorktreeError, GitCommandError) as exc:
                 raise VerificationError(str(exc)) from exc

@@ -18,8 +18,13 @@ capture is **read-only against the source**: it never stages, resets, restores,
 checks out, cleans, renames, deletes, or writes any canonical working-tree
 file, and it never alters index state, Git configuration, remotes, branches, or
 `.reasonix` content. The captured candidate is a normal retained governed
-candidate, eligible unchanged for `verify_development_job`, `candidate_review`,
-`verification_commit`, and `push_development_commit`.
+candidate, eligible through `list_candidate_changes` / `read_candidate_file`,
+`candidate_review`, `verify_development_job`, `verification_commit`, and
+`push_development_commit` — with the single downstream adjustment described
+below: because the capture leaves the canonical checkout dirty **by design**,
+the shared downstream clean-source precondition is relaxed **only** for a
+candidate whose trusted durable origin is the working-tree capture (see
+"Downstream gates and the dirty source" and the defect-repair record).
 
 It is **dormant by default**: a project that does not opt in observes no new
 tool and no broadened permission. Opt-in requires `repository_read` and a
@@ -69,11 +74,12 @@ post-revalidation against disk).
    the exact bound HEAD; the source working tree, index, refs, config, and
    `.reasonix` content are never written.
 2. **Bind capture to exact provenance.** The exact canonical HEAD SHA is
-   recorded and re-checked. A working-tree fingerprint is computed before the
-   source is read, recomputed after source collection, and recomputed once
-   more immediately before success. Any drift — HEAD moved, a selected or
-   protected-excluded file changed, the changed-path set changed — fails the
-   capture and leaves **no usable candidate**.
+   recorded and re-checked. The working-tree fingerprint is computed twice:
+   once after source collection (before the overlay) and once after the
+   overlay, during the final source-state revalidation immediately before
+   success. Any drift — HEAD moved, a selected or protected-excluded file
+   changed, the changed-path set changed — fails the capture and leaves
+   **no usable candidate**.
 3. **Require explicit, approved scope.** The caller supplies the include and
    protected-exclude path sets, which must equal the policy-pinned scope.
    Protected exclusions always override inclusions and never appear in the
@@ -91,9 +97,12 @@ post-revalidation against disk).
 6. **Retained-candidate lifecycle.** A successful capture registers a
    development job directly in the `COMPLETED` / inactive / uncommitted state
    (never running Claude) via `register_captured_candidate`, so every
-   downstream gate accepts it unchanged and the candidate is restart-safe. A
-   failed capture force-removes the worktree and persists a `rejected` audit
-   row; no partial candidate survives.
+   downstream gate accepts it and the candidate is restart-safe.
+   `register_captured_candidate` stamps the durable candidate origin
+   (`origin = "working_tree_capture"`) itself — it is bridge-internal
+   provenance persisted in the job row's `candidate_json`, never a
+   caller-controlled value. A failed capture force-removes the worktree and
+   persists a `rejected` audit row; no partial candidate survives.
 
 ## Working-tree fingerprint algorithm
 
@@ -133,10 +142,11 @@ returned alongside it is computed by the **same** `_digest_candidate_paths`
 routine that `verify_development_job` uses, so the captured candidate is
 content-addressed identically at the gate boundary.
 
-Drift detection recomputes this fingerprint from a fresh `git status` snapshot
-and fresh file reads after the overlay and again immediately before success;
-any mismatch (`fingerprint_pre != fingerprint_post`, HEAD moved, or any
-descriptor field changed) fails the capture.
+Drift detection recomputes this fingerprint once, from a fresh `git status`
+snapshot and fresh file reads after the overlay, as part of the final
+source-state revalidation immediately before success; any mismatch
+(`fingerprint_pre != fingerprint_post`, HEAD moved, or any descriptor field
+changed) fails the capture.
 
 ## Errors
 
@@ -177,9 +187,55 @@ capture
    ├─ persist captured audit row
    └─ return response
        on any failure → force-remove worktree, persist rejected audit row, raise
-downstream gates (unchanged)
+downstream gates (origin-aware clean-source exception; everything else unchanged)
    verify_development_job → candidate_review → commit_verified_development_job → push_development_commit
 ```
+
+## Downstream gates and the dirty source (defect repair)
+
+**Defect.** The capture leaves the canonical checkout dirty **by design**, but
+the shared downstream preconditions in `GitWorktreeManager.validate_resume`
+required the canonical checkout to be clean before *any* gate touched a
+retained candidate. A just-captured candidate was therefore retained but
+inert: `list_candidate_changes`, `read_candidate_file`,
+`candidate_review`, `verify_development_job`, and the commit gate all failed
+closed on the very dirty state the candidate was captured from.
+
+**Chosen invariant.** The canonical-cleanliness precondition is relaxed only
+when trusted, durable bridge state proves the retained candidate's origin is
+the working-tree capture; every other gate precondition is untouched:
+
+- The default fail-closed rule is preserved — an ordinary (non-captured)
+  job is still denied resume/list/read/verify/review/commit on a dirty
+  canonical source, and a new ordinary job still cannot start on one.
+- The authority is the durable candidate origin stamped by
+  `register_captured_candidate` (`CAPTURED_CANDIDATE_ORIGIN`), persisted in
+  the job row's `candidate_json` and rehydrated by `_reload_jobs`, so it
+  survives a bridge/job-manager restart. `DevelopmentJobManager.
+  is_working_tree_capture_candidate` derives it; no tool caller can supply or
+  influence it, and unknown jobs / non-captured candidates answer `False`.
+- The exact base-HEAD requirement is unchanged: a captured candidate still
+  fails every gate once canonical HEAD moves.
+- Candidate fingerprint, changed-path equality, policy fingerprint,
+  protected-path, verification, review, and commit bindings are unchanged —
+  only the canonical-cleanliness precondition is conditional.
+
+**Mechanics.** `validate_resume` gained a keyword-only
+`allow_dirty_source: bool = False`; the four downstream call sites
+(`verify`, commit preparation/commit, review's shared `_reviewable_worktree_locked`
+which covers `list_candidate_changes` / `read_candidate_file` / review
+recording, and the job resume path) each derive the flag from
+`is_working_tree_capture_candidate`. Job resume also honors it so a captured
+candidate remains resumable; job *creation* still requires a clean source.
+
+**Tested behaviors** (tests 18–23 in `tests/test_working_tree_capture.py`):
+a captured candidate passes inspection, review recording, and fixed
+verification — and a later commit — while its captured source stays dirty and
+byte-identical (HEAD, index/status, and file bytes unchanged); an ordinary
+job under a dirty source is still denied; a captured candidate is denied
+after canonical HEAD movement; the capture origin persists across a
+job-manager reload and gates still pass; and post-verification candidate
+drift is still denied at the commit gate.
 
 ## MrBera scope
 
@@ -312,13 +368,19 @@ checks.
 
 ### Tests run + results
 
+Protected fixed verification observed by the orchestrator on the exact
+pre-correction candidate on 2026-09-11 (verification ID
+`6f252f1139f6761765d26572d8627031`):
+
 ```
-.venv/bin/python -m pytest tests/ -q
-→ 340 passed, 42 subtests passed
+597 passed in 45.869s
 ```
 
-Includes the 17 capture cases, 8 policy tests, 3 updated canaries, and the full
-existing local-dev-mcp suite (no regressions). The unrelated `tokengate/`,
+Includes the new capture-gate tests 18–23 (all passed), the 17 capture cases,
+8 policy tests, 3 updated tool-count canaries, and the full existing
+local-dev-mcp suite (no regressions). This evidence **precedes** the
+documentation-only / no-op cleanup; it does not verify the post-correction
+candidate — fresh verification is required. The unrelated `tokengate/`,
 `LightRAG/`, and `RAG-Anything/` subprojects that share the repo root are not
 part of this server and are excluded from the run.
 

@@ -142,6 +142,13 @@ MAX_LIST_JOBS = 200
 # returns a bounded response.
 MAX_VALIDATION_EVIDENCE_ENTRIES = 50
 
+# MCPB-012: the durable candidate origin stamped by
+# ``register_captured_candidate``. Downstream gates may relax the
+# canonical-cleanliness precondition only for a retained job whose durable
+# record proves this origin — the value is bridge-internal provenance, never a
+# caller-controlled input.
+CAPTURED_CANDIDATE_ORIGIN = "working_tree_capture"
+
 
 def _timestamp() -> str:
     return datetime.now(UTC).isoformat()
@@ -2139,6 +2146,11 @@ class DevelopmentJobManager:
         """
         effort = resolve_effort(project, effort, self.settings)
         validate_effort(project, effort)
+        # MCPB-012: the origin is bridge-internal provenance, not caller input —
+        # stamp it here (overwriting whatever the caller passed) so only this
+        # bridge-internal registration path can ever produce a captured origin,
+        # and so downstream gates can trust the durable ``candidate_json`` value.
+        candidate = {**candidate, "origin": CAPTURED_CANDIDATE_ORIGIN}
         async with self._state_lock:
             if job_id in self._jobs or store.job_id_exists(self._db, job_id):
                 raise DevelopmentJobError("captured job id already exists")
@@ -3098,6 +3110,33 @@ class DevelopmentJobManager:
                 raise DevelopmentJobError("job has no retained worktree")
             return job.worktree
 
+    async def is_working_tree_capture_candidate(
+        self,
+        project: ProjectPolicy,
+        job_id: str,
+    ) -> bool:
+        """True only when durable job state proves a captured-candidate origin.
+
+        MCPB-012: the answer is read from the job's rehydrated durable record
+        (``candidate_json`` on the ``jobs`` row — the same record
+        ``_reload_jobs`` restores after a bridge or job-manager restart), so a
+        restart or reload keeps the capture origin. The origin is stamped only
+        by ``register_captured_candidate``; no tool caller can supply or
+        influence it. Downstream gates use this solely to relax the
+        canonical-cleanliness precondition (``validate_resume``) for a
+        candidate whose capture left the canonical checkout dirty by design —
+        every other gate precondition (base-HEAD binding, fingerprints, policy
+        paths, review/commit bindings) is unchanged, and any unknown job or
+        non-captured candidate answers ``False`` (fail closed).
+        """
+        async with self._state_lock:
+            job = self._jobs.get(job_id)
+            candidate = job.candidate if job is not None else None
+            project_matches = job is not None and job.project_id == project.id
+        if not project_matches or not isinstance(candidate, dict):
+            return False
+        return candidate.get("origin") == CAPTURED_CANDIDATE_ORIGIN
+
     async def record_commit(
         self,
         project: ProjectPolicy,
@@ -3741,7 +3780,21 @@ class DevelopmentJobManager:
                 await self._set_status(job, JobStatus.PREPARING_WORKTREE)
                 if resume:
                     assert job.worktree is not None
-                    await self._worktrees.validate_resume(project, job.worktree)
+                    # MCPB-012: a retained candidate whose durable origin is
+                    # the working-tree capture may be resumed while the
+                    # canonical checkout is still dirty (the capture left it
+                    # that way by design); ordinary jobs keep the clean-source
+                    # rule and the base-HEAD binding is enforced either way.
+                    allow_dirty_source = (
+                        await self.is_working_tree_capture_candidate(
+                            project, job.job_id
+                        )
+                    )
+                    await self._worktrees.validate_resume(
+                        project,
+                        job.worktree,
+                        allow_dirty_source=allow_dirty_source,
+                    )
                 else:
                     # M-CC-03: a successor job pins its worktree to the parent
                     # job's published committed SHA (which exists in the shared

@@ -555,7 +555,17 @@ class ReviewManager:
         """
         try:
             worktree = await self._jobs.verification_worktree(project, job_id)
-            await self._worktrees.validate_resume(project, worktree)
+            # MCPB-012: origin-aware clean-source exception. A retained
+            # candidate whose trusted durable origin is the working-tree
+            # capture is listable/readable/reviewable while the canonical
+            # checkout remains dirty (the capture left it that way by design);
+            # ordinary candidates keep the clean-source rule.
+            allow_dirty_source = await self._jobs.is_working_tree_capture_candidate(
+                project, job_id
+            )
+            await self._worktrees.validate_resume(
+                project, worktree, allow_dirty_source=allow_dirty_source
+            )
             return worktree
         except (DevelopmentJobError, WorktreeError, GitCommandError) as exc:
             raise ReviewError(str(exc)) from exc

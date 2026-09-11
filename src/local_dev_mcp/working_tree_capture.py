@@ -16,10 +16,11 @@ gates accept it unchanged.
 Safety invariants enforced here:
 
 * **Exact provenance binding.** The exact canonical HEAD SHA is recorded and
-  re-checked; a working-tree fingerprint is computed before the source is read,
-  recomputed after the source collection, and recomputed once more immediately
-  before success. Any drift (HEAD moved, a selected/protected file changed, the
-  index changed) fails the capture and leaves no usable candidate.
+  re-checked; the working-tree fingerprint is computed twice — once over the
+  resolved manifest after source collection (before the overlay), and once
+  more after the overlay, during the final source-state revalidation
+  immediately before success. Any drift (HEAD moved, a selected/protected file
+  changed, the index changed) fails the capture and leaves no usable candidate.
 * **Explicit, approved scope.** The caller must supply include and
   protected-exclude path sets that equal — as sets — the scope pinned in trusted
   local policy (``WorkingTreeCaptureScope``). The caller cannot widen, narrow,
@@ -49,7 +50,12 @@ from typing import Any
 from . import store
 from .config import Settings
 from .git import GitCommandError, run_git
-from .jobs import DevelopmentJobError, DevelopmentJobManager, resolve_effort
+from .jobs import (
+    CAPTURED_CANDIDATE_ORIGIN,
+    DevelopmentJobError,
+    DevelopmentJobManager,
+    resolve_effort,
+)
 from .models import (
     ProjectCapability,
     ProjectPolicy,
@@ -921,7 +927,11 @@ class WorkingTreeCaptureManager:
                 )
 
                 candidate = {
-                    "origin": "working_tree_capture",
+                    # MCPB-012: durable candidate origin. register_captured_
+                    # candidate stamps the same trusted constant; downstream
+                    # gates relax only the canonical-cleanliness precondition
+                    # from this provenance.
+                    "origin": CAPTURED_CANDIDATE_ORIGIN,
                     "base_head": base_head,
                     "manifest": self._manifest_view(selected_descriptors),
                     "protected_exclude_manifest": self._manifest_view(
