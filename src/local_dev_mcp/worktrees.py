@@ -630,9 +630,29 @@ class GitWorktreeManager:
         self,
         project: ProjectPolicy,
         worktree: JobWorktree,
+        *,
+        allow_dirty_source: bool = False,
     ) -> None:
+        """Re-validate a retained worktree before a downstream gate touches it.
+
+        Enforces the canonical-source preconditions and the worktree integrity
+        checks every gate shares: the canonical checkout must be clean, the
+        canonical HEAD must still equal the job's bound ``base_head``, and the
+        worktree must still be a trusted directory at that base.
+
+        MCPB-012: ``allow_dirty_source`` relaxes **only** the canonical
+        cleanliness check. It is reserved for a retained candidate whose
+        trusted durable job record proves its origin is the working-tree
+        capture (``DevelopmentJobManager.is_working_tree_capture_candidate``):
+        such a capture leaves the canonical checkout dirty by design, so
+        downstream gates on that retained candidate must not require it clean.
+        The value is derived by the calling manager from durable bridge state —
+        it is never a caller-controlled flag. The base-HEAD binding, the
+        worktree-integrity checks, and the default clean-source rule for every
+        other job are unchanged and always enforced.
+        """
         status, head = await self._source_state(project)
-        if status:
+        if status and not allow_dirty_source:
             raise WorktreeError(
                 "configured project checkout must be clean before resuming a job"
             )

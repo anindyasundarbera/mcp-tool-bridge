@@ -20,7 +20,9 @@ from local_dev_mcp.config import Settings
 from local_dev_mcp.jobs import DevelopmentJobManager
 from local_dev_mcp.models import ProjectPolicy
 from local_dev_mcp.registry import ProjectLockManager
+from local_dev_mcp.review import ReviewError, ReviewManager
 from local_dev_mcp.verification import (
+    VerificationCommitManager,
     VerificationError,
     _digest_candidate_paths,
     candidate_changed_paths,
@@ -33,7 +35,11 @@ from local_dev_mcp.working_tree_capture import (
 )
 
 from tests.support import initialize_git_repository
-from tests.test_jobs import ImmediateExecutor, settings as base_settings
+from tests.test_jobs import (
+    ImmediateExecutor,
+    settings as base_settings,
+    wait_for_status,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -469,7 +475,6 @@ class ContractAndGateTests(CaptureTestCase):
         self.assertEqual(ok["base_head"], base_head)
         self.assertEqual(ok["working_tree_fingerprint"], fingerprint)
         # A wrong expected fingerprint fails and retains no candidate.
-        self._make_dirty  # noqa: B018 (no-op; state already dirty)
         with self.assertRaises(WorkingTreeCaptureError):
             asyncio.run(
                 self.capture.capture(
@@ -521,6 +526,217 @@ class ContractAndGateTests(CaptureTestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "captured")
         self.assertEqual(rows[0]["job_id"], result["job_id"])
+
+
+# --------------------------------------------------------------------------- #
+# MCPB-012 defect repair: downstream gates on a captured candidate while the
+# canonical source stays dirty (origin-aware clean-source exception)
+# --------------------------------------------------------------------------- #
+
+
+class CapturedCandidateGateTests(CaptureTestCase):
+    """Every downstream gate accepts a captured candidate while its source
+    checkout remains dirty with the unchanged captured state — and every
+    non-captured candidate still fails closed on a dirty source."""
+
+    def _managers(self) -> tuple[Any, Any]:
+        verification = VerificationCommitManager(
+            self.settings, self.locks, self.jobs, projects=(self.project,)
+        )
+        review = ReviewManager(
+            self.settings,
+            self.locks,
+            self.jobs,
+            ImmediateExecutor(),
+            projects=(self.project,),
+        )
+        return verification, review
+
+    def _capture_dirty(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        self._make_dirty()
+        before = {
+            "status": _status(self.root),
+            "head": _head(self.root),
+            "agents": (self.root / "AGENTS.md").read_bytes(),
+            "notes": (self.root / "notes.md").read_bytes(),
+        }
+        result = self._capture()
+        self.assertEqual(result["status"], "captured")
+        return result, before
+
+    def _assert_source_unchanged(self, before: dict[str, Any]) -> None:
+        self.assertEqual(_status(self.root), before["status"])
+        self.assertEqual(_head(self.root), before["head"])
+        self.assertEqual((self.root / "AGENTS.md").read_bytes(), before["agents"])
+        self.assertEqual((self.root / "notes.md").read_bytes(), before["notes"])
+
+    def test_18_captured_candidate_passes_read_review_verify_while_source_dirty(
+        self,
+    ) -> None:
+        result, before = self._capture_dirty()
+        self._assert_source_unchanged(before)
+        verification, review = self._managers()
+        job_id = result["job_id"]
+
+        # Inspection gates succeed on the dirty-sourced retained candidate.
+        listed = asyncio.run(review.list_candidate_changes(self.project, job_id))
+        self.assertEqual(
+            {entry["path"] for entry in listed["paths"]},
+            {m["path"] for m in result["manifest"]},
+        )
+        read = asyncio.run(
+            review.read_candidate_file(self.project, job_id, "AGENTS.md")
+        )
+        self.assertEqual(read["content"], "# Agents edited\n")
+
+        # Review recording succeeds and binds the exact candidate state.
+        recorded = asyncio.run(
+            review.record_candidate_review(
+                self.project,
+                job_id,
+                {"decision": "approved"},
+                reviewer_id="human-reviewer",
+            )
+        )
+        self.assertEqual(recorded["status"], "recorded")
+
+        # Fixed verification succeeds against the retained candidate.
+        verified = asyncio.run(
+            verification.verify(self.project, job_id, result["base_head"])
+        )
+        self.assertEqual(verified["status"], "passed", verified)
+        # Throughout, the canonical source stayed dirty and byte-identical.
+        self.assertTrue(_status(self.root))
+        self._assert_source_unchanged(before)
+
+    def test_19_captured_candidate_commits_while_source_dirty(self) -> None:
+        result, before = self._capture_dirty()
+        verification, _review = self._managers()
+        job_id = result["job_id"]
+        verified = asyncio.run(
+            verification.verify(self.project, job_id, result["base_head"])
+        )
+        self.assertEqual(verified["status"], "passed", verified)
+        committed = asyncio.run(
+            verification.commit(
+                self.project,
+                job_id,
+                verified["verification_id"],
+                verified["base_head"],
+                verified["diff_fingerprint"],
+                list(verified["paths"]),
+                "MCPB-012 captured candidate",
+            )
+        )
+        self.assertEqual(committed["status"], "committed")
+        # The commit happened in the candidate worktree only; the canonical
+        # source is still dirty with exactly the captured state.
+        self.assertTrue(_status(self.root))
+        self._assert_source_unchanged(before)
+
+    def test_20_ordinary_job_denied_under_dirty_source(self) -> None:
+        async def exercise() -> None:
+            # A retained NON-captured candidate: created and completed while
+            # the canonical checkout was clean, then the source becomes dirty.
+            started = await self.jobs.start(
+                self.project, "make an ordinary candidate", "high"
+            )
+            snapshot = await wait_for_status(
+                self.jobs, self.project, started["job_id"], {"completed"}
+            )
+            job_id = str(snapshot["job_id"])
+            self.assertFalse(
+                await self.jobs.is_working_tree_capture_candidate(
+                    self.project, job_id
+                )
+            )
+            self._write("AGENTS.md", "# dirty after completion\n")
+            verification, _review = self._managers()
+            with self.assertRaises(VerificationError) as cm:
+                await verification.verify(
+                    self.project, job_id, str(snapshot["base_head"])
+                )
+            self.assertIn("must be clean", str(cm.exception))
+            # A brand-new ordinary job cannot even start under the dirty source.
+            second = await self.jobs.start(self.project, "must not start", "high")
+            failed = await wait_for_status(
+                self.jobs, self.project, second["job_id"], {"failed"}
+            )
+            self.assertIn("must be clean", str(failed.get("error")))
+
+        asyncio.run(exercise())
+
+    def test_21_captured_candidate_denied_after_canonical_head_moves(self) -> None:
+        result, before = self._capture_dirty()
+        _git(self.root, "commit", "--allow-empty", "-qm", "unrelated head move")
+        self.assertNotEqual(_head(self.root), result["base_head"])
+        verification, review = self._managers()
+        job_id = result["job_id"]
+        # Verification is denied after the base-HEAD binding broke ...
+        with self.assertRaises(VerificationError) as cm:
+            asyncio.run(
+                verification.verify(self.project, job_id, result["base_head"])
+            )
+        self.assertIn("HEAD moved", str(cm.exception))
+        # ... and so is candidate inspection ...
+        with self.assertRaises(ReviewError):
+            asyncio.run(review.list_candidate_changes(self.project, job_id))
+        # ... while the captured source state itself is still intact.
+        self.assertEqual(_status(self.root), before["status"])
+        self.assertEqual((self.root / "AGENTS.md").read_bytes(), before["agents"])
+
+    def test_22_capture_origin_persists_across_job_manager_reload(self) -> None:
+        result, before = self._capture_dirty()
+        job_id = result["job_id"]
+        # A brand-new manager over the same durable state — the restart path:
+        # ``_reload_jobs`` rehydrates ``candidate_json`` from the jobs table.
+        jobs_reloaded = DevelopmentJobManager(
+            self.settings, self.locks, ImmediateExecutor(), projects=(self.project,)
+        )
+        self.assertTrue(
+            asyncio.run(
+                jobs_reloaded.is_working_tree_capture_candidate(
+                    self.project, job_id
+                )
+            )
+        )
+        verification = VerificationCommitManager(
+            self.settings, self.locks, jobs_reloaded, projects=(self.project,)
+        )
+        verified = asyncio.run(
+            verification.verify(self.project, job_id, result["base_head"])
+        )
+        self.assertEqual(verified["status"], "passed", verified)
+        self._assert_source_unchanged(before)
+
+    def test_23_candidate_drift_remains_denied(self) -> None:
+        result, before = self._capture_dirty()
+        verification, _review = self._managers()
+        job_id = result["job_id"]
+        verified = asyncio.run(
+            verification.verify(self.project, job_id, result["base_head"])
+        )
+        self.assertEqual(verified["status"], "passed", verified)
+        # Drift the retained candidate AFTER verification ...
+        worktree = self.jobs._jobs[job_id].worktree
+        assert worktree is not None
+        (worktree.path / "AGENTS.md").write_text("# drifted\n", encoding="utf-8")
+        # ... the commit gate must deny the mismatch (and quarantine the job).
+        with self.assertRaises(VerificationError) as cm:
+            asyncio.run(
+                verification.commit(
+                    self.project,
+                    job_id,
+                    verified["verification_id"],
+                    verified["base_head"],
+                    verified["diff_fingerprint"],
+                    list(verified["paths"]),
+                    "must not commit drifted state",
+                )
+            )
+        self.assertIn("candidate state changed", str(cm.exception))
+        # The canonical source still carries the captured dirty state untouched.
+        self._assert_source_unchanged(before)
 
 
 if __name__ == "__main__":
