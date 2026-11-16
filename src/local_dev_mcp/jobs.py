@@ -19,6 +19,12 @@ from . import store
 from .candidate import CandidateHealthChecker
 from .claude import ClaudeExecutor, validate_effort
 from .config import Settings
+from .executor_contract import (
+    ExecutionRequest,
+    ExecutionResult,
+    ExecutorCheckpoint,
+    ExecutorPort,
+)
 from .models import Effort, ProjectCapability, ProjectPolicy
 from .registry import ProjectLockManager
 from .worktrees import GitWorktreeManager, JobWorktree
@@ -562,16 +568,24 @@ class DevelopmentJobManager:
         self,
         settings: Settings,
         locks: ProjectLockManager,
-        executor: ClaudeExecutor,
+        executor: ClaudeExecutor | None = None,
         worktrees: GitWorktreeManager | None = None,
         candidate_checker: CandidateHealthChecker | None = None,
         projects: tuple[ProjectPolicy, ...] = (),
         requirements: Any = None,
         state_db: sqlite3.Connection | None = None,
+        *,
+        claude_executor: ClaudeExecutor | None = None,
+        executor_port: ExecutorPort | None = None,
     ) -> None:
         self.settings = settings
         self._locks = locks
-        self._executor = executor
+        active_executor = claude_executor if claude_executor is not None else executor
+        if active_executor is None:
+            active_executor = ClaudeExecutor(settings)
+        self._executor: ClaudeExecutor = active_executor
+        self.claude_executor: ClaudeExecutor = active_executor
+        self._executor_port: ExecutorPort | None = executor_port
         self._worktrees = worktrees or GitWorktreeManager(
             settings,
             tuple(project.root for project in projects),
@@ -617,6 +631,29 @@ class DevelopmentJobManager:
         # ``_requirements``) and shares this manager's state root / DB.
         self._authorizations: Any = None
         self._reload_jobs()
+
+    @property
+    def executor_port(self) -> ExecutorPort | None:
+        """Expose the configured or lazily adapted ExecutorPort."""
+        if self._executor_port is not None:
+            return self._executor_port
+        if self._executor is not None:
+            from .claude import ClaudeExecutorAdapter
+
+            self._executor_port = ClaudeExecutorAdapter(self._executor, settings=self.settings)
+            return self._executor_port
+        return None
+
+    async def execute_via_executor_port(
+        self,
+        request: ExecutionRequest,
+        on_checkpoint: Any = None,
+    ) -> ExecutionResult:
+        """Execute a request directly through the configured ExecutorPort."""
+        port = self.executor_port
+        if port is None:
+            raise DevelopmentJobError("no executor port available for execution")
+        return await port.start(request, on_checkpoint=on_checkpoint)
 
     def close(self) -> None:
         """Safely close the underlying database if owned by this manager."""
@@ -4277,3 +4314,7 @@ class DevelopmentJobManager:
             # None``), and ``_run_parallel_gates`` is non-fatal.
             if project.parallel_gates and job.status == JobStatus.COMPLETED:
                 await self._run_parallel_gates(job, project)
+
+
+JobManager = DevelopmentJobManager
+

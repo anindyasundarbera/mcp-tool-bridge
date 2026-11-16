@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import sqlite3
 from typing import Annotated, Any, Literal
 
@@ -20,6 +21,7 @@ from .reader import RepositoryReader
 from .registry import ProjectLockManager, ProjectRegistry
 from .review import ReviewManager
 from .writer import RepositoryWriter, WriteMode
+from .transports import TransportConfig, TransportMode
 from .verification import (
     PublicationManager,
     VerificationCommitManager,
@@ -1851,6 +1853,64 @@ def create_server(
     return mcp
 
 
+def create_transport_config_from_env(
+    environ: Mapping[str, str] | None = None,
+) -> TransportConfig:
+    """Create a validated TransportConfig from environment mapping or os.environ."""
+    import os
+    env = os.environ if environ is None else environ
+    mode_raw = env.get("BRIDGE_TRANSPORT_MODE", env.get("MCP_TRANSPORT_MODE", "stdio")).strip().lower()
+
+    if mode_raw in ("http", "local_http"):
+        host = env.get("MCP_HOST", "127.0.0.1")
+        port = int(env.get("MCP_PORT", "8000"))
+        return TransportConfig(mode=TransportMode.LOCAL_HTTP, host=host, port=port)
+    elif mode_raw in ("ngrok_mtls", "ngrok", "mtls"):
+        from pathlib import Path
+
+        host = env.get("MCP_HOST", "127.0.0.1")
+        port = int(env.get("MCP_PORT", "8000"))
+        ngrok_domain = env.get("NGROK_DOMAIN")
+        ngrok_authtoken = env.get("NGROK_AUTHTOKEN")
+        mtls_ca = env.get("MTLS_CA_CERT_PATH")
+        ca_path = Path(mtls_ca) if mtls_ca else None
+        return TransportConfig(
+            mode=TransportMode.NGROK_MTLS,
+            host=host,
+            port=port,
+            ngrok_domain=ngrok_domain,
+            ngrok_authtoken=ngrok_authtoken,
+            mtls_ca_cert_path=ca_path,
+        )
+    return TransportConfig(mode=TransportMode.STDIO)
+
+
+def run_server_with_transport(
+    server: FastMCP | None = None,
+    config: TransportConfig | None = None,
+    settings: Settings | None = None,
+) -> None:
+    """Run FastMCP server under the specified transport mode."""
+    active_settings = settings or Settings.from_env()
+    active_config = config or create_transport_config_from_env()
+    active_server = server or create_server(settings=active_settings)
+
+    if active_config.mode == TransportMode.STDIO:
+        active_server.run(transport="stdio")
+    elif active_config.mode == TransportMode.LOCAL_HTTP:
+        active_server.run(
+            transport="http",
+            host=active_config.host,
+            port=active_config.port,
+        )
+    elif active_config.mode == TransportMode.NGROK_MTLS:
+        active_server.run(
+            transport="http",
+            host=active_config.host,
+            port=active_config.port,
+        )
+
+
 def run() -> None:
     settings = Settings.from_env()
     server = create_server(settings=settings)
@@ -1859,3 +1919,7 @@ def run() -> None:
         host=settings.mcp_host,
         port=settings.mcp_port,
     )
+
+
+def main() -> None:
+    run()

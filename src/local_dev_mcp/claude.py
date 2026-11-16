@@ -4,12 +4,24 @@ import asyncio
 import json
 import os
 import signal
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 from .config import Settings
+from .containment import build_minimal_executor_env
+from .executor_contract import (
+    ExecutionRequest,
+    ExecutionResult,
+    ExecutorCapabilities,
+    ExecutorCheckpoint,
+    ExecutorHealthStatus,
+    ExecutorLifecycleState,
+    ExecutorResourceUsage,
+    NetworkMode,
+)
 from .git import project_status
-from .models import Effort, ProjectPolicy
+from .models import Effort, ProjectCapability, ProjectPolicy
 from .security import projected_credential_env
 
 
@@ -473,6 +485,7 @@ def _parse_output(stdout: str, *, stream: bool) -> dict[str, Any]:
 class ClaudeExecutor:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self._active: dict[str, asyncio.subprocess.Process] = {}
 
     async def _run_claude(
         self,
@@ -483,6 +496,8 @@ class ClaudeExecutor:
         text: str,
         *,
         stream: bool = False,
+        execution_id: str | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         """Shared bounded-subprocess core for the drafter and the reviewer.
 
@@ -493,15 +508,21 @@ class ClaudeExecutor:
         method only reports what happened. On timeout the process group is
         killed and ``timed_out`` is reported.
         """
-        before = await project_status(
-            execution_root, self.settings.git_command_timeout_seconds
-        )
+        try:
+            before = await project_status(
+                execution_root, self.settings.git_command_timeout_seconds
+            )
+        except Exception:
+            before = {"working_tree": "", "branch": "unknown"}
         # M-CC-11 credential_policy: when a project opts in, the Claude worktree
         # launcher receives a minimal base environment plus ONLY the credential
         # env names the project declares — never a copy of the bridge's whole
-        # environment. Without a credential_policy (the default), the historical
-        # behavior (full environment copy) is preserved.
-        if project.credential_policy is not None:
+        # environment. Without a credential_policy (the default), use
+        # build_minimal_executor_env to project only safe minimal keys and avoid
+        # leaking host secrets.
+        if env is not None:
+            environment = dict(env)
+        elif project.credential_policy is not None:
             environment = projected_credential_env(
                 project.credential_policy,
                 base={
@@ -514,20 +535,15 @@ class ClaudeExecutor:
                 },
             )
         else:
-            environment = os.environ.copy()
+            explicit_vars: dict[str, str] = {}
+            if "CLAUDE_CODE_ENTRYPOINT" in os.environ:
+                explicit_vars["CLAUDE_CODE_ENTRYPOINT"] = os.environ["CLAUDE_CODE_ENTRYPOINT"]
+            environment = build_minimal_executor_env(
+                os.environ,
+                explicit_projection=explicit_vars,
+                candidate_root=execution_root,
+            )
             environment["NO_COLOR"] = "1"
-            # When no credential_policy is set, the historical behavior copies the
-            # full process environment — but the bridge's own secrets must never
-            # leak into a Claude worktree subprocess. Scrub the bridge's sensitive
-            # tokens by default (NGROK auth, any OpenAI credential, and any
-            # LOCAL_DEV_MCP_*_KEY signing/authorization key).
-            for name in list(environment):
-                if (
-                    name == "NGROK_AUTHTOKEN"
-                    or name.startswith("OPENAI_")
-                    or (name.startswith("LOCAL_DEV_MCP_") and name.endswith("_KEY"))
-                ):
-                    environment.pop(name, None)
 
         process = await asyncio.create_subprocess_exec(
             *command,
@@ -538,6 +554,8 @@ class ClaudeExecutor:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        if execution_id is not None:
+            self._active[execution_id] = process
 
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -546,24 +564,34 @@ class ClaudeExecutor:
             )
         except asyncio.TimeoutError:
             await terminate_process_group(process)
+            try:
+                after_timeout = await project_status(
+                    execution_root, self.settings.git_command_timeout_seconds
+                )
+            except Exception:
+                after_timeout = {"working_tree": "", "branch": "unknown"}
             return {
                 "timed_out": True,
                 "exit_code": process.returncode,
                 "stderr": "",
                 "claude_result": {},
                 "before": before,
-                "after": await project_status(
-                    execution_root, self.settings.git_command_timeout_seconds
-                ),
+                "after": after_timeout,
                 "oversized": False,
             }
         except asyncio.CancelledError:
             await terminate_process_group(process)
             raise
+        finally:
+            if execution_id is not None:
+                self._active.pop(execution_id, None)
 
-        after = await project_status(
-            execution_root, self.settings.git_command_timeout_seconds
-        )
+        try:
+            after = await project_status(
+                execution_root, self.settings.git_command_timeout_seconds
+            )
+        except Exception:
+            after = {"working_tree": "", "branch": "unknown"}
         oversized = len(stdout_bytes) > self.settings.max_output_bytes
         stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
         stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
@@ -583,6 +611,19 @@ class ClaudeExecutor:
             "oversized": oversized,
         }
 
+    async def cancel(self, execution_id: str, reason: str = "cancelled_by_caller") -> bool:
+        """Cancel an active Claude execution by execution_id.
+
+        Returns True when a running process was found and terminated. This is a
+        best-effort cancellation: the process may already have exited by the
+        time the request is handled.
+        """
+        process = self._active.get(execution_id)
+        if process is None or process.returncode is not None:
+            return False
+        await terminate_process_group(process)
+        return True
+
     async def execute(
         self,
         project: ProjectPolicy,
@@ -592,6 +633,8 @@ class ClaudeExecutor:
         root: Path | None = None,
         resume_session_id: str | None = None,
         max_turns: int | None = None,
+        execution_id: str | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         text = specification.strip()
         if not text:
@@ -616,6 +659,8 @@ class ClaudeExecutor:
             execution_root,
             text,
             stream=self.settings.claude_stream_json,
+            execution_id=execution_id,
+            env=env,
         )
         model = project.claude_model or self.settings.claude_model
 
@@ -672,6 +717,8 @@ class ClaudeExecutor:
         *,
         root: Path | None = None,
         resume_session_id: str | None = None,
+        execution_id: str | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         """Run a READ-ONLY, NON-RESUMING Claude reviewer over a candidate.
 
@@ -703,6 +750,8 @@ class ClaudeExecutor:
             execution_root,
             text,
             stream=False,
+            execution_id=execution_id,
+            env=env,
         )
         model = project.claude_model or self.settings.claude_model
 
@@ -747,3 +796,304 @@ class ClaudeExecutor:
         if outcome["stderr"]:
             response["stderr"] = outcome["stderr"][-4000:]
         return response
+
+
+# ---------------------------------------------------------------------------
+# M2.2: ExecutorPort adapter for the legacy ClaudeExecutor
+# ---------------------------------------------------------------------------
+
+
+class ClaudeExecutorAdapter:
+    """Adapter that makes ``ClaudeExecutor`` satisfy the ``ExecutorPort`` protocol.
+
+    The adapter translates the lifecycle-neutral ``ExecutionRequest`` into the
+    legacy ``ClaudeExecutor.execute`` call shape, enforces candidate/canonical
+    isolation, computes modified paths from the before/after repository status,
+    and emits checkpoints so the adapter's ``supports_checkpoints`` declaration
+    is honest.
+    """
+
+    _ADAPTER_ID = "claude"
+
+    def __init__(
+        self,
+        executor: ClaudeExecutor | None = None,
+        *,
+        runner: Any = None,
+        settings: Settings | None = None,
+    ) -> None:
+        self.settings = settings or Settings.from_env({})
+        self._executor = executor or ClaudeExecutor(self.settings)
+        self._runner = runner
+
+    def capabilities(self) -> ExecutorCapabilities:
+        return ExecutorCapabilities(
+            adapter_id=self._ADAPTER_ID,
+            adapter_version="0.11.0",
+            supports_resume=True,
+            supports_streaming=True,
+            supports_cancellation=True,
+            supports_checkpoints=True,
+            supported_network_modes=(NetworkMode.NONE,),
+            requires_container_runtime=False,
+            supports_host_containment=True,
+            declared_tools=("Read", "Edit", "Write", "Glob", "Grep"),
+            max_concurrent_executions=1,
+        )
+
+    async def health(self) -> ExecutorHealthStatus:
+        from .containment import probe_bwrap_containment
+
+        doctor = probe_bwrap_containment()
+        return ExecutorHealthStatus(
+            adapter_id=self._ADAPTER_ID,
+            healthy=True,
+            runtime_version="0.11.0",
+            containment_available=doctor.healthy,
+            details={"bwrap_path": doctor.bwrap_path, "bwrap_healthy": doctor.healthy},
+        )
+
+    async def start(
+        self,
+        request: ExecutionRequest,
+        on_checkpoint: Callable[[ExecutorCheckpoint], None] | None = None,
+    ) -> ExecutionResult:
+        from datetime import datetime, timezone
+        from .containment import (
+            build_executor_environment,
+            probe_bwrap_containment,
+            validate_candidate_isolation,
+        )
+
+        disallowed = {"Bash", "WebFetch", "WebSearch"}
+        if any(tool in request.allowed_tools for tool in disallowed):
+            raise ValueError(
+                f"Denied tool requested: {sorted(set(request.allowed_tools) & disallowed)}"
+            )
+
+        if (
+            request.resource_limits.network_mode
+            not in self.capabilities().supported_network_modes
+        ):
+            raise ValueError(
+                f"Unsupported network mode: {request.resource_limits.network_mode.value}"
+            )
+
+        validate_candidate_isolation(request)
+
+        init_checkpoint = ExecutorCheckpoint(
+            checkpoint_id=f"chk_{request.execution_id}_init",
+            execution_id=request.execution_id,
+            sequence=1,
+            summary="Claude execution initiated",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            resumable_token=request.resume_session_id,
+        )
+        if on_checkpoint is not None:
+            on_checkpoint(init_checkpoint)
+
+        if self._runner is not None and hasattr(self._runner, "start"):
+            outcome_res = self._runner.start(request, on_checkpoint=on_checkpoint)
+            if asyncio.iscoroutine(outcome_res):
+                res = await outcome_res
+            else:
+                res = outcome_res
+            if isinstance(res, ExecutionResult):
+                return res
+
+        project = self._synthetic_project(request)
+        effort = self._resolve_effort(request)
+        env = build_executor_environment(request)
+        resume_session_id = self._resume_token(request)
+
+        outcome = await self._executor.execute(
+            project,
+            request.mandate,
+            effort,
+            root=request.candidate_root,
+            resume_session_id=resume_session_id,
+            max_turns=request.resource_limits.max_turns,
+            execution_id=request.execution_id,
+            env=env,
+        )
+
+        doctor = probe_bwrap_containment()
+        containment_profile = "bwrap" if doctor.healthy else "UNCONTAINED_TRUSTED_DEV"
+
+        return self._build_result(
+            request,
+            outcome,
+            containment_profile,
+            init_checkpoint=init_checkpoint,
+            on_checkpoint=on_checkpoint,
+        )
+
+    async def resume(
+        self,
+        request: ExecutionRequest,
+        checkpoint: ExecutorCheckpoint,
+        on_checkpoint: Callable[[ExecutorCheckpoint], None] | None = None,
+    ) -> ExecutionResult:
+        if self._runner is not None and hasattr(self._runner, "resume"):
+            outcome_res = self._runner.resume(
+                request, checkpoint, on_checkpoint=on_checkpoint
+            )
+            if asyncio.iscoroutine(outcome_res):
+                return await outcome_res
+            return outcome_res
+
+        session_id = request.resume_session_id or checkpoint.resumable_token
+        resumed_request = ExecutionRequest(
+            execution_id=request.execution_id,
+            project_id=request.project_id,
+            job_id=request.job_id,
+            candidate_root=request.candidate_root,
+            mandate=request.mandate,
+            canonical_root=request.canonical_root,
+            allowed_tools=request.allowed_tools,
+            denied_tools=request.denied_tools,
+            env_projection=request.env_projection,
+            resource_limits=request.resource_limits,
+            resume_checkpoint_id=checkpoint.checkpoint_id,
+            resume_session_id=session_id,
+            metadata=request.metadata,
+        )
+        return await self.start(resumed_request, on_checkpoint=on_checkpoint)
+
+    async def cancel(
+        self,
+        execution_id: str,
+        reason: str = "cancelled_by_caller",
+    ) -> bool:
+        if self._runner is not None and hasattr(self._runner, "cancel"):
+            res = self._runner.cancel(execution_id, reason=reason)
+            if asyncio.iscoroutine(res):
+                return bool(await res)
+            return bool(res)
+        return await self._executor.cancel(execution_id, reason=reason)
+
+    def _synthetic_project(self, request: ExecutionRequest) -> ProjectPolicy:
+        return ProjectPolicy(
+            id="executor-adapter",
+            display_name=request.project_id,
+            description="Synthetic project for executor adapter invocation",
+            root=request.candidate_root,
+            capabilities=frozenset(
+                {ProjectCapability.REPOSITORY_READ, ProjectCapability.CLAUDE_EDIT}
+            ),
+            allow_ultracode=True,
+        )
+
+    def _resolve_effort(self, request: ExecutionRequest) -> Effort:
+        effort = request.metadata.get("effort")
+        if effort in ("high", "ultracode"):
+            return effort  # type: ignore[return-value]
+        return "high"
+
+    def _resume_token(self, request: ExecutionRequest) -> str | None:
+        return request.resume_session_id
+
+    def _build_result(
+        self,
+        request: ExecutionRequest,
+        outcome: dict[str, Any],
+        containment_profile: str,
+        *,
+        init_checkpoint: ExecutorCheckpoint | None = None,
+        on_checkpoint: Callable[[ExecutorCheckpoint], None] | None = None,
+    ) -> ExecutionResult:
+        from datetime import datetime, timezone
+        from .containment import compute_modified_paths
+
+        status = outcome.get("status")
+        before = outcome.get("repository_before") or outcome.get("repository") or {}
+        after = outcome.get("repository_after") or outcome.get("repository") or {}
+        modified_paths = compute_modified_paths(
+            request.candidate_root, before, after
+        )
+
+        usage = outcome.get("usage") or {}
+        input_tokens = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+        output_tokens = (
+            usage.get("output_tokens") or usage.get("completion_tokens") or 0
+        )
+        resource_usage = ExecutorResourceUsage(
+            turns_used=outcome.get("num_turns") or 0,
+            input_tokens=int(input_tokens),
+            output_tokens=int(output_tokens),
+            exit_code=outcome.get("exit_code"),
+        )
+
+        term_checkpoint = ExecutorCheckpoint(
+            checkpoint_id=f"chk_{request.execution_id}_terminal",
+            execution_id=request.execution_id,
+            sequence=2 if init_checkpoint is not None else 1,
+            summary=f"Claude execution finished with status {status}",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            resumable_token=outcome.get("session_id") or request.resume_session_id,
+            diagnostics={"status": status, "exit_code": outcome.get("exit_code")},
+        )
+        if on_checkpoint is not None:
+            on_checkpoint(term_checkpoint)
+
+        vendor_diagnostics: dict[str, Any] = {
+            "claude": {
+                "result": outcome.get("result", ""),
+                "session_id": outcome.get("session_id"),
+                "exit_code": outcome.get("exit_code"),
+                "errors": outcome.get("errors", []),
+                "stderr": outcome.get("stderr"),
+            }
+        }
+
+        checkpoints = (
+            (init_checkpoint, term_checkpoint)
+            if init_checkpoint is not None
+            else (term_checkpoint,)
+        )
+
+        if status == "timed_out":
+            return ExecutionResult(
+                execution_id=request.execution_id,
+                adapter_id=self._ADAPTER_ID,
+                state=ExecutorLifecycleState.TIMED_OUT,
+                summary="Claude execution timed out",
+                modified_paths=modified_paths,
+                checkpoints=checkpoints,
+                resource_usage=resource_usage,
+                error_code="EXECUTION_TIMEOUT",
+                error_message="Execution exceeded the configured timeout",
+                containment_profile=containment_profile,
+                vendor_diagnostics=vendor_diagnostics,
+                grants_authority=False,
+            )
+
+        if status == "failed" or outcome.get("exit_code") != 0 or outcome.get("is_error"):
+            message = outcome.get("error") or outcome.get("result") or "Claude execution failed"
+            return ExecutionResult(
+                execution_id=request.execution_id,
+                adapter_id=self._ADAPTER_ID,
+                state=ExecutorLifecycleState.FAILED,
+                summary="Claude execution failed",
+                modified_paths=modified_paths,
+                checkpoints=checkpoints,
+                resource_usage=resource_usage,
+                error_code="CLAUDE_EXECUTION_FAILED",
+                error_message=str(message)[:500],
+                containment_profile=containment_profile,
+                vendor_diagnostics=vendor_diagnostics,
+                grants_authority=False,
+            )
+
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            adapter_id=self._ADAPTER_ID,
+            state=ExecutorLifecycleState.COMPLETED,
+            summary="Claude execution completed",
+            modified_paths=modified_paths,
+            checkpoints=checkpoints,
+            resource_usage=resource_usage,
+            containment_profile=containment_profile,
+            vendor_diagnostics=vendor_diagnostics,
+            grants_authority=False,
+        )
