@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -191,6 +192,7 @@ class CanonicalizationResolver:
         sync: SyncManager,
         worktrees: GitWorktreeManager | None = None,
         projects: tuple[ProjectPolicy, ...] = (),
+        state_db: sqlite3.Connection | None = None,
     ) -> None:
         self.settings = settings
         self._locks = locks
@@ -203,7 +205,12 @@ class CanonicalizationResolver:
         self._project_roots = tuple(project.root for project in projects)
         # Own read-only connection to bridge.db for durable-record lookups, the
         # same way every manager co-owns the shared state database.
-        self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+        if state_db is not None:
+            self._db = state_db
+            self._owns_db = False
+        else:
+            self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+            self._owns_db = True
 
     def _redaction_paths(self, project: ProjectPolicy) -> tuple[Any, ...]:
         return (
@@ -212,6 +219,15 @@ class CanonicalizationResolver:
             self.settings.projects_config_path,
             *self._project_roots,
         )
+
+    def close(self) -> None:
+        """Close the durable state database if this resolver owns it."""
+        if getattr(self, "_owns_db", False) and getattr(self, "_db", None) is not None:
+            try:
+                self._db.close()
+            except Exception:
+                pass
+            self._db = None  # type: ignore[assignment]
 
     async def resolve(
         self,

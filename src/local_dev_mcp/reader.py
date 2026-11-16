@@ -136,7 +136,7 @@ def resolve_project_path(
             raise RepositoryReadError("symbolic links are not readable")
     try:
         resolved = candidate.resolve(strict=True)
-        resolved_relative = PurePosixPath(resolved.relative_to(project.root).as_posix())
+        resolved_relative = PurePosixPath(resolved.relative_to(project.root.resolve()).as_posix())
     except FileNotFoundError as exc:
         raise RepositoryReadError(f"path does not exist: {relative.as_posix()}") from exc
     except ValueError as exc:
@@ -155,12 +155,20 @@ def resolve_project_path(
 
 
 def _read_markdown_bytes(path: Path, limit: int) -> bytes:
-    size = path.stat().st_size
-    if size > limit:
-        raise RepositoryReadError(
-            f"Markdown file exceeds the configured {limit}-byte limit"
-        )
-    data = path.read_bytes()
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise RepositoryReadError("Markdown file could not be opened") from exc
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            if size > limit:
+                raise RepositoryReadError(
+                    f"Markdown file exceeds the configured {limit}-byte limit"
+                )
+            data = handle.read(limit + 1)
+    except OSError as exc:
+        raise RepositoryReadError("Markdown file could not be read") from exc
     if len(data) > limit:
         raise RepositoryReadError(
             f"Markdown file exceeds the configured {limit}-byte limit"

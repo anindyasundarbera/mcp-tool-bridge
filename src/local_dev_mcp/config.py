@@ -277,6 +277,14 @@ class Settings:
         if candidate_mcp_port == mcp_port:
             raise RuntimeError("CANDIDATE_MCP_PORT must differ from MCP_PORT")
 
+        claude_max_turns = _positive_int(env, "CLAUDE_MAX_TURNS", 30)
+        claude_soft_turns = _positive_int(env, "CLAUDE_SOFT_TURNS", claude_max_turns)
+        claude_hard_turns = _positive_int(env, "CLAUDE_HARD_TURNS", 120)
+        if claude_hard_turns < claude_soft_turns:
+            raise RuntimeError(
+                "CLAUDE_HARD_TURNS must be greater than or equal to CLAUDE_SOFT_TURNS"
+            )
+
         return cls(
             projects_config_path=config_path,
             claude_model=model,
@@ -285,7 +293,7 @@ class Settings:
             claude_timeout_seconds=_positive_int(
                 env, "CLAUDE_TIMEOUT_SECONDS", 1800
             ),
-            claude_max_turns=_positive_int(env, "CLAUDE_MAX_TURNS", 30),
+            claude_max_turns=claude_max_turns,
             max_input_chars=_positive_int(env, "MAX_INPUT_CHARS", 100000),
             max_output_bytes=_positive_int(env, "MAX_OUTPUT_BYTES", 2097152),
             max_markdown_file_bytes=_positive_int(
@@ -342,7 +350,7 @@ class Settings:
             verification_deterministic_repetitions=_positive_int(
                 env, "VERIFICATION_DETERMINISTIC_REPETITIONS", 1
             ),
-            claude_soft_turns=_positive_int(env, "CLAUDE_SOFT_TURNS", 30),
+            claude_soft_turns=claude_soft_turns,
             claude_extension_turns=_positive_int(
                 env, "CLAUDE_EXTENSION_TURNS", 30
             ),
@@ -352,7 +360,7 @@ class Settings:
             claude_max_manual_extensions=_positive_int(
                 env, "CLAUDE_MAX_MANUAL_EXTENSIONS", 5
             ),
-            claude_hard_turns=_positive_int(env, "CLAUDE_HARD_TURNS", 120),
+            claude_hard_turns=claude_hard_turns,
             claude_max_no_progress_turns=_positive_int(
                 env, "CLAUDE_MAX_NO_PROGRESS_TURNS", 6
             ),

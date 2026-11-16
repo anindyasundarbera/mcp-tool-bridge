@@ -231,11 +231,11 @@ core tests and must be identified as such. Do not fabricate their results.
 **All roadmap capability milestones R1–R3 and Cross-cutting are DONE** as of
 the 2026-08-27 integration: MCPB-001→012, M-AL-01, M-CT-02…07, M-EV-01…08,
 M-GV-01…07, M-CC-01…11 — 22 capability commits cherry-picked onto `main` in
-dependency order; the full suite is green (**572 tests**). See
+dependency order; the full suite is green (**597 tests**). See
 [`docs/MCPB-ROADMAP.md`](docs/MCPB-ROADMAP.md) for the authoritative status.
 **M-IN-01 (P3) remains a non-goal.** No capability gaps are open.
 
-Next work if requested: release/versioning (HEAD is pinned at `0.10.4`
+Next work if requested: release/versioning (HEAD is pinned at `0.11.0`
 through the cherry-picks) or any follow-on hardening; branch off `main` and
 follow §3.
 

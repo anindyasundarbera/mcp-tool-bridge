@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -91,7 +91,7 @@ def _exclude_sensitive_paths(
     paths: list[Any] | None,
     extra_patterns: tuple[re.Pattern[str], ...] = (),
     sensitive_prefixes: tuple[str, ...] = (),
-) -> tuple[list[Any], int]:
+) -> tuple[list[Any] | None, int]:
     """Drop sensitive entries from a changed-paths list.
 
     Returns the kept entries and the count of dropped entries. Non-string
@@ -187,6 +187,7 @@ class EvidenceBundleManager:
         jobs: DevelopmentJobManager,
         worktrees: GitWorktreeManager | None = None,
         projects: tuple[ProjectPolicy, ...] = (),
+        state_db: sqlite3.Connection | None = None,
     ) -> None:
         self.settings = settings
         self._locks = locks
@@ -195,7 +196,18 @@ class EvidenceBundleManager:
             settings, tuple(project.root for project in projects)
         )
         self._project_roots = tuple(project.root for project in projects)
-        self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+        if state_db is not None:
+            self._db = state_db
+            self._owns_db = False
+        else:
+            self._db = store.open_state_db(
+                self._worktrees.ensure_state_root() / "bridge.db"
+            )
+            self._owns_db = True
+
+    def close(self) -> None:
+        if self._owns_db:
+            self._db.close()
 
     def _redaction_paths(self, project: ProjectPolicy, job_id: str) -> tuple[Path, ...]:
         worktree_path = self.settings.job_worktree_root / project.id / job_id

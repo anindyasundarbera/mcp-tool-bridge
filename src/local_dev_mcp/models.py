@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal
+from typing import Any, Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -225,9 +225,9 @@ def _validate_command_argv(value: object, *, label: str, exe_label: str) -> tupl
     ``label``/``exe_label`` parameterize the error messages so each model keeps
     its own wording (existing tests assert the exact text).
     """
-    if isinstance(value, (str, bytes)) or value is None:
+    if value is None or not isinstance(value, Iterable) or isinstance(value, (str, bytes)):
         raise ValueError(f"{label} argv must be a list of arguments")
-    arguments = tuple(str(item) for item in value)  # type: ignore[arg-type]
+    arguments = tuple(str(item) for item in value)
     if not 1 <= len(arguments) <= 64:
         raise ValueError(f"{label} argv must contain 1 through 64 arguments")
     for argument in arguments:
@@ -316,9 +316,9 @@ class VerificationCommand(BaseModel):
     def validate_python_path(cls, value: object) -> tuple[str, ...]:
         if value is None:
             return ()
-        if isinstance(value, (str, bytes)):
+        if not isinstance(value, Iterable) or isinstance(value, (str, bytes)):
             raise ValueError("python_path must be a list of relative directories")
-        paths = tuple(_policy_path(str(item)) for item in value)  # type: ignore[arg-type]
+        paths = tuple(_policy_path(str(item)) for item in value)
         if len(paths) > 16:
             raise ValueError("python_path may contain at most 16 entries")
         return paths
@@ -468,9 +468,9 @@ def _validate_allowlist(value: object, *, label: str) -> tuple[str, ...]:
     """Validate a tuple of policy allowlist entries (paths or globs)."""
     if value is None:
         return ()
-    if isinstance(value, (str, bytes)):
+    if not isinstance(value, Iterable) or isinstance(value, (str, bytes)):
         raise ValueError(f"{label} must be a list of relative paths")
-    entries = tuple(_policy_allow_path(str(item)) for item in value)  # type: ignore[arg-type]
+    entries = tuple(_policy_allow_path(str(item)) for item in value)
     if len(entries) != len(set(entries)):
         raise ValueError(f"{label} must not contain duplicate entries")
     return entries
@@ -521,9 +521,9 @@ class WorkingTreeCaptureScope(BaseModel):
     def validate_paths(cls, value: object) -> tuple[str, ...]:
         if value is None:
             return ()
-        if isinstance(value, (str, bytes)):
+        if not isinstance(value, Iterable) or isinstance(value, (str, bytes)):
             raise ValueError("capture scope paths must be a list of strings")
-        paths = tuple(_capture_scope_path(str(item)) for item in value)  # type: ignore[arg-type]
+        paths = tuple(_capture_scope_path(str(item)) for item in value)
         if len(paths) != len(set(paths)):
             raise ValueError("capture scope paths must not contain duplicates")
         return paths
@@ -614,14 +614,14 @@ class CredentialPolicy(BaseModel):
     def validate_allow(cls, value: object) -> tuple[str, ...]:
         if value is None:
             return ()
-        if isinstance(value, (str, bytes)):
+        if not isinstance(value, Iterable) or isinstance(value, (str, bytes)):
             raise ValueError(
                 "credential_policy.allow must be a list of environment variable names"
             )
         import re
 
         key_pattern = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
-        names = tuple(str(item) for item in value)  # type: ignore[arg-type]
+        names = tuple(str(item) for item in value)
         if len(names) != len(set(names)):
             raise ValueError("credential_policy.allow must not contain duplicate names")
         for name in names:
@@ -776,6 +776,8 @@ class ProjectPolicy(BaseModel):
     def validate_policy_paths(cls, value: object) -> tuple[str, ...]:
         if value is None:
             return ()
+        if not isinstance(value, Iterable) or isinstance(value, (str, bytes)):
+            raise ValueError("policy paths must be a list of relative paths")
         return tuple(_policy_path(str(item)) for item in value)
 
     @field_validator("unexpected_paths", mode="before")
@@ -783,9 +785,9 @@ class ProjectPolicy(BaseModel):
     def validate_unexpected_paths(cls, value: object) -> tuple[str, ...]:
         if value is None:
             return ()
-        if isinstance(value, (str, bytes)):
+        if not isinstance(value, Iterable) or isinstance(value, (str, bytes)):
             raise ValueError("unexpected_paths must be a list of pattern strings")
-        patterns = tuple(_unexpected_path(str(item)) for item in value)  # type: ignore[arg-type]
+        patterns = tuple(_unexpected_path(str(item)) for item in value)
         if len(patterns) != len(set(patterns)):
             raise ValueError("unexpected_paths must not contain duplicates")
         return patterns
@@ -846,6 +848,8 @@ class ProjectPolicy(BaseModel):
         """
         if value is None:
             return ()
+        if not isinstance(value, Iterable) or isinstance(value, (str, bytes)):
+            raise ValueError("network_allowlist must be a list of hostnames")
         entries = tuple(str(item).strip().lower() for item in value)
         if len(entries) != len(set(entries)):
             raise ValueError("network_allowlist must not contain duplicates")

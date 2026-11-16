@@ -9,6 +9,7 @@ import platform
 import re
 import secrets
 import signal
+import sqlite3
 import stat
 import sys
 import tempfile
@@ -299,6 +300,31 @@ def _redact(value: Any, paths: tuple[Path, ...]) -> Any:
     return value
 
 
+def _scrub_secrets(value: Any, secrets_to_scrub: tuple[str, ...]) -> Any:
+    """Replace any occurrence of a projected secret value with a marker.
+
+    ``_run_exec`` projects a project's ``credential_names`` from the bridge's
+    own environment into the subprocess. If a command echoes one of those
+    secrets on stdout/stderr, the value must never leave the bridge, so any
+    occurrence (length >= 4) is replaced with ``<redacted-secret>``. Mirrors
+    ``_redact``'s recursive walk.
+    """
+    if not secrets_to_scrub:
+        return value
+    if isinstance(value, str):
+        scrubbed = value
+        for secret in secrets_to_scrub:
+            scrubbed = scrubbed.replace(secret, "<redacted-secret>")
+        return scrubbed
+    if isinstance(value, dict):
+        return {key: _scrub_secrets(item, secrets_to_scrub) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_scrub_secrets(item, secrets_to_scrub) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_scrub_secrets(item, secrets_to_scrub) for item in value)
+    return value
+
+
 def _frame(value: bytes) -> bytes:
     return len(value).to_bytes(8, "big") + value
 
@@ -354,6 +380,13 @@ async def _git_bytes(
             pass
         await process.wait()
         raise VerificationError("a bounded Git command timed out") from exc
+    except asyncio.CancelledError:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await process.wait()
+        raise
     if process.returncode != 0:
         detail = stderr.decode("utf-8", errors="replace").strip()[-2000:]
         raise VerificationError(
@@ -398,6 +431,8 @@ async def _digest_git_blob(
 
     async def consume() -> bytes:
         nonlocal actual_size
+        assert process.stdout is not None
+        assert process.stderr is not None
         while True:
             chunk = await process.stdout.read(1024 * 1024)
             if not chunk:
@@ -417,6 +452,13 @@ async def _digest_git_blob(
             pass
         await process.wait()
         raise VerificationError("a bounded Git blob read timed out") from exc
+    except asyncio.CancelledError:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await process.wait()
+        raise
     if process.returncode != 0:
         detail = stderr.decode("utf-8", errors="replace").strip()[-2000:]
         raise VerificationError(f"Git could not read a staged blob: {detail}")
@@ -442,6 +484,8 @@ def _safe_path(
         # which must never reach tool output. Surface a path-free message.
         raise VerificationError("candidate worktree could not be opened") from exc
     parts = PurePosixPath(relative).parts
+    if not parts:
+        raise VerificationError("candidate path must not be empty")
     try:
         for component in parts[:-1]:
             try:
@@ -1259,6 +1303,14 @@ async def _run_exec(
                 pass
             await process.wait()
     stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
+    secret_values = tuple(
+        os.environ[name]
+        for name in credential_names
+        if name in os.environ and len(os.environ[name]) >= 4
+    )
+    if secret_values:
+        stdout = _scrub_secrets(stdout, secret_values)
+        stderr = _scrub_secrets(stderr, secret_values)
     return {
         "command_id": command_id,
         "status": "timed_out"
@@ -1340,7 +1392,7 @@ def _sandbox_argv(
                 hosts_file,
                 "/etc/hosts",
                 "--ro-bind",
-                resolv_conf,
+                resolv_conf or "/dev/null",
                 "/etc/resolv.conf",
             ]
         )
@@ -1692,6 +1744,7 @@ class VerificationCommitManager:
         jobs: DevelopmentJobManager,
         worktrees: GitWorktreeManager | None = None,
         projects: tuple[ProjectPolicy, ...] = (),
+        state_db: sqlite3.Connection | None = None,
     ) -> None:
         self.settings = settings
         self._locks = locks
@@ -1706,8 +1759,19 @@ class VerificationCommitManager:
         # does not invalidate the single-use verification authority a caller
         # may still be holding. Opens a second connection to the same database
         # the jobs manager uses; WAL serializes the two writers safely.
-        self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+        if state_db is not None:
+            self._db = state_db
+            self._owns_db = False
+        else:
+            self._db = store.open_state_db(
+                self._worktrees.ensure_state_root() / "bridge.db"
+            )
+            self._owns_db = True
         self._reload_records()
+
+    def close(self) -> None:
+        if self._owns_db:
+            self._db.close()
 
     def _reload_records(self) -> None:
         """Load persisted verification records, skipping unparseable rows.
@@ -2007,7 +2071,8 @@ class VerificationCommitManager:
                         first["kind"] = command.kind.value
                         if command.kind is TestKind.MUTATION:
                             first["mutation_stats"] = _parse_mutation_stats(first)
-                    command_results.append(first)
+                    if first is not None:
+                        command_results.append(first)
                 results = tuple(command_results)
                 after = await self._candidate_state_or_rollback(
                     project, job_id, worktree
@@ -2816,6 +2881,7 @@ class PublicationManager:
         jobs: DevelopmentJobManager,
         worktrees: GitWorktreeManager | None = None,
         projects: tuple[ProjectPolicy, ...] = (),
+        state_db: sqlite3.Connection | None = None,
     ) -> None:
         self.settings = settings
         self._locks = locks
@@ -2826,8 +2892,19 @@ class PublicationManager:
         self._project_roots = tuple(project.root for project in projects)
         self._publications: dict[tuple[str, str], PublicationRecord] = {}
         self._publications_lock = asyncio.Lock()
-        self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+        if state_db is not None:
+            self._db = state_db
+            self._owns_db = False
+        else:
+            self._db = store.open_state_db(
+                self._worktrees.ensure_state_root() / "bridge.db"
+            )
+            self._owns_db = True
         self._reload_publications()
+
+    def close(self) -> None:
+        if self._owns_db:
+            self._db.close()
 
     def _reload_publications(self) -> None:
         for row in store.load_publication_rows(self._db):

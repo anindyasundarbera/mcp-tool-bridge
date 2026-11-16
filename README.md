@@ -263,7 +263,7 @@ capture, Markdown I/O, budgets) is in [docs/GETTING-STARTED.md](docs/GETTING-STA
 Authoritative, newcomer-oriented docs live in [`docs/`](docs/README.md):
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — components, request flow, lifecycle, durable state, module map, threat model
-- [docs/TOOLS.md](docs/TOOLS.md) — full 32-tool reference
+- [docs/TOOLS.md](docs/TOOLS.md) — full 39-tool reference
 - [docs/CAPABILITIES.md](docs/CAPABILITIES.md) — capability model and `projects.json` schema
 - [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) — install, configure a project, run, test end-to-end
 - [docs/SECURITY.md](docs/SECURITY.md) — security boundaries and non-negotiable rules
@@ -300,7 +300,7 @@ src/local_dev_mcp/                 the bridge (26 modules, ~15k lines)
   reader.py, writer.py             bounded Markdown read/write
   git.py, worktrees.py, candidate.py   git helpers / worktree mgmt
   authorization.py, requirement.py  durable authorizations / requirement traceability
-tests/                             340+ unittest tests, no network/model deps
+tests/                             597 unittest tests, no network/model deps
 docs/                              milestone decision records + this documentation set
 ```
 

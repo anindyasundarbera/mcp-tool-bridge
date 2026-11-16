@@ -66,7 +66,7 @@ def _validate_target(
     parent = target.parent
     try:
         resolved_parent = parent.resolve(strict=True)
-        resolved_parent.relative_to(project.root)
+        resolved_parent.relative_to(project.root.resolve())
     except FileNotFoundError as exc:
         raise RepositoryWriteError("parent directory does not exist") from exc
     except ValueError as exc:
@@ -75,7 +75,7 @@ def _validate_target(
         raise RepositoryWriteError("parent path is not a directory")
 
     resolved_relative = PurePosixPath(
-        (resolved_parent / target.name).relative_to(project.root).as_posix()
+        (resolved_parent / target.name).relative_to(project.root.resolve()).as_posix()
     )
     if resolved_relative != relative:
         raise RepositoryWriteError("path does not resolve to the requested project location")

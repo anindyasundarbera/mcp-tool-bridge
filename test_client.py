@@ -49,6 +49,13 @@ async def main(project_id: str, endpoint: str) -> None:
                 "failed",
                 "timed_out",
                 "cancelled",
+                "failed_infrastructure",
+                "quarantined_provenance",
+                "paused_budget_exhausted",
+                "paused_interrupted",
+                "paused_operator",
+                "paused_progress_alert",
+                "blocked_input_required",
             }:
                 break
             if time.monotonic() >= deadline:

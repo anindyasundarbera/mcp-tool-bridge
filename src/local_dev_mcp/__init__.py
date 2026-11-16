@@ -6,3 +6,11 @@ from .authorization import AuthorizationManager  # noqa: F401
 from .evidence import EvidenceBundleManager  # noqa: F401
 from .pr import PullRequestManager  # noqa: F401
 from .requirement import RequirementManager  # noqa: F401
+
+__all__ = [
+    "__version__",
+    "AuthorizationManager",
+    "EvidenceBundleManager",
+    "PullRequestManager",
+    "RequirementManager",
+]

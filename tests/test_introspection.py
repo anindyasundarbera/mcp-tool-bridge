@@ -503,35 +503,45 @@ class ListDevelopmentJobsTests(ReconcileFixture):
 
 
 class AuthorizationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temp_dirs: list[tempfile.TemporaryDirectory] = []
+
     def _server(self, capabilities: list[str]) -> Any:
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            root = base / "repo"
-            init_repo(root)
-            project_obj = ProjectPolicy.model_validate(
+        td = tempfile.TemporaryDirectory()
+        self._temp_dirs.append(td)
+        base = Path(td.name)
+        root = base / "repo"
+        init_repo(root)
+        project_obj = ProjectPolicy.model_validate(
+            {
+                "id": "test-project",
+                "display_name": "Test",
+                "description": "Auth",
+                "root": str(root),
+                "capabilities": capabilities,
+                "commit_roots": ["."],
+                "verification_commands": [
+                    {"id": "core", "argv": ["{python}", "-c", "pass"]}
+                ],
+                "protected_paths": [".git", ".env"],
+            }
+        )
+        server = create_server(
+            Settings.from_env(
                 {
-                    "id": "test-project",
-                    "display_name": "Test",
-                    "description": "Auth",
-                    "root": str(root),
-                    "capabilities": capabilities,
-                    "commit_roots": ["."],
-                    "verification_commands": [
-                        {"id": "core", "argv": ["{python}", "-c", "pass"]}
-                    ],
-                    "protected_paths": [".git", ".env"],
+                    "PROJECTS_CONFIG_PATH": str(base / "projects.json"),
+                    "JOB_WORKTREE_ROOT": str(base / "jobs"),
                 }
-            )
-            server = create_server(
-                Settings.from_env(
-                    {
-                        "PROJECTS_CONFIG_PATH": str(base / "projects.json"),
-                        "JOB_WORKTREE_ROOT": str(base / "jobs"),
-                    }
-                ),
-                ProjectRegistry({"test-project": project_obj}),
-            )
-            return server
+            ),
+            ProjectRegistry({"test-project": project_obj}),
+        )
+        return server
+
+    def tearDown(self) -> None:
+        for td in self._temp_dirs:
+            td.cleanup()
+        store.close_all_state_dbs()
+        super().tearDown()
 
     def test_introspection_capabilities_are_gated(self) -> None:
         async def exercise() -> None:

@@ -15,6 +15,7 @@ at; it never pushes, merges, tags, deletes, or moves a remote ref.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -99,6 +100,7 @@ class SyncManager:
         jobs: DevelopmentJobManager,
         worktrees: Any | None = None,
         projects: tuple[ProjectPolicy, ...] = (),
+        state_db: sqlite3.Connection | None = None,
     ) -> None:
         # Local import to avoid a hard dependency cycle in import ordering:
         # ``verification`` (imported above) already imports ``worktrees``.
@@ -114,7 +116,12 @@ class SyncManager:
         self._project_roots = tuple(project.root for project in projects)
         self._syncs: list[SyncRecord] = []
         self._syncs_lock = asyncio.Lock()
-        self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+        if state_db is not None:
+            self._db = state_db
+            self._owns_db = False
+        else:
+            self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+            self._owns_db = True
         self._reload_syncs()
 
     def _reload_syncs(self) -> None:
@@ -123,6 +130,15 @@ class SyncManager:
             record = sync_from_row(row)
             if record is not None:
                 self._syncs.append(record)
+
+    def close(self) -> None:
+        """Close the durable state database if this manager owns it."""
+        if getattr(self, "_owns_db", False) and getattr(self, "_db", None) is not None:
+            try:
+                self._db.close()
+            except Exception:
+                pass
+            self._db = None  # type: ignore[assignment]
 
     def _persist_sync(self, record: SyncRecord) -> None:
         store.insert_sync_row(self._db, sync_to_row(record))

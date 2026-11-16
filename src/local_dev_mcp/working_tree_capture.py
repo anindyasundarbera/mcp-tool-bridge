@@ -36,16 +36,16 @@ Safety invariants enforced here:
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import os
 import secrets
+import sqlite3
 import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal, cast
 
 from . import store
 from .config import Settings
@@ -596,6 +596,7 @@ class WorkingTreeCaptureManager:
         jobs: DevelopmentJobManager,
         worktrees: GitWorktreeManager | None = None,
         projects: tuple[ProjectPolicy, ...] = (),
+        state_db: sqlite3.Connection | None = None,
     ) -> None:
         self.settings = settings
         self._locks = locks
@@ -604,7 +605,21 @@ class WorkingTreeCaptureManager:
             settings, tuple(project.root for project in projects)
         )
         self._projects = projects
-        self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+        if state_db is not None:
+            self._db = state_db
+            self._owns_db = False
+        else:
+            self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+            self._owns_db = True
+
+    def close(self) -> None:
+        """Close the durable state database if this manager owns it."""
+        if getattr(self, "_owns_db", False) and getattr(self, "_db", None) is not None:
+            try:
+                self._db.close()
+            except Exception:
+                pass
+            self._db = None  # type: ignore[assignment]
 
     # -- scope -------------------------------------------------------------- #
 
@@ -839,7 +854,9 @@ class WorkingTreeCaptureManager:
         failure the worktree is force-removed and no candidate is retained; a
         rejected audit row is persisted instead.
         """
-        effort = resolve_effort(project, effort, self.settings)
+        effort = resolve_effort(
+            project, cast(Literal["high", "ultracode"] | None, effort), self.settings
+        )
         scope = self._resolve_scope(project, include_paths, protected_exclude_paths)
         redaction_paths = self._redaction_paths(project)
         policy_fingerprint = _policy_fingerprint(project)
@@ -853,7 +870,7 @@ class WorkingTreeCaptureManager:
             try:
                 (
                     base_head,
-                    selected_entries,
+                    _selected_entries,
                     _protected_entries,
                     selected_descriptors,
                     protected_descriptors,
@@ -983,7 +1000,7 @@ class WorkingTreeCaptureManager:
                 )
                 return _redact(result, redaction_paths)
 
-            except (WorkingTreeCaptureError, WorktreeError, DevelopmentJobError, VerificationError) as exc:
+            except (WorkingTreeCaptureError, WorktreeError, DevelopmentJobError, VerificationError, GitCommandError) as exc:
                 # Fail safe: never retain a partial candidate. The worktree is
                 # force-removed unless the job was already registered (in which
                 # case the candidate is durably retained and owned by the job

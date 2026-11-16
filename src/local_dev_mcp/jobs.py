@@ -5,6 +5,7 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import stat
 import subprocess
 import time
@@ -18,7 +19,7 @@ from . import store
 from .candidate import CandidateHealthChecker
 from .claude import ClaudeExecutor, validate_effort
 from .config import Settings
-from .models import Effort, ProjectPolicy
+from .models import Effort, ProjectCapability, ProjectPolicy
 from .registry import ProjectLockManager
 from .worktrees import GitWorktreeManager, JobWorktree
 
@@ -252,7 +253,7 @@ def _extract_detail_field(
 def _parse_checkpoint_detail(
     event: dict[str, Any] | None,
     result: dict[str, Any] | None,
-) -> dict[str, str | None]:
+) -> dict[str, Any]:
     """Parse the rich checkpoint detail fields from executor events (M-CT-03).
 
     Returns a dict with the five nullable JSON columns
@@ -566,6 +567,7 @@ class DevelopmentJobManager:
         candidate_checker: CandidateHealthChecker | None = None,
         projects: tuple[ProjectPolicy, ...] = (),
         requirements: Any = None,
+        state_db: sqlite3.Connection | None = None,
     ) -> None:
         self.settings = settings
         self._locks = locks
@@ -594,7 +596,12 @@ class DevelopmentJobManager:
         # longer amnesiates in-flight or completed work. Done synchronously in
         # __init__ (only filesystem/DB work, no await) so it works before the
         # event loop starts.
-        self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+        self._owns_db = state_db is None
+        self._db = (
+            state_db
+            if state_db is not None
+            else store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+        )
         # M-EV-01: requirement traceability manager. Shares this manager's DB
         # connection so there is a single write path. Lazily constructed if
         # not provided (lazy import to avoid a module-load-time dependency).
@@ -610,6 +617,14 @@ class DevelopmentJobManager:
         # ``_requirements``) and shares this manager's state root / DB.
         self._authorizations: Any = None
         self._reload_jobs()
+
+    def close(self) -> None:
+        """Safely close the underlying database if owned by this manager."""
+        if getattr(self, "_owns_db", False) and getattr(self, "_db", None) is not None:
+            try:
+                self._db.close()
+            except Exception:
+                pass
 
     def _reload_jobs(self) -> None:
         """Load persisted jobs and reconcile any that were mid-flight at crash.
@@ -727,7 +742,11 @@ class DevelopmentJobManager:
         from .verification import VerificationCommitManager
 
         self._verification = VerificationCommitManager(
-            self.settings, self._locks, self, projects=self._projects
+            self.settings,
+            self._locks,
+            self,
+            projects=self._projects,
+            state_db=self._db,
         )
         return self._verification
 
@@ -750,6 +769,7 @@ class DevelopmentJobManager:
             self,
             self._executor,
             projects=self._projects,
+            state_db=self._db,
         )
         return self._review
 
@@ -774,6 +794,7 @@ class DevelopmentJobManager:
             self.settings,
             worktrees=self._worktrees,
             projects=self._projects,
+            state_db=self._db,
         )
         return self._authorizations
 
@@ -1312,9 +1333,9 @@ class DevelopmentJobManager:
         # ``input_required`` dict carrying a human-readable message.
         direct = result.get("input_required")
         if isinstance(direct, dict):
-            message = direct.get("message") or direct.get("reason")
-            if isinstance(message, str) and message.strip():
-                return message.strip()
+            raw_msg = direct.get("message") or direct.get("reason")
+            if isinstance(raw_msg, str) and raw_msg.strip():
+                return raw_msg.strip()
         # A stream-json event list carrying an ``input_required`` event.
         events = result.get("stream_events")
         if isinstance(events, list):
@@ -1322,9 +1343,9 @@ class DevelopmentJobManager:
                 if not isinstance(event, dict):
                     continue
                 if event.get("type") == "input_required":
-                    message = event.get("message") or event.get("reason")
-                    if isinstance(message, str) and message.strip():
-                        return message.strip()
+                    raw_msg = event.get("message") or event.get("reason")
+                    if isinstance(raw_msg, str) and raw_msg.strip():
+                        return raw_msg.strip()
         # A tool-use of an input-asking shape (e.g. ask_question /
         # request_input) — the drafter is waiting on the operator, not
         # exhausting its budget.
@@ -1334,9 +1355,9 @@ class DevelopmentJobManager:
                 if not isinstance(use, dict):
                     continue
                 if use.get("name") in _INPUT_ASKING_TOOL_NAMES:
-                    message = use.get("message") or use.get("question") or use.get("input")
-                    if isinstance(message, str) and message.strip():
-                        return message.strip()
+                    raw_msg = use.get("message") or use.get("question") or use.get("input")
+                    if isinstance(raw_msg, str) and raw_msg.strip():
+                        return raw_msg.strip()
         return None
 
     async def _close_milestones(
@@ -1446,6 +1467,7 @@ class DevelopmentJobManager:
         the changed-path set captured for THIS attempt (the last attempt's set
         wins when a retry loop follows).
         """
+        assert job.worktree is not None
         exec_task: asyncio.Task[dict[str, Any]] = asyncio.create_task(
             self._executor.execute(
                 project,
@@ -2992,12 +3014,18 @@ class DevelopmentJobManager:
                 # duplicate audit event.
                 snapshot = self._snapshot(job)
                 return {**snapshot, "discard": {"discarded": False}}
-            discarded_path = job.worktree.path
-            await self._worktrees.remove(project, job.worktree)
+            worktree_to_remove = job.worktree
+            discarded_path = worktree_to_remove.path
             job.worktree = None
             job.session_id = None
             job.updated_at = _timestamp()
             self._persist_job(job)
+
+        project_lock = await self._locks.for_project(project.id)
+        async with project_lock:
+            await self._worktrees.remove(project, worktree_to_remove)
+
+        async with self._state_lock:
             self._record_event(
                 job,
                 "control_discard",
@@ -3966,7 +3994,7 @@ class DevelopmentJobManager:
                                 terminal = job.status
                                 applied = True
                                 break
-                            allowed = set(job.delegation_mandate.get("outputs"))
+                            allowed = set(job.delegation_mandate.get("outputs") or ())
                             changed = await self._current_changed_paths(job)
                             out_of_scope = [
                                 path for path in changed if path not in allowed

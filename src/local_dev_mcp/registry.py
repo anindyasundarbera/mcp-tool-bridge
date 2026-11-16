@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import subprocess
 from pathlib import Path
-from typing import Any
 
 from pydantic import ValidationError
 
@@ -39,7 +39,7 @@ class ProjectRegistry:
     def __init__(
         self,
         projects: dict[str, ProjectPolicy],
-        state_db: Any | None = None,
+        state_db: sqlite3.Connection | None = None,
     ):
         self._projects = projects
         # M-GV-03: the durable registration ledger for external apex grounding.
@@ -47,6 +47,7 @@ class ProjectRegistry:
         # ``apex_authority_ref`` at load and rejects a ref that changed without
         # an explicit re-confirmation.
         self._state_db = state_db
+        self._owns_db = False
 
     @classmethod
     def load(
@@ -54,7 +55,7 @@ class ProjectRegistry:
         config_path: Path,
         *,
         require_apex_grounding: bool = False,
-        state_db: Any | None = None,
+        state_db: sqlite3.Connection | None = None,
     ) -> ProjectRegistry:
         try:
             payload = json.loads(config_path.read_text(encoding="utf-8"))
@@ -122,8 +123,8 @@ class ProjectRegistry:
                 ):
                     raise ProjectRegistryError(
                         f"project {project_id!r} apex_authority_ref changed without "
-                        "re-confirmation; call confirm_apex_authority to accept the "
-                        "new external grounding ref"
+                        "re-confirmation; call ProjectRegistry.confirm_apex_authority(...) "
+                        "to accept the new external grounding ref"
                     )
                 if recorded is None:
                     store.upsert_registered_apex_authority(
@@ -156,6 +157,15 @@ class ProjectRegistry:
             self._state_db, project_id, validated
         )
         return validated
+
+    def close(self) -> None:
+        """Close the durable state database if this registry owns it."""
+        if getattr(self, "_owns_db", False) and self._state_db is not None:
+            try:
+                self._state_db.close()
+            except Exception:
+                pass
+            self._state_db = None
 
     def list_public(self) -> list[dict[str, object]]:
         return [
