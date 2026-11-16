@@ -40,15 +40,17 @@ import os
 import secrets
 import sqlite3
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from . import store
+from .authorization import Authorization
 from .claude import ClaudeExecutor
 from .config import Settings
 from .git import GitCommandError
+from .identity import AuthProvenance, CallerPrincipal, PrincipalRole
 from .jobs import DevelopmentJobError, DevelopmentJobManager, resolve_effort
 from .models import Effort, ProjectPolicy
 from .registry import ProjectLockManager
@@ -67,7 +69,7 @@ from .verification import (
 from .worktrees import GitWorktreeManager, JobWorktree, WorktreeError
 
 
-class ReviewError(RuntimeError):
+class ReviewError(ValueError, RuntimeError):
     """Raised when a candidate cannot be safely reviewed or a review is invalid."""
 
 
@@ -393,6 +395,171 @@ def _read_candidate_bytes(worktree_path: Path, relative: str) -> tuple[bytes, di
         raise ReviewError(f"candidate file could not be read: {exc}") from exc
     finally:
         os.close(file_descriptor)
+
+
+# ---------------------------------------------------------------------------
+# M2.5 promotion governance: a review decision never grants mutation
+# authority. Promotion requires two gates — a review bound to the exact
+# candidate state (Gate 1) and a non-executor steward approval grant with full
+# separation of duties (Gate 2).
+# ---------------------------------------------------------------------------
+
+_APPROVAL_DECISIONS = frozenset({"approve", "approved", "pass", "accept", "accepted"})
+_REJECTION_DECISIONS = frozenset(
+    {"reject", "rejected", "fail", "deny", "denied", "changes"}
+)
+
+
+def _normalize_decision(decision: str) -> str:
+    """Normalize a free-text decision to ``approve``/``reject``, failing closed."""
+    if not isinstance(decision, str):
+        raise ReviewError("decision must be a string")
+    normalized = decision.strip().lower()
+    if normalized in _APPROVAL_DECISIONS:
+        return "approve"
+    if normalized in _REJECTION_DECISIONS:
+        return "reject"
+    raise ReviewError(f"unknown review decision: {decision!r}")
+
+
+def _compute_evidence_digest(
+    project_id: str,
+    job_id: str,
+    candidate_head: str,
+    diff_fingerprint: str,
+    paths: tuple[str, ...],
+    verification_run_id: str = "",
+) -> str:
+    """Compute a deterministic SHA-256 evidence digest over candidate state."""
+    payload = {
+        "project_id": project_id,
+        "job_id": job_id,
+        "candidate_head": candidate_head,
+        "diff_fingerprint": diff_fingerprint,
+        "paths": sorted(paths),
+        "verification_run_id": verification_run_id,
+    }
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewDecision:
+    """A structured, candidate-bound review decision.
+
+    ``grants_mutation_authority`` is always ``False``: a review is advice, never
+    the authority to mutate. Constructing one with it set to ``True`` raises, so
+    no code path can ever surface a review decision as a mutation grant.
+    """
+
+    decision_id: str = ""
+    project_id: str = ""
+    job_id: str = ""
+    verdict: str = "approved"
+    reviewer_principal_id: str | None = None
+    reviewer_provenance: str | None = None
+    reviewer_class: str = "human"
+    candidate_head_sha: str = ""
+    diff_fingerprint: str = ""
+    changed_paths: tuple[str, ...] = ()
+    verification_run_id: str = ""
+    evidence_digest: str = ""
+    notes: str = ""
+    created_at: str = ""
+    grants_mutation_authority: bool = False
+    # Backward compatibility aliases for existing callers/tests:
+    review_id: str | None = None
+    decision: str | None = None
+    candidate_head: str | None = None
+    paths: tuple[str, ...] | None = None
+    decided_at: str | None = None
+    detail: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.grants_mutation_authority:
+            raise ReviewError("Review decisions never confer mutation authority")
+        # Harmonize primary fields and compatibility aliases:
+        if self.review_id and not self.decision_id:
+            object.__setattr__(self, "decision_id", self.review_id)
+        elif self.decision_id and not self.review_id:
+            object.__setattr__(self, "review_id", self.decision_id)
+
+        if self.decision and (not self.verdict or self.verdict == "approved"):
+            object.__setattr__(self, "verdict", self.decision)
+        elif self.verdict and not self.decision:
+            object.__setattr__(self, "decision", self.verdict)
+
+        if self.candidate_head and not self.candidate_head_sha:
+            object.__setattr__(self, "candidate_head_sha", self.candidate_head)
+        elif self.candidate_head_sha and not self.candidate_head:
+            object.__setattr__(self, "candidate_head", self.candidate_head_sha)
+
+        if self.paths and not self.changed_paths:
+            object.__setattr__(self, "changed_paths", tuple(self.paths))
+        elif self.changed_paths and not self.paths:
+            object.__setattr__(self, "paths", tuple(self.changed_paths))
+
+        if self.decided_at and not self.created_at:
+            object.__setattr__(self, "created_at", self.decided_at)
+        elif self.created_at and not self.decided_at:
+            object.__setattr__(self, "decided_at", self.created_at)
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalSummaryDTO:
+    """A read-only summary of a review decision + approval grant."""
+
+    project_id: str
+    job_id: str
+    candidate_head_sha: str = ""
+    diff_fingerprint: str = ""
+    changed_paths: tuple[str, ...] = ()
+    verification_run_id: str = ""
+    verification_passed: bool = True
+    review_decision_id: str = ""
+    review_verdict: str = ""
+    reviewer_principal_id: str = ""
+    evidence_digest: str = ""
+    # Backward compatibility aliases and fields:
+    candidate_head: str | None = None
+    decision: str = "pending"
+    approval_grant_id: str | None = None
+    approver_principal_id: str | None = None
+    approver_provenance: str | None = None
+    approver_role: str | None = None
+    promoted: bool = False
+    detail: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.candidate_head and not self.candidate_head_sha:
+            object.__setattr__(self, "candidate_head_sha", self.candidate_head)
+        elif self.candidate_head_sha and not self.candidate_head:
+            object.__setattr__(self, "candidate_head", self.candidate_head_sha)
+
+        if self.decision and (not self.review_verdict or self.review_verdict == "pending"):
+            object.__setattr__(self, "review_verdict", self.decision)
+        elif self.review_verdict and not self.decision:
+            object.__setattr__(self, "decision", self.review_verdict)
+
+
+@dataclass(frozen=True, slots=True)
+class PromotionAuthorityTrace:
+    """The authority evidence produced by a verified two-gate promotion."""
+
+    project_id: str
+    job_id: str
+    executor_principal_id: str | None = None
+    reviewer_principal_id: str | None = None
+    approver_principal_id: str | None = None
+    publisher_principal_id: str | None = None
+    candidate_head_sha: str = ""
+    diff_fingerprint: str = ""
+    verification_run_id: str = ""
+    review_decision_id: str | None = None
+    approval_grant_id: str | None = None
+    evidence_digest: str = ""
+    verified: bool = False
+    trace: tuple[str, ...] = ()
 
 
 class ReviewManager:
@@ -1145,3 +1312,255 @@ class ReviewManager:
             except Exception:
                 record.used = False
                 raise
+
+    # ------------------------------------------------------------------
+    # M2.5: two-gate promotion governance.
+    # ------------------------------------------------------------------
+
+    def record_review_decision(
+        self,
+        project: ProjectPolicy | Any,
+        job_id: str,
+        decision: str = "approve",
+        *,
+        candidate_head: str | None = None,
+        candidate_head_sha: str | None = None,
+        diff_fingerprint: str = "",
+        paths: list[str] | tuple[str, ...] | None = None,
+        changed_paths: list[str] | tuple[str, ...] | None = None,
+        verification_run_id: str = "",
+        verification_passed: bool = True,
+        principal: CallerPrincipal | None = None,
+        reviewer: CallerPrincipal | None = None,
+        executor_principal_id: str | None = None,
+        reviewer_class: str = "human",
+        notes: str = "",
+    ) -> ReviewDecision:
+        """Record a review decision bound to the exact candidate state."""
+        reviewer_p = reviewer or principal
+        if reviewer_p is not None:
+            if not reviewer_p.authenticated:
+                raise PermissionError("an unauthenticated principal cannot act as reviewer")
+            if (
+                reviewer_p.role is PrincipalRole.EXECUTOR
+                or reviewer_p.provenance is AuthProvenance.EXECUTOR_INTERNAL
+                or reviewer_p.principal_id.startswith("executor:")
+            ):
+                raise PermissionError("an executor principal cannot act as reviewer")
+            if executor_principal_id and reviewer_p.principal_id == executor_principal_id:
+                raise PermissionError("executor cannot review their own work")
+
+        normalized = _normalize_decision(decision)
+        if normalized == "approve" and not verification_passed:
+            raise ReviewError("cannot approve candidate when verification has not passed")
+
+        proj_id = project.id if hasattr(project, "id") else str(project)
+        head = candidate_head_sha or candidate_head or ""
+        norm_paths = tuple(
+            sorted(changed_paths if changed_paths is not None else (paths or ()))
+        )
+        digest = _compute_evidence_digest(
+            proj_id, job_id, head, diff_fingerprint, norm_paths, verification_run_id
+        )
+        dec_id = self._new_review_id()
+        now = _timestamp()
+        return ReviewDecision(
+            decision_id=dec_id,
+            project_id=proj_id,
+            job_id=job_id,
+            verdict=normalized,
+            reviewer_principal_id=reviewer_p.principal_id if reviewer_p else None,
+            reviewer_provenance=reviewer_p.provenance.value if reviewer_p else None,
+            reviewer_class=reviewer_class,
+            candidate_head_sha=head,
+            diff_fingerprint=diff_fingerprint,
+            changed_paths=norm_paths,
+            verification_run_id=verification_run_id,
+            evidence_digest=digest,
+            notes=notes,
+            created_at=now,
+            grants_mutation_authority=False,
+            # Aliases:
+            review_id=dec_id,
+            decision=normalized,
+            candidate_head=head,
+            paths=norm_paths,
+            decided_at=now,
+        )
+
+    def build_approval_summary(
+        self,
+        project: ProjectPolicy | Any,
+        job_id: str,
+        review_decision: ReviewDecision,
+        approval_grant: Authorization | None = None,
+        verification_passed: bool = True,
+    ) -> ApprovalSummaryDTO:
+        """Build a read-only approval summary from a decision + optional grant."""
+        proj_id = project.id if hasattr(project, "id") else str(project)
+        approver_id: str | None = None
+        approver_provenance: str | None = None
+        approver_role: str | None = None
+        grant_id: str | None = None
+        if approval_grant is not None:
+            grant_id = approval_grant.authorization_id
+            detail = approval_grant.detail or {}
+            approver_id = detail.get("issuer_principal_id") or approval_grant.actor
+            approver_provenance = detail.get("issuer_provenance")
+            approver_role = detail.get("issuer_role")
+        promoted = (
+            review_decision.decision == "approve"
+            and approval_grant is not None
+            and verification_passed
+        )
+        return ApprovalSummaryDTO(
+            project_id=proj_id,
+            job_id=job_id,
+            candidate_head_sha=review_decision.candidate_head_sha,
+            diff_fingerprint=review_decision.diff_fingerprint,
+            changed_paths=review_decision.changed_paths,
+            verification_run_id=review_decision.verification_run_id,
+            verification_passed=verification_passed,
+            review_decision_id=review_decision.decision_id,
+            review_verdict=review_decision.verdict,
+            reviewer_principal_id=review_decision.reviewer_principal_id or "",
+            evidence_digest=review_decision.evidence_digest,
+            # Aliases:
+            candidate_head=review_decision.candidate_head,
+            decision=review_decision.decision or "pending",
+            approval_grant_id=grant_id,
+            approver_principal_id=approver_id,
+            approver_provenance=approver_provenance,
+            approver_role=approver_role,
+            promoted=promoted,
+        )
+
+    def verify_two_gate_promotion(
+        self,
+        project: ProjectPolicy | Any,
+        job_id: str,
+        *,
+        review_decision: ReviewDecision,
+        approval_grant: Authorization,
+        expected_head: str | None = None,
+        expected_diff_fingerprint: str | None = None,
+        paths: list[str] | tuple[str, ...] | None = None,
+        candidate_head_sha: str | None = None,
+        diff_fingerprint: str | None = None,
+        changed_paths: list[str] | tuple[str, ...] | None = None,
+        verification_run_id: str | None = None,
+        verification_passed: bool = True,
+        executor_principal: CallerPrincipal | None = None,
+        publisher_principal: CallerPrincipal | None = None,
+        publisher: CallerPrincipal | None = None,
+        executor_principal_id: str | None = None,
+    ) -> PromotionAuthorityTrace:
+        """Verify both promotion gates before a candidate may be published."""
+        trace: list[str] = []
+        proj_id = project.id if hasattr(project, "id") else str(project)
+
+        # Gate 1: the review decision must match the candidate state and verification.
+        trace.append("gate1:review-matches-candidate")
+        if review_decision.project_id != proj_id or review_decision.job_id != job_id:
+            raise ReviewError("review decision is for a different project or job")
+        if review_decision.decision != "approve" and review_decision.verdict not in (
+            "approve",
+            "approved",
+            "pass",
+        ):
+            raise ReviewError("promotion requires an approving review decision")
+        if not verification_passed:
+            raise ReviewError("promotion requires verification to have passed")
+
+        exp_head = expected_head or candidate_head_sha or ""
+        if (
+            review_decision.candidate_head_sha != exp_head
+            and review_decision.candidate_head != exp_head
+        ):
+            raise ReviewError("review decision does not match the expected base HEAD")
+
+        exp_fp = expected_diff_fingerprint or diff_fingerprint or ""
+        if review_decision.diff_fingerprint != exp_fp:
+            raise ReviewError(
+                "review decision does not match the expected diff fingerprint"
+            )
+
+        input_paths = tuple(paths if paths is not None else (changed_paths or ()))
+        if len(input_paths) != len(set(input_paths)):
+            raise ReviewError("paths must be unique")
+        dec_paths = review_decision.paths or review_decision.changed_paths
+        if tuple(dec_paths) != input_paths and tuple(sorted(dec_paths)) != tuple(
+            sorted(input_paths)
+        ):
+            raise ReviewError(
+                "review decision paths must exactly match the promoted ordered path list"
+            )
+
+        if (
+            verification_run_id
+            and review_decision.verification_run_id
+            and review_decision.verification_run_id != verification_run_id
+        ):
+            raise ReviewError("verification_run_id mismatch")
+
+        # Gate 2: a non-executor steward approval grant + separation of duties.
+        detail = approval_grant.detail or {}
+        approver_id = detail.get("issuer_principal_id") or approval_grant.actor
+        approver_provenance = detail.get("issuer_provenance")
+        approver_role = detail.get("issuer_role")
+        if approval_grant.used:
+            raise ReviewError("approval grant has already been consumed")
+        if approver_provenance == AuthProvenance.EXECUTOR_INTERNAL.value:
+            raise ReviewError("approval grant must be issued by a non-executor principal")
+        if isinstance(approver_id, str) and approver_id.startswith("executor:"):
+            raise ReviewError("approval grant must be issued by a non-executor principal")
+        if approver_role == PrincipalRole.EXECUTOR.value:
+            raise ReviewError("approval grant must be issued by a non-executor principal")
+        if approver_role is not None and approver_role != PrincipalRole.STEWARD.value:
+            raise ReviewError("approval grant must be issued by a steward principal")
+
+        bound_digest = detail.get("bound_evidence_digest") or detail.get("evidence_digest")
+        if (
+            bound_digest
+            and review_decision.evidence_digest
+            and bound_digest != review_decision.evidence_digest
+        ):
+            raise ReviewError("approval grant is bound to a different evidence digest")
+
+        trace.append("gate2:non-executor-steward-approval")
+
+        pub = publisher_principal or publisher
+        reviewer_id = review_decision.reviewer_principal_id
+        executor_id = (
+            executor_principal.principal_id
+            if executor_principal is not None
+            else executor_principal_id
+        )
+        publisher_id = pub.principal_id if pub is not None else None
+        ids = [executor_id, reviewer_id, approver_id, publisher_id]
+        if any(pid is None for pid in ids):
+            raise ReviewError(
+                "executor, reviewer, approver, and publisher must all be identified"
+            )
+        if len(set(ids)) != len(ids):
+            raise ReviewError(
+                "executor, reviewer, approver, and publisher must be distinct identities"
+            )
+        trace.append("gate2:separation-of-duties")
+
+        return PromotionAuthorityTrace(
+            project_id=proj_id,
+            job_id=job_id,
+            executor_principal_id=executor_id,
+            reviewer_principal_id=reviewer_id,
+            approver_principal_id=approver_id,
+            publisher_principal_id=publisher_id,
+            candidate_head_sha=exp_head,
+            diff_fingerprint=exp_fp,
+            verification_run_id=review_decision.verification_run_id,
+            review_decision_id=review_decision.decision_id,
+            approval_grant_id=approval_grant.authorization_id,
+            evidence_digest=review_decision.evidence_digest,
+            verified=True,
+            trace=tuple(trace),
+        )

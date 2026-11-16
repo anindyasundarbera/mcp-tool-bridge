@@ -1,15 +1,29 @@
 import json
+import os
 import tempfile
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any, cast
 
 from local_dev_mcp.claude import (
+    ClaudeExecutor,
+    ClaudeExecutorAdapter,
     _parse_output,
     build_claude_command,
     build_reviewer_command,
 )
 from local_dev_mcp.config import Settings
+from local_dev_mcp.executor_contract import (
+    ExecutionRequest,
+    ExecutorCheckpoint,
+    ExecutorLifecycleState,
+    ExecutorPort,
+    ExecutorResourceLimits,
+    NetworkMode,
+)
 from local_dev_mcp.models import ProjectPolicy
+from tests.support import initialize_git_repository
 
 
 def settings(config_path: Path, **env: str) -> Settings:
@@ -386,6 +400,390 @@ class ReviewerCommandTests(unittest.TestCase):
 
         self.assertEqual(command.count("--effort"), 1)
         self.assertEqual(command[command.index("--effort") + 1], "ultracode")
+
+
+class FakeClaudeExecutor(ClaudeExecutor):
+    """Drop-in replacement for ClaudeExecutor used to test the adapter."""
+
+    def __init__(self, outcome: dict[str, object] | None = None):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings.from_env(
+                {"PROJECTS_CONFIG_PATH": str(Path(directory) / "projects.json")}
+            )
+        super().__init__(settings)
+        self.outcome = outcome or {
+            "status": "completed",
+            "exit_code": 0,
+            "num_turns": 2,
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "session_id": "session-123",
+            "repository_before": {"working_tree": ""},
+            "repository_after": {"working_tree": " M src/foo.py\n"},
+        }
+        self.calls: list[dict[str, Any]] = []
+        self.cancelled: list[str] = []
+
+    async def execute(
+        self,
+        project: ProjectPolicy,
+        specification: str,
+        effort: str,
+        *,
+        root: Path | None = None,
+        resume_session_id: str | None = None,
+        max_turns: int | None = None,
+        execution_id: str | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> dict[str, object]:
+        self.calls.append(
+            {
+                "project": project,
+                "specification": specification,
+                "effort": effort,
+                "root": root,
+                "resume_session_id": resume_session_id,
+                "max_turns": max_turns,
+                "execution_id": execution_id,
+                "env": env,
+            }
+        )
+        return self.outcome
+
+    async def execute_review(
+        self,
+        project: ProjectPolicy,
+        specification: str,
+        effort: str,
+        *,
+        root: Path | None = None,
+        resume_session_id: str | None = None,
+        execution_id: str | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> dict[str, object]:
+        raise NotImplementedError
+
+    async def cancel(self, execution_id: str, reason: str = "cancelled_by_caller") -> bool:
+        self.cancelled.append(execution_id)
+        return True
+
+
+class WritingFakeClaudeExecutor(FakeClaudeExecutor):
+    """Fake executor that actually writes a file so git status sees a change."""
+
+    async def execute(
+        self,
+        project: ProjectPolicy,
+        specification: str,
+        effort: str,
+        *,
+        root: Path | None = None,
+        resume_session_id: str | None = None,
+        max_turns: int | None = None,
+        execution_id: str | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> dict[str, object]:
+        root_path = root or project.root
+        (root_path / "fake_output.txt").write_text("fake output\n", encoding="utf-8")
+        outcome = dict(self.outcome)
+        outcome["repository_before"] = {"working_tree": ""}
+        outcome["repository_after"] = {"working_tree": "?? fake_output.txt\n"}
+        outcome["session_id"] = resume_session_id or "session-123"
+        return outcome
+
+
+def _base_request(candidate: Path, canonical: Path | None = None, **kwargs: object) -> ExecutionRequest:
+    return ExecutionRequest(
+        execution_id="exec-1",
+        project_id="proj-1",
+        job_id="job-1",
+        candidate_root=candidate,
+        canonical_root=canonical,
+        mandate="do work",
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+class ClaudeExecutorAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.candidate = self.root / "candidate"
+        self.canonical = self.root / "canonical"
+        self.candidate.mkdir()
+        self.canonical.mkdir()
+
+    async def asyncTearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _adapter(self, outcome: dict[str, object] | None = None) -> ClaudeExecutorAdapter:
+        return ClaudeExecutorAdapter(FakeClaudeExecutor(outcome))
+
+    def _fake(self, adapter: ClaudeExecutorAdapter) -> FakeClaudeExecutor:
+        return cast(FakeClaudeExecutor, adapter._executor)
+
+    async def test_adapter_implements_executor_port(self) -> None:
+        adapter = self._adapter()
+        self.assertIsInstance(adapter, ExecutorPort)
+
+    async def test_capabilities_declared(self) -> None:
+        adapter = self._adapter()
+        caps = adapter.capabilities()
+        self.assertEqual(caps.adapter_id, "claude")
+        self.assertTrue(caps.supports_resume)
+        self.assertTrue(caps.supports_streaming)
+        self.assertTrue(caps.supports_cancellation)
+        self.assertTrue(caps.supports_checkpoints)
+        self.assertTrue(caps.supports_host_containment)
+        self.assertEqual(caps.supported_network_modes, (NetworkMode.NONE,))
+        self.assertEqual(caps.max_concurrent_executions, 1)
+
+    async def test_health_reports_healthy(self) -> None:
+        adapter = self._adapter()
+        health = await adapter.health()
+        self.assertTrue(health.healthy)
+        self.assertEqual(health.adapter_id, "claude")
+        self.assertIsNotNone(health.containment_available)
+
+    async def test_start_returns_completed_result(self) -> None:
+        adapter = self._adapter()
+        request = _base_request(self.candidate, self.canonical)
+        result = await adapter.start(request)
+        self.assertEqual(result.state, ExecutorLifecycleState.COMPLETED)
+        self.assertEqual(result.execution_id, "exec-1")
+        self.assertEqual(result.adapter_id, "claude")
+        self.assertFalse(result.grants_authority)
+        self.assertEqual(result.modified_paths, ("src/foo.py",))
+        self.assertEqual(result.resource_usage.turns_used, 2)
+        self.assertEqual(result.resource_usage.exit_code, 0)
+        self.assertIn("claude", result.vendor_diagnostics)
+
+    async def test_start_emits_checkpoint(self) -> None:
+        adapter = self._adapter()
+        checkpoints: list[ExecutorCheckpoint] = []
+        request = _base_request(self.candidate, self.canonical)
+        result = await adapter.start(request, on_checkpoint=checkpoints.append)
+        self.assertGreaterEqual(len(checkpoints), 1)
+        self.assertGreaterEqual(len(result.checkpoints), 1)
+        self.assertEqual(checkpoints[-1].execution_id, "exec-1")
+        self.assertEqual(result.checkpoints[-1].resumable_token, "session-123")
+
+    async def test_denied_tool_rejection_bash(self) -> None:
+        adapter = self._adapter()
+        request = _base_request(
+            self.candidate,
+            self.canonical,
+            allowed_tools=("Read", "Bash"),
+        )
+        with self.assertRaisesRegex(ValueError, "Denied tool requested"):
+            await adapter.start(request)
+
+    async def test_unsupported_network_mode_rejection(self) -> None:
+        adapter = self._adapter()
+        request = _base_request(
+            self.candidate,
+            self.canonical,
+            resource_limits=ExecutorResourceLimits(network_mode=NetworkMode.LOOPBACK_ONLY),
+        )
+        with self.assertRaisesRegex(ValueError, "Unsupported network mode"):
+            await adapter.start(request)
+
+    async def test_grants_authority_is_always_false(self) -> None:
+        adapter = self._adapter()
+        request = _base_request(self.candidate, self.canonical)
+        result = await adapter.start(request)
+        self.assertFalse(result.grants_authority)
+
+    async def test_start_passes_env_projection(self) -> None:
+        adapter = self._adapter()
+        request = _base_request(
+            self.candidate,
+            self.canonical,
+            env_projection={"MY_VAR": "value"},
+        )
+        await adapter.start(request)
+        call = self._fake(adapter).calls[-1]
+        env = call["env"]
+        self.assertIsInstance(env, dict)
+        self.assertEqual(env.get("MY_VAR"), "value")
+        self.assertIn("PATH", env)
+
+    async def test_start_passes_resume_session_id(self) -> None:
+        adapter = self._adapter()
+        request = _base_request(
+            self.candidate,
+            self.canonical,
+            resume_session_id="stored-session",
+        )
+        await adapter.start(request)
+        call = self._fake(adapter).calls[-1]
+        self.assertEqual(call["resume_session_id"], "stored-session")
+
+    async def test_start_maps_timed_out(self) -> None:
+        adapter = self._adapter(
+            {
+                "status": "timed_out",
+                "exit_code": None,
+                "repository_after": {"working_tree": ""},
+            }
+        )
+        request = _base_request(self.candidate, self.canonical)
+        result = await adapter.start(request)
+        self.assertEqual(result.state, ExecutorLifecycleState.TIMED_OUT)
+        self.assertEqual(result.error_code, "EXECUTION_TIMEOUT")
+        self.assertFalse(result.grants_authority)
+
+    async def test_start_maps_failed(self) -> None:
+        adapter = self._adapter(
+            {
+                "status": "failed",
+                "exit_code": 1,
+                "error": "something went wrong",
+                "repository_before": {"working_tree": ""},
+                "repository_after": {"working_tree": ""},
+            }
+        )
+        request = _base_request(self.candidate, self.canonical)
+        result = await adapter.start(request)
+        self.assertEqual(result.state, ExecutorLifecycleState.FAILED)
+        self.assertEqual(result.error_code, "CLAUDE_EXECUTION_FAILED")
+        self.assertFalse(result.grants_authority)
+        assert result.error_message is not None
+        self.assertIn("something went wrong", result.error_message)
+
+    async def test_start_propagates_isolation_validation_error(self) -> None:
+        adapter = self._adapter()
+        from unittest.mock import patch
+
+        request = _base_request(self.candidate, self.canonical)
+        with patch("local_dev_mcp.containment.validate_candidate_isolation") as mock_validate:
+            mock_validate.side_effect = ValueError("isolation breach")
+            with self.assertRaisesRegex(ValueError, "isolation breach"):
+                await adapter.start(request)
+
+    async def test_resume_uses_checkpoint_token(self) -> None:
+        adapter = self._adapter()
+        request = _base_request(self.candidate, self.canonical)
+        checkpoint = ExecutorCheckpoint(
+            checkpoint_id="chk-1",
+            execution_id="exec-1",
+            sequence=1,
+            summary="",
+            created_at="2026-11-16T00:00:00Z",
+            resumable_token="token-from-checkpoint",
+        )
+        await adapter.resume(request, checkpoint)
+        call = self._fake(adapter).calls[-1]
+        self.assertEqual(call["resume_session_id"], "token-from-checkpoint")
+
+    async def test_resume_prefers_explicit_session_id(self) -> None:
+        adapter = self._adapter()
+        request = _base_request(
+            self.candidate,
+            self.canonical,
+            resume_session_id="explicit-session",
+        )
+        checkpoint = ExecutorCheckpoint(
+            checkpoint_id="chk-1",
+            execution_id="exec-1",
+            sequence=1,
+            summary="",
+            created_at="2026-11-16T00:00:00Z",
+            resumable_token="token-from-checkpoint",
+        )
+        await adapter.resume(request, checkpoint)
+        call = self._fake(adapter).calls[-1]
+        self.assertEqual(call["resume_session_id"], "explicit-session")
+
+    async def test_cancel_delegates_to_executor(self) -> None:
+        adapter = self._adapter()
+        result = await adapter.cancel("exec-1", reason="test")
+        self.assertTrue(result)
+        self.assertEqual(self._fake(adapter).cancelled, ["exec-1"])
+
+
+class ClaudeExecutorEnvironmentScrubbingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_claude_executor_default_minimal_env_scrubbing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executor = ClaudeExecutor(settings(root / "projects.json"))
+            pol = policy(root)
+
+            # Mock create_subprocess_exec to capture environment passed to subprocess
+            passed_env: dict[str, str] = {}
+
+            async def fake_create_subprocess_exec(*cmd: Any, **kwargs: Any) -> Any:
+                nonlocal passed_env
+                if cmd and cmd[0] != "git":
+                    passed_env = dict(kwargs.get("env") or {})
+
+                class FakeProcess:
+                    returncode = 0
+                    pid = 12345
+
+                    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+                        return (b'{"type": "result", "result": "done", "session_id": "s1"}', b'')
+
+                    async def wait(self) -> int:
+                        return 0
+
+                return FakeProcess()
+
+            from unittest.mock import patch
+            with patch.dict(os.environ, {
+                "SECRET_CANARY_TOKEN": "host-canary-secret",
+                "OPENAI_API_KEY": "sk-openai-secret",
+                "ANTHROPIC_API_KEY": "ant-secret",
+                "AWS_SECRET_ACCESS_KEY": "aws-secret",
+                "NGROK_AUTHTOKEN": "ngrok-secret",
+            }), patch("local_dev_mcp.claude.asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec):
+                res = await executor.execute(pol, "test specification", "high")
+                self.assertEqual(res["status"], "completed")
+                self.assertNotIn("SECRET_CANARY_TOKEN", passed_env)
+                self.assertNotIn("OPENAI_API_KEY", passed_env)
+                self.assertNotIn("ANTHROPIC_API_KEY", passed_env)
+                self.assertNotIn("AWS_SECRET_ACCESS_KEY", passed_env)
+                self.assertNotIn("NGROK_AUTHTOKEN", passed_env)
+                self.assertEqual(passed_env.get("NO_COLOR"), "1")
+
+
+class ClaudeExecutorCancelTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancel_returns_false_when_no_active_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings.from_env(
+                {"PROJECTS_CONFIG_PATH": str(Path(directory) / "projects.json")}
+            )
+            executor = ClaudeExecutor(settings)
+            result = await executor.cancel("unknown-id")
+            self.assertFalse(result)
+
+
+class ClaudeExecutorAdapterConformanceTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.temporary.name)
+        self.candidate = self.workspace / "candidate"
+        self.canonical = self.workspace / "canonical"
+        self.candidate.mkdir()
+        self.canonical.mkdir()
+        initialize_git_repository(self.candidate)
+        initialize_git_repository(self.canonical)
+
+    async def asyncTearDown(self) -> None:
+        self.temporary.cleanup()
+
+    async def test_adapter_passes_executor_conformance_suite(self) -> None:
+        from local_dev_mcp.executor_contract import (
+            run_executor_conformance_suite,
+            run_executor_conformance_suite_sync,
+        )
+
+        adapter = ClaudeExecutorAdapter(WritingFakeClaudeExecutor())
+
+        report = await run_executor_conformance_suite(lambda: adapter, self.workspace)
+        self.assertTrue(report.passed, f"Conformance async failed: {report.failures}")
+
+        report_sync = run_executor_conformance_suite_sync(lambda: adapter, self.workspace)
+        self.assertTrue(report_sync.passed, f"Conformance sync failed: {report_sync.failures}")
 
 
 if __name__ == "__main__":

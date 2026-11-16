@@ -43,6 +43,9 @@ from .working_tree_capture import (
 from .writer import RepositoryWriter, WriteMode
 from . import store
 from .worktrees import GitWorktreeManager
+from .executor_contract import ExecutorPort
+from .identity import CallerPrincipal, resolve_caller_principal
+from .transports import PeerTransportMetadata, TransportMode
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,38 @@ class RequestContext:
     caller_id: str = "local"
     transport: str = "direct"
     correlation_id: str | None = None
+    principal: CallerPrincipal | None = None
+    transport_mode: str | TransportMode = "stdio"
+
+    def resolved_principal(self) -> CallerPrincipal:
+        """Resolve the caller principal from explicit principal or transport metadata."""
+        if self.principal is not None:
+            return self.principal
+        mode_val = self.transport_mode
+        if isinstance(mode_val, TransportMode):
+            mode_str = mode_val.value.lower()
+        else:
+            mode_str = str(mode_val or "stdio").lower()
+
+        if mode_str in ("stdio", "direct"):
+            peer: PeerTransportMetadata | None = PeerTransportMetadata(
+                transport_mode=TransportMode.STDIO
+            )
+        elif mode_str in ("http", "local_http"):
+            peer = PeerTransportMetadata(
+                transport_mode=TransportMode.LOCAL_HTTP,
+                remote_addr="127.0.0.1",
+            )
+        elif mode_str in ("ngrok_mtls", "mtls"):
+            peer = PeerTransportMetadata(transport_mode=TransportMode.NGROK_MTLS)
+        else:
+            peer = None
+
+        return resolve_caller_principal(
+            peer,
+            claimed_actor_label=self.caller_id,
+            allow_legacy_unauthenticated=True,
+        )
 
 
 class InspectionSubService:
@@ -571,6 +606,8 @@ class GovernanceApplication:
         state_db: sqlite3.Connection | None = None,
         authorization: AuthorizationManager | None = None,
         open_hands: OpenHandsActionManager | None = None,
+        claude_executor: ClaudeExecutor | None = None,
+        executor_port: ExecutorPort | None = None,
     ) -> None:
         active_settings = settings or Settings.from_env()
         owns_state_db = False
@@ -602,7 +639,8 @@ class GovernanceApplication:
         self.registry = active_registry
 
         self.locks = locks or ProjectLockManager()
-        self.executor = executor or ClaudeExecutor(active_settings)
+        active_claude = claude_executor or executor or ClaudeExecutor(active_settings)
+        self.executor = active_claude
         self.reader = reader or RepositoryReader(active_settings)
         self.writer = writer or RepositoryWriter(active_settings)
 
@@ -626,9 +664,11 @@ class GovernanceApplication:
             projects=self.registry.projects(),
             requirements=active_requirements,
             state_db=active_state_db,
+            executor_port=executor_port,
         )
         self.jobs_manager = active_jobs
         self.job_manager = active_jobs
+        self.executor_port: ExecutorPort | None = getattr(active_jobs, "executor_port", None)
 
         active_verification = verification or VerificationCommitManager(
             active_settings,
