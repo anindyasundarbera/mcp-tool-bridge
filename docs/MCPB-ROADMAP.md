@@ -85,7 +85,10 @@ cross-cutting M-CC set are now DONE, including the three former PARTIAL rows
 closed on 2026-08-28.** The 2026-08-27 integration re-landed the full
 capability set onto `main` (22 cherry-picked commits), closing every item in the
 prior "definitive open set". The 2026-08-28 PARTIAL-closure tail then added
-three more DONE items — full suite green: **597 tests**:
+three more DONE items, and the Phase 1 Core Boundary integration delivered
+the transport-neutral `GovernanceApplication` (`application.py`), error
+boundary (`errors.py`), and schema compatibility catalog (`schema_compat.py`,
+`docs/M-P1-PROTOCOL-AND-SCHEMA.md`) — full suite green: **657 tests**:
 
 - **Deterministic replay (NEW SURFACE):** read-only `replay_verification` tool
   + `REPLAY_VERIFICATION` capability (requires `verification_commit`, dormant
@@ -173,8 +176,7 @@ follow-on hardening, not new capability gaps.
 ## Verdict summary — all 149 ChatGPT capability items
 
 The original point-in-time audit (2026-08-07), reconciled against merged `main`
-as of the 2026-08-28 release integration (22 capability commits + the PARTIAL
-closure tail, 597 tests green). Every P0/P1/P2 item is delivered — the three
+as of the Phase 1 Core Boundary integration (657 tests green). Every P0/P1/P2 item is delivered — the three
 former PARTIAL items (deterministic replay, test-kind coverage, static analysis)
 were closed on 2026-08-28; the ten P3 items remain deferred as the M-IN-01
 non-goal. Status legend: **DONE** = delivered;
@@ -1087,7 +1089,11 @@ vision.
    dependency order; the 2026-08-28 PARTIAL-closure tail added the
    `replay_verification` read-only tool (39 tools, 22 capabilities),
    `VerificationCommand.kind` test-kind coverage, and the internal
-   `static_analysis` block; the full suite is green (**597 tests**).
+   `static_analysis` block. The Phase 1 Core Boundary integration decoupled
+   the transport-neutral `GovernanceApplication` core, error boundary, and
+   schema compatibility catalog (`application.py`, `errors.py`,
+   `schema_compat.py`, `docs/M-P1-PROTOCOL-AND-SCHEMA.md`); the full suite is
+   green (**657 tests**).
 2. **Release.** Version stays **0.11.0** (the release commit `aa1b7b0` was never
    pushed). The remaining work is release mechanics: merge `origin/main`,
    push, tag `v0.11.0`, and a GitHub release — each step is an explicit

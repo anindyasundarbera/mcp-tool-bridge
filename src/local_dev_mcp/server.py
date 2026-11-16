@@ -7,37 +7,26 @@ from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from .application import GovernanceApplication, RequestContext
 from .claude import ClaudeExecutor
 from .config import Settings
-from .evidence import EvidenceBundleError, EvidenceBundleManager
-from .git import GitCommandError, project_status
-from .introspection import CanonicalizationResolver, effective_policy_view
-from .jobs import DevelopmentJobError, DevelopmentJobManager
+from .errors import raise_as_interface_error
+from .evidence import EvidenceBundleManager
+from .introspection import CanonicalizationResolver
+from .jobs import DevelopmentJobManager
 from .models import Effort, ProjectCapability
-from .pr import PullRequestError, PullRequestManager
+from .pr import PullRequestManager
 from .reader import RepositoryReader
 from .registry import ProjectLockManager, ProjectRegistry
-from .review import ReviewError, ReviewManager
+from .review import ReviewManager
 from .writer import RepositoryWriter, WriteMode
 from .verification import (
-    PublicationError,
     PublicationManager,
     VerificationCommitManager,
-    VerificationError,
 )
-from .sync import SyncError, SyncManager
-from .runtime_verification import (
-    RuntimeVerificationError,
-    RuntimeVerificationManager,
-)
-from .working_tree_capture import (
-    WorkingTreeCaptureError,
-    WorkingTreeCaptureManager,
-)
-from .authorization import AuthorizationError, AuthorizationManager
-from .open_hands_action import OpenHandsActionError, OpenHandsActionManager
-from . import store
-from .worktrees import GitWorktreeManager
+from .sync import SyncManager
+from .runtime_verification import RuntimeVerificationManager
+from .working_tree_capture import WorkingTreeCaptureManager
 
 
 def create_server(
@@ -60,140 +49,25 @@ def create_server(
     requirements: Any = None,
     state_db: sqlite3.Connection | None = None,
 ) -> FastMCP:
-    active_settings = settings or Settings.from_env()
-    owns_state_db = False
-    if state_db is not None:
-        active_state_db = state_db
-    elif registry is not None and registry._state_db is not None:
-        active_state_db = registry._state_db
-    else:
-        active_state_db = store.open_state_db(
-            GitWorktreeManager(active_settings, ()).ensure_state_root() / "bridge.db"
-        )
-        owns_state_db = True
-
-    if registry is not None:
-        active_registry = registry
-        if getattr(active_registry, "_state_db", None) is None:
-            active_registry._state_db = active_state_db
-    else:
-        # M-GV-03: load the registry against the same durable state DB the job
-        # manager uses, so the external-apex-grounding registration ledger is
-        # enforced at load time (a grounded project whose apex ref changed
-        # without re-confirmation fails closed at startup). WAL allows the
-        # registry and the job manager to hold concurrent connections to the
-        # same file.
-        active_registry = ProjectRegistry.load(
-            active_settings.projects_config_path,
-            require_apex_grounding=active_settings.require_apex_grounding,
-            state_db=active_state_db,
-        )
-    active_locks = locks or ProjectLockManager()
-    active_executor = executor or ClaudeExecutor(active_settings)
-    active_reader = reader or RepositoryReader(active_settings)
-    active_writer = writer or RepositoryWriter(active_settings)
-
-    if requirements is not None:
-        active_requirements = requirements
-    else:
-        from .requirement import RequirementManager
-
-        active_requirements = RequirementManager(
-            active_settings,
-            store,
-            active_reader,
-            db=active_state_db,
-        )
-
-    # M-EV-01: construct the RequirementManager so it shares the job manager's
-    # DB connection (wired inside DevelopmentJobManager). When the caller
-    # passes a pre-built ``jobs`` manager, its own RequirementManager is kept.
-    active_jobs = jobs or DevelopmentJobManager(
-        active_settings,
-        active_locks,
-        active_executor,
-        projects=active_registry.projects(),
-        requirements=active_requirements,
-        state_db=active_state_db,
-    )
-    active_verification = verification or VerificationCommitManager(
-        active_settings,
-        active_locks,
-        active_jobs,
-        projects=active_registry.projects(),
-        state_db=active_state_db,
-    )
-    active_review = review or ReviewManager(
-        active_settings,
-        active_locks,
-        active_jobs,
-        active_executor,
-        projects=active_registry.projects(),
-        state_db=active_state_db,
-    )
-    active_publication = publication or PublicationManager(
-        active_settings,
-        active_locks,
-        active_jobs,
-        projects=active_registry.projects(),
-        state_db=active_state_db,
-    )
-    # Sync manager for canonical checkout synchronization
-    active_sync = sync or SyncManager(
-        active_settings,
-        active_locks,
-        active_jobs,
-        projects=active_registry.projects(),
-        state_db=active_state_db,
-    )
-    # Authorization manager for durable capability checks
-    active_authorization = AuthorizationManager(
-        active_settings,
-        projects=active_registry.projects(),
-        state_db=active_state_db,
-    )
-
-    active_evidence = evidence or EvidenceBundleManager(
-        active_settings,
-        active_locks,
-        active_jobs,
-        projects=active_registry.projects(),
-        state_db=active_state_db,
-    )
-    active_pr = pr or PullRequestManager(
-        active_settings,
-        active_locks,
-        active_jobs,
-        projects=active_registry.projects(),
-        state_db=active_state_db,
-    )
-    active_canonicalization = canonicalization or CanonicalizationResolver(
-        active_settings,
-        active_locks,
-        active_jobs,
-        active_pr,
-        active_sync,
-        projects=active_registry.projects(),
-        state_db=active_state_db,
-    )
-    active_runtime = runtime or RuntimeVerificationManager(
-        active_settings,
-        active_locks,
-        projects=active_registry.projects(),
-        state_db=active_state_db,
-    )
-    active_capture = capture or WorkingTreeCaptureManager(
-        active_settings,
-        active_locks,
-        active_jobs,
-        projects=active_registry.projects(),
-        state_db=active_state_db,
-    )
-    active_open_hands = OpenHandsActionManager(
-        active_settings,
-        active_locks,
-        projects=active_registry.projects(),
-        state_db=active_state_db,
+    app = GovernanceApplication(
+        settings=settings,
+        registry=registry,
+        executor=executor,
+        reader=reader,
+        writer=writer,
+        locks=locks,
+        jobs=jobs,
+        verification=verification,
+        review=review,
+        publication=publication,
+        sync=sync,
+        evidence=evidence,
+        pr=pr,
+        canonicalization=canonicalization,
+        runtime=runtime,
+        capture=capture,
+        requirements=requirements,
+        state_db=state_db,
     )
 
     mcp = FastMCP(
@@ -232,7 +106,10 @@ def create_server(
         ),
     )
     async def list_allowed_projects() -> dict[str, object]:
-        return {"projects": active_registry.list_public()}
+        try:
+            return await app.list_allowed_projects()
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="get_project_status",
@@ -253,25 +130,10 @@ def create_server(
             Field(description="Exact project ID returned by list_allowed_projects."),
         ],
     ) -> dict[str, object]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.REPOSITORY_READ
-        )
-        result: dict[str, object] = {
-            "project_id": project.id,
-            "project_name": project.display_name,
-            "repository": await project_status(project.root),
-        }
-        # M-EV-01: surface a bounded requirements_covered summary so an
-        # orchestrator can see coverage before planning work. Non-fatal: a
-        # project with no parsed requirements yields no summary.
         try:
-            req_manager = active_jobs._requirements_manager()
-            summary = await req_manager.requirements_covered_summary(project)
-            if summary.get("normative", 0) > 0:
-                result["requirements_covered"] = summary
-        except Exception:
-            pass
-        return result
+            return await app.get_project_status(project_id)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     read_only_annotations = ToolAnnotations(
         readOnlyHint=True,
@@ -307,8 +169,12 @@ def create_server(
             Field(description="Maximum number of Markdown paths to return.", ge=1),
         ] = 100,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(project_id, ProjectCapability.REPOSITORY_READ)
-        return await active_reader.list_markdown(project, path, max_depth, max_results)
+        try:
+            return await app.list_project_markdown(
+                project_id, path, max_depth, max_results
+            )
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="search_project_markdown",
@@ -333,8 +199,10 @@ def create_server(
             int, Field(description="Maximum number of matches to return.", ge=1)
         ] = 30,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(project_id, ProjectCapability.REPOSITORY_READ)
-        return await active_reader.search(project, query, path, max_results)
+        try:
+            return await app.search_project_markdown(project_id, query, path, max_results)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="read_project_markdown",
@@ -352,8 +220,10 @@ def create_server(
             str, Field(description="Exact relative path to a Markdown (.md) file.")
         ],
     ) -> dict[str, Any]:
-        project = active_registry.resolve(project_id, ProjectCapability.REPOSITORY_READ)
-        return await active_reader.read_markdown(project, path)
+        try:
+            return await app.read_project_markdown(project_id, path)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="read_project_file_range",
@@ -377,10 +247,12 @@ def create_server(
             Field(description="Optional SHA-256 requiring the file to be unchanged."),
         ] = None,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(project_id, ProjectCapability.REPOSITORY_READ)
-        return await active_reader.read_range(
-            project, path, start_line, end_line, expected_sha256
-        )
+        try:
+            return await app.read_project_file_range(
+                project_id, path, start_line, end_line, expected_sha256
+            )
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="get_markdown_outline",
@@ -398,8 +270,10 @@ def create_server(
             str, Field(description="Exact relative path to a Markdown (.md) file.")
         ],
     ) -> dict[str, Any]:
-        project = active_registry.resolve(project_id, ProjectCapability.REPOSITORY_READ)
-        return await active_reader.outline(project, path)
+        try:
+            return await app.get_markdown_outline(project_id, path)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="get_project_file_metadata",
@@ -417,8 +291,10 @@ def create_server(
             str, Field(description="Exact relative path to a Markdown (.md) file.")
         ],
     ) -> dict[str, Any]:
-        project = active_registry.resolve(project_id, ProjectCapability.REPOSITORY_READ)
-        return await active_reader.metadata(project, path)
+        try:
+            return await app.get_project_file_metadata(project_id, path)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="write_project_markdown",
@@ -471,12 +347,12 @@ def create_server(
             ),
         ] = None,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(project_id, ProjectCapability.MARKDOWN_WRITE)
-        lock = await active_locks.for_project(project.id)
-        async with lock:
-            return await active_writer.write(
-                project, path, content, write_mode, expected_sha256
+        try:
+            return await app.write_project_markdown(
+                project_id, path, content, write_mode, expected_sha256
             )
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="send_to_local_dev",
@@ -535,13 +411,12 @@ def create_server(
             ),
         ] = None,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(project_id, ProjectCapability.CLAUDE_EDIT)
-        # M-GV-05: record the drafting identity on the job so a later
-        # record_candidate_review with the same reviewer_id is rejected
-        # (self-certification prevention).
-        return await active_jobs.start(
-            project, text, effort, requested_base, drafter_id="ChatGPT"
-        )
+        try:
+            return await app.send_to_local_dev(
+                project_id, text, effort, requested_base
+            )
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="get_development_job",
@@ -570,12 +445,10 @@ def create_server(
             ),
         ],
     ) -> dict[str, Any]:
-        project = active_registry.resolve(project_id, ProjectCapability.CLAUDE_EDIT)
-        # M-GV-06: a delegated child is bounded to its mandate authority subset.
-        await active_jobs.require_job_capability(
-            project, job_id, ProjectCapability.CLAUDE_EDIT
-        )
-        return await active_jobs.get(project, job_id)
+        try:
+            return await app.get_development_job(project_id, job_id)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="resume_development_job",
@@ -621,12 +494,10 @@ def create_server(
             ),
         ] = None,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(project_id, ProjectCapability.CLAUDE_EDIT)
-        # M-GV-06: a delegated child is bounded to its mandate authority subset.
-        await active_jobs.require_job_capability(
-            project, job_id, ProjectCapability.CLAUDE_EDIT
-        )
-        return await active_jobs.resume(project, job_id, text, effort)
+        try:
+            return await app.resume_development_job(project_id, job_id, text, effort)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="cancel_development_job",
@@ -655,16 +526,10 @@ def create_server(
             ),
         ],
     ) -> dict[str, Any]:
-        project = active_registry.resolve(project_id, ProjectCapability.CLAUDE_EDIT)
-        # M-GV-06: a delegated child is bounded to its mandate authority subset.
-        await active_jobs.require_job_capability(
-            project, job_id, ProjectCapability.CLAUDE_EDIT
-        )
-        return await active_jobs.cancel(project, job_id)
-
-    # M-CC-08: human control surface. Each control is dormant by default —
-    # registered always, but capability-gated at call time so a project that has
-    # not opted into the control cannot invoke it.
+        try:
+            return await app.cancel_development_job(project_id, job_id)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="pause_development_job",
@@ -695,10 +560,10 @@ def create_server(
             ),
         ],
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.PAUSE_DEVELOPMENT_JOB
-        )
-        return await active_jobs.pause(project, job_id)
+        try:
+            return await app.pause_development_job(project_id, job_id)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="extend_budget",
@@ -742,12 +607,12 @@ def create_server(
             ),
         ] = None,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.EXTEND_BUDGET
-        )
-        return await active_jobs.extend_budget(
-            project, job_id, slices=slices, reason=reason
-        )
+        try:
+            return await app.extend_budget(
+                project_id, job_id, slices=slices, reason=reason
+            )
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="narrow_scope",
@@ -791,12 +656,12 @@ def create_server(
             ),
         ] = None,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.NARROW_SCOPE
-        )
-        return await active_jobs.narrow_scope(
-            project, job_id, paths=paths, reason=reason
-        )
+        try:
+            return await app.narrow_scope(
+                project_id, job_id, paths=paths, reason=reason
+            )
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="replace_worker",
@@ -836,12 +701,12 @@ def create_server(
             Field(description="Effort override (high or ultracode)."),
         ] = None,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.REPLACE_WORKER
-        )
-        return await active_jobs.replace_worker(
-            project, job_id, text, effort=effort
-        )
+        try:
+            return await app.replace_worker(
+                project_id, job_id, text, effort=effort
+            )
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="discard_candidate",
@@ -880,12 +745,12 @@ def create_server(
             ),
         ] = None,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.DISCARD_CANDIDATE
-        )
-        return await active_jobs.discard_candidate(
-            project, job_id, reason=reason
-        )
+        try:
+            return await app.discard_candidate(
+                project_id, job_id, reason=reason
+            )
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="revoke_authorization",
@@ -928,12 +793,12 @@ def create_server(
             ),
         ] = None,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.REVOKE_AUTHORIZATION
-        )
-        return await active_jobs.revoke_authorization(
-            project, authorization_id, reason=reason
-        )
+        try:
+            return await app.revoke_authorization(
+                project_id, authorization_id, reason=reason
+            )
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="verify_development_job",
@@ -970,14 +835,10 @@ def create_server(
             ),
         ],
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.VERIFICATION_COMMIT
-        )
-        # M-GV-06: a delegated child is bounded to its mandate authority subset.
-        await active_jobs.require_job_capability(
-            project, job_id, ProjectCapability.VERIFICATION_COMMIT
-        )
-        return await active_verification.verify(project, job_id, expected_head)
+        try:
+            return await app.verify_development_job(project_id, job_id, expected_head)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="replay_verification",
@@ -1012,13 +873,10 @@ def create_server(
             ),
         ],
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.REPLAY_VERIFICATION
-        )
         try:
-            return await active_verification.replay(project, verification_id)
-        except VerificationError as exc:
-            raise ValueError(str(exc)) from exc
+            return await app.replay_verification(project_id, verification_id)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="list_candidate_changes",
@@ -1042,14 +900,10 @@ def create_server(
             ),
         ],
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.CANDIDATE_REVIEW
-        )
-        # M-GV-06: a delegated child is bounded to its mandate authority subset.
-        await active_jobs.require_job_capability(
-            project, job_id, ProjectCapability.CANDIDATE_REVIEW
-        )
-        return await active_review.list_candidate_changes(project, job_id)
+        try:
+            return await app.list_candidate_changes(project_id, job_id)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="read_candidate_file",
@@ -1099,16 +953,12 @@ def create_server(
             ),
         ] = None,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.CANDIDATE_REVIEW
-        )
-        # M-GV-06: a delegated child is bounded to its mandate authority subset.
-        await active_jobs.require_job_capability(
-            project, job_id, ProjectCapability.CANDIDATE_REVIEW
-        )
-        return await active_review.read_candidate_file(
-            project, job_id, path, start_line, end_line, expected_sha256
-        )
+        try:
+            return await app.read_candidate_file(
+                project_id, job_id, path, start_line, end_line, expected_sha256
+            )
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="record_candidate_review",
@@ -1153,16 +1003,12 @@ def create_server(
             ),
         ] = None,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.CANDIDATE_REVIEW
-        )
-        # M-GV-06: a delegated child is bounded to its mandate authority subset.
-        await active_jobs.require_job_capability(
-            project, job_id, ProjectCapability.CANDIDATE_REVIEW
-        )
-        return await active_review.record_candidate_review(
-            project, job_id, verdict, reviewer_id
-        )
+        try:
+            return await app.record_candidate_review(
+                project_id, job_id, verdict, reviewer_id
+            )
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="run_independent_review",
@@ -1203,14 +1049,10 @@ def create_server(
             ),
         ] = None,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.CANDIDATE_REVIEW
-        )
-        # M-GV-06: a delegated child is bounded to its mandate authority subset.
-        await active_jobs.require_job_capability(
-            project, job_id, ProjectCapability.CANDIDATE_REVIEW
-        )
-        return await active_review.run_independent_review(project, job_id, effort)
+        try:
+            return await app.run_independent_review(project_id, job_id, effort)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="get_candidate_review",
@@ -1239,14 +1081,10 @@ def create_server(
             ),
         ],
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.CANDIDATE_REVIEW
-        )
-        # M-GV-06: a delegated child is bounded to its mandate authority subset.
-        await active_jobs.require_job_capability(
-            project, job_id, ProjectCapability.CANDIDATE_REVIEW
-        )
-        return await active_review.get_candidate_review(project, job_id, review_id)
+        try:
+            return await app.get_candidate_review(project_id, job_id, review_id)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="commit_verified_development_job",
@@ -1336,68 +1174,20 @@ def create_server(
             Field(description="Durable authorization ID for commit.", pattern=r"^[0-9a-f]{32}$")
         ] = None,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.VERIFICATION_COMMIT
-        )
         try:
-            # M-GV-06: a delegated child is bounded to its mandate authority subset.
-            await active_jobs.require_job_capability(
-                project, job_id, ProjectCapability.VERIFICATION_COMMIT
-            )
-            if project.requires_review:
-                if review_id is None:
-                    raise ReviewError(
-                        "review_id is required: this project requires a candidate "
-                        "review before a verified commit"
-                    )
-                await active_review.validate_for_commit(
-                    project,
-                    job_id,
-                    review_id,
-                    expected_head,
-                    expected_diff_fingerprint,
-                    paths,
-                )
-            # Durable authorization check (non-mutating precheck)
-            if active_settings.enable_durable_authz and authorization_id is not None:
-                active_authorization.check(
-                    authorization_id,
-                    project_id=project.id,
-                    capability=ProjectCapability.VERIFICATION_COMMIT,
-                    target=verification_id,
-                )
-            committed = await active_verification.commit(
-                project,
+            return await app.commit_verified_development_job(
+                project_id,
                 job_id,
                 verification_id,
                 expected_head,
                 expected_diff_fingerprint,
                 paths,
                 message,
+                review_id=review_id,
+                authorization_id=authorization_id,
             )
-            # Consume authorization only after successful commit
-            if active_settings.enable_durable_authz and authorization_id is not None:
-                active_authorization.consume(authorization_id)
-            if project.requires_review and review_id is not None:
-                try:
-                    await active_review.mark_used(review_id)
-                except Exception:
-                    # The commit already succeeded and verification's single-use
-                    # verification_id prevents a second commit, so a review-
-                    # bookkeeping failure must not discard the commit_sha the caller
-                    # needs. mark_used is atomic, so the review stays reusable in
-                    # memory and disk; surface the issue as a warning instead.
-                    committed = {
-                        **committed,
-                        "review_mark_warning": (
-                            "commit succeeded but the review record could not be "
-                            "marked used; the single-use verification_id still "
-                            "prevents a second commit"
-                        ),
-                    }
-            return committed
-        except (VerificationError, ReviewError, AuthorizationError, DevelopmentJobError) as exc:
-            raise ValueError(str(exc)) from exc
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="push_detached_development_commit",
@@ -1469,36 +1259,18 @@ def create_server(
             Field(description="Durable authorization ID for push.", pattern=r"^[0-9a-f]{32}$")
         ] = None,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.PUSH_DEVELOPMENT_COMMIT
-        )
         try:
-            # M-GV-06: a delegated child is bounded to its mandate authority subset.
-            await active_jobs.require_job_capability(
-                project, job_id, ProjectCapability.PUSH_DEVELOPMENT_COMMIT
-            )
-            # Durable authorization check for push (non-mutating precheck)
-            if active_settings.enable_durable_authz and authorization_id is not None:
-                active_authorization.check(
-                    authorization_id,
-                    project_id=project.id,
-                    capability=ProjectCapability.PUSH_DEVELOPMENT_COMMIT,
-                    target=branch_name,
-                )
-            published = await active_publication.publish(
-                project,
+            return await app.push_detached_development_commit(
+                project_id,
                 job_id,
                 commit_sha,
                 branch_name,
                 expected_base_head,
                 expected_diff_fingerprint,
+                authorization_id=authorization_id,
             )
-            # Consume authorization only after successful publish
-            if active_settings.enable_durable_authz and authorization_id is not None:
-                active_authorization.consume(authorization_id)
-            return published
-        except (PublicationError, AuthorizationError, DevelopmentJobError) as exc:
-            raise ValueError(str(exc)) from exc
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="sync_canonical_checkout",
@@ -1548,13 +1320,12 @@ def create_server(
             ),
         ],
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.SYNC_CANONICAL_CHECKOUT
-        )
         try:
-            return await active_sync.sync(project, expected_current_head, target_commit)
-        except SyncError as exc:
-            raise ValueError(str(exc)) from exc
+            return await app.sync_canonical_checkout(
+                project_id, expected_current_head, target_commit
+            )
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="prepare_canonical_for_work",
@@ -1596,19 +1367,10 @@ def create_server(
             ),
         ] = False,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.SYNC_CANONICAL_CHECKOUT
-        )
-        if not pull:
-            return await active_sync.check_for_updates(project)
         try:
-            return await active_sync.sync(
-                project,
-                expected_current_head=None,
-                target_commit=None,
-            )
-        except SyncError as exc:
-            raise ValueError(str(exc)) from exc
+            return await app.prepare_canonical_for_work(project_id, pull)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="export_evidence_bundle",
@@ -1652,21 +1414,12 @@ def create_server(
             ),
         ],
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.EXPORT_EVIDENCE_BUNDLE
-        )
-        # M-GV-06: a delegated child is bounded to its mandate authority subset.
-        await active_jobs.require_job_capability(
-            project, job_id, ProjectCapability.EXPORT_EVIDENCE_BUNDLE
-        )
         try:
-            return await active_evidence.export_bundle(
-                project,
-                job_id,
-                expected_candidate_fingerprint,
+            return await app.export_evidence_bundle(
+                project_id, job_id, expected_candidate_fingerprint
             )
-        except EvidenceBundleError as exc:
-            raise ValueError(str(exc)) from exc
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="open_pull_request",
@@ -1720,30 +1473,12 @@ def create_server(
             Field(description="Open as a draft PR (default true)."),
         ] = True,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.OPEN_PULL_REQUEST
-        )
-        # M-GV-06: a delegated child is bounded to its mandate authority subset.
-        await active_jobs.require_job_capability(
-            project, job_id, ProjectCapability.OPEN_PULL_REQUEST
-        )
         try:
-            return await active_pr.open_pull_request(
-                project,
-                job_id,
-                base_head,
-                fingerprint,
-                title,
-                draft=draft,
+            return await app.open_pull_request(
+                project_id, job_id, base_head, fingerprint, title, draft=draft
             )
-        except PullRequestError as exc:
-            raise ValueError(str(exc)) from exc
-
-    # M-AL-01 read-only introspection tools (dormant by default; opt-in via the
-    # job_introspection / policy_introspection / canonical_history_read project
-    # capabilities). They only observe governed state and never mutate: they read
-    # the in-memory + durable job store, the already-validated effective policy,
-    # and origin history via read-only git/gh (no fetch, no push, no merge).
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="list_development_jobs",
@@ -1778,10 +1513,10 @@ def create_server(
             ),
         ] = 50,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.JOB_INTROSPECTION
-        )
-        return await active_jobs.list_jobs(project, scope, limit)
+        try:
+            return await app.list_development_jobs(project_id, scope, limit)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="get_effective_project_policy",
@@ -1800,16 +1535,10 @@ def create_server(
             Field(description="Exact project ID returned by list_allowed_projects."),
         ],
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.POLICY_INTROSPECTION
-        )
-        redaction_paths = (
-            project.root,
-            active_settings.job_worktree_root,
-            active_settings.projects_config_path,
-            *(policy.root for policy in active_registry.projects()),
-        )
-        return effective_policy_view(project, redaction_paths)
+        try:
+            return await app.get_effective_project_policy(project_id)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="resolve_candidate_canonicalization",
@@ -1843,13 +1572,10 @@ def create_server(
             ),
         ],
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.CANONICAL_HISTORY_READ
-        )
         try:
-            return await active_canonicalization.resolve(project, commit_sha)
-        except (GitCommandError, RuntimeError, ValueError) as exc:
-            raise ValueError(str(exc)) from exc
+            return await app.resolve_candidate_canonicalization(project_id, commit_sha)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="run_runtime_verification",
@@ -1899,13 +1625,10 @@ def create_server(
             ),
         ],
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.RUNTIME_VERIFICATION
-        )
         try:
-            return await active_runtime.run(project, check_id, expected_head)
-        except RuntimeVerificationError as exc:
-            raise ValueError(str(exc)) from exc
+            return await app.run_runtime_verification(project_id, check_id, expected_head)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="preflight_working_tree_capture",
@@ -1979,19 +1702,16 @@ def create_server(
             ),
         ] = None,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.WORKING_TREE_CANDIDATE_CAPTURE
-        )
         try:
-            return await active_capture.preflight(
-                project,
+            return await app.preflight_working_tree_capture(
+                project_id,
                 include_paths,
                 protected_exclude_paths,
                 expected_base_head=expected_base_head,
                 expected_working_tree_fingerprint=expected_working_tree_fingerprint,
             )
-        except WorkingTreeCaptureError as exc:
-            raise ValueError(str(exc)) from exc
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="working_tree_candidate_capture",
@@ -2076,20 +1796,17 @@ def create_server(
             ),
         ] = None,
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.WORKING_TREE_CANDIDATE_CAPTURE
-        )
         try:
-            return await active_capture.capture(
-                project,
+            return await app.working_tree_candidate_capture(
+                project_id,
                 include_paths,
                 protected_exclude_paths,
                 expected_base_head=expected_base_head,
                 expected_working_tree_fingerprint=expected_working_tree_fingerprint,
                 effort=effort,
             )
-        except WorkingTreeCaptureError as exc:
-            raise ValueError(str(exc)) from exc
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
     @mcp.tool(
         name="standalone_openhands_action",
@@ -2122,46 +1839,14 @@ def create_server(
             ),
         ],
     ) -> dict[str, Any]:
-        project = active_registry.resolve(
-            project_id, ProjectCapability.GOVERNED_DISPOSABLE_RUNTIME_ACTION_EXECUTION
-        )
         try:
-            return await active_open_hands.execute_action(project, action_params)
-        except OpenHandsActionError as exc:
-            raise ValueError(str(exc)) from exc
+            return await app.standalone_openhands_action(project_id, action_params)
+        except Exception as exc:
+            raise_as_interface_error(exc)
 
-    def close_all() -> None:
-        """Close all managers and the shared state DB."""
-        managers = [
-            active_registry,
-            active_jobs,
-            active_verification,
-            active_review,
-            active_publication,
-            active_sync,
-            active_authorization,
-            active_evidence,
-            active_pr,
-            active_canonicalization,
-            active_runtime,
-            active_capture,
-            active_open_hands,
-            active_requirements,
-        ]
-        for mgr in managers:
-            if hasattr(mgr, "close") and callable(mgr.close):
-                try:
-                    mgr.close()
-                except Exception:
-                    pass
-        if active_state_db is not None:
-            try:
-                active_state_db.close()
-            except Exception:
-                pass
-
-    setattr(mcp, "close", close_all)
-    setattr(mcp, "close_managers", close_all)
+    setattr(mcp, "app", app)
+    setattr(mcp, "close", app.close)
+    setattr(mcp, "close_managers", app.close_managers)
 
     return mcp
 
