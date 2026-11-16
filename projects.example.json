@@ -5,7 +5,7 @@
       "id": "cairn-knowledge-store",
       "display_name": "CAIRN Knowledge Store",
       "description": "Canonical CAIRN knowledge and governance repository",
-      "root": "/home/anindyasundar-bera/Downloads/docs/cairn-orch/cairn-knowledge-store",
+      "root": "/path/to/your-project",
       "enabled": true,
       "require_git": true,
       "capabilities": [
@@ -30,7 +30,7 @@
       "id": "local-dev-mcp",
       "display_name": "Local Development MCP",
       "description": "The ChatGPT-to-Claude development bridge",
-      "root": "/home/anindyasundar-bera/local-dev-mcp",
+      "root": "/path/to/local-dev-mcp",
       "enabled": true,
       "require_git": true,
       "capabilities": [

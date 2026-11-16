@@ -83,10 +83,9 @@ Verified against the source on 2026-08-27/28 (grep/symbol evidence, not just
 commit messages). **All R1 Continuity, R2 Evidence, R3 Governance, and the
 cross-cutting M-CC set are now DONE, including the three former PARTIAL rows
 closed on 2026-08-28.** The 2026-08-27 integration re-landed the full
-capability set onto `main` (22 cherry-picked commits, full suite green: **572
-tests**), closing every item in the prior "definitive open set". The 2026-08-28
-PARTIAL-closure tail then added three more DONE items — full suite green:
-**591 tests**:
+capability set onto `main` (22 cherry-picked commits), closing every item in the
+prior "definitive open set". The 2026-08-28 PARTIAL-closure tail then added
+three more DONE items — full suite green: **597 tests**:
 
 - **Deterministic replay (NEW SURFACE):** read-only `replay_verification` tool
   + `REPLAY_VERIFICATION` capability (requires `verification_commit`, dormant
@@ -175,7 +174,7 @@ follow-on hardening, not new capability gaps.
 
 The original point-in-time audit (2026-08-07), reconciled against merged `main`
 as of the 2026-08-28 release integration (22 capability commits + the PARTIAL
-closure tail, 591 tests green). Every P0/P1/P2 item is delivered — the three
+closure tail, 597 tests green). Every P0/P1/P2 item is delivered — the three
 former PARTIAL items (deterministic replay, test-kind coverage, static analysis)
 were closed on 2026-08-28; the ten P3 items remain deferred as the M-IN-01
 non-goal. Status legend: **DONE** = delivered;
@@ -383,7 +382,7 @@ authoritative input to the implementation order in "Recommended next action".
 | **X-MCPB-011** | Governed host runtime verification (extra) | DONE | — (RUNTIME_VERIFICATION cap models.py:34; runtime_verification_commands; docs/MCPB-011.md) |
 | **X-MCPB-012** | Working-tree candidate capture (extra) | DONE | — (WORKING_TREE_CANDIDATE_CAPTURE cap models.py:43; docs/MCPB-012.md) |
 | **X-M-AL-01** | Read-only introspection tools (extra) | DONE | — (list_development_jobs/get_effective_project_policy/resolve_candidate_canonicalization tools server.py:1269/1307/1343; job_introspection/policy_introspection/canonical_history_read caps; docs/M-AL-01.md) |
-| **X-OPENHANDS** | Governed disposable runtime action execution (extra) | DONE | — (open_hands_action.py OpenHandsActionManager; GOVERNED_DISPOSABLE_RUNTIME_ACTION_EXECUTION cap models.py:44; execute_action tool server.py:1604; test_open_hands_action.py) |
+| **X-OPENHANDS** | Governed disposable runtime action execution (extra) | DONE (stub) | — (`open_hands_action.py` `OpenHandsActionManager` implements the governance lifecycle and OH-001D ledger persistence with simulated/mocked runtime execution; `GOVERNED_DISPOSABLE_RUNTIME_ACTION_EXECUTION` cap `models.py:66`; `execute_action` tool `server.py:1604`; `test_open_hands_action.py`) |
 
 **Implementation order (unblock value first):** M-CT-04 → M-CT-05 → M-EV-01
 (the three CKS-002B blockers still open), then the small additive R1 tail
@@ -1088,7 +1087,7 @@ vision.
    dependency order; the 2026-08-28 PARTIAL-closure tail added the
    `replay_verification` read-only tool (39 tools, 22 capabilities),
    `VerificationCommand.kind` test-kind coverage, and the internal
-   `static_analysis` block; the full suite is green (**591 tests**).
+   `static_analysis` block; the full suite is green (**597 tests**).
 2. **Release.** Version stays **0.11.0** (the release commit `aa1b7b0` was never
    pushed). The remaining work is release mechanics: merge `origin/main`,
    push, tag `v0.11.0`, and a GitHub release — each step is an explicit

@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import weakref
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,14 @@ from typing import Any
 from .worktrees import _ensure_private_directory
 
 SCHEMA_VERSION = 1
+
+
+class _TrackedConnection(sqlite3.Connection):
+    """Subclass of sqlite3.Connection to allow weakref tracking."""
+    pass
+
+
+_OPEN_CONNECTIONS: weakref.WeakSet[sqlite3.Connection] = weakref.WeakSet()
 
 _CREATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -629,7 +638,9 @@ def open_state_db(db_path: Path) -> sqlite3.Connection:
     schema version is newer than this code supports, opening fails closed so
     the operator notices rather than silently losing data.
     """
-    connection = sqlite3.connect(db_path, check_same_thread=False)
+    connection = sqlite3.connect(
+        db_path, check_same_thread=False, factory=_TrackedConnection
+    )
     try:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
@@ -689,7 +700,18 @@ def open_state_db(db_path: Path) -> sqlite3.Connection:
         os.chmod(db_path, 0o600)
     except OSError:
         pass
+    _OPEN_CONNECTIONS.add(connection)
     return connection
+
+
+def close_all_state_dbs() -> None:
+    """Close all tracked open state database connections."""
+    for conn in list(_OPEN_CONNECTIONS):
+        try:
+            conn.close()
+        except Exception:
+            pass
+    _OPEN_CONNECTIONS.clear()
 
 
 def load_job_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -1262,7 +1284,7 @@ def insert_checkpoint_row(connection: sqlite3.Connection, row: dict[str, Any]) -
     """
     with connection:
         cursor = connection.execute(_INSERT_CHECKPOINT, row)
-        return int(cursor.lastrowid)
+        return int(cursor.lastrowid or 0)
 
 
 def load_checkpoint_rows(
@@ -1562,21 +1584,56 @@ def gc_artifacts(
     # are baked into the query as literals only after failing-closed checks
     # (the values are internal IDs, never caller-supplied free text). Use
     # parameter placeholders for the cutoff and the keep-kinds tuple.
+    #
+    # When a protected set exceeds SQLite's practical variable limit, fall back
+    # to a TEMP table and a subquery guard so GC stays deterministic for projects
+    # with large evidence footprints.
     with connection:
-        if protected_job_ids:
-            job_placeholders = ",".join("?" for _ in protected_job_ids)
-            job_guard = f"AND job_id NOT IN ({job_placeholders}) "
-            job_params: tuple[Any, ...] = tuple(protected_job_ids)
+        use_temp_jobs = len(protected_job_ids) > 400
+        use_temp_cps = len(protected_checkpoint_ids) > 400
+
+        if use_temp_jobs:
+            connection.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS _gc_protected_jobs (job_id TEXT PRIMARY KEY)"
+            )
+            connection.execute("DELETE FROM _gc_protected_jobs")
+            if protected_job_ids:
+                connection.executemany(
+                    "INSERT INTO _gc_protected_jobs (job_id) VALUES (?)",
+                    [(job_id,) for job_id in protected_job_ids],
+                )
+            job_guard = "AND job_id NOT IN (SELECT job_id FROM _gc_protected_jobs) "
+            job_params: tuple[Any, ...] = ()
         else:
-            job_guard = ""
-            job_params = ()
-        if protected_checkpoint_ids:
-            cp_placeholders = ",".join("?" for _ in protected_checkpoint_ids)
-            cp_guard = f"AND checkpoint_id NOT IN ({cp_placeholders}) "
-            cp_params: tuple[Any, ...] = tuple(protected_checkpoint_ids)
+            if protected_job_ids:
+                job_placeholders = ",".join("?" for _ in protected_job_ids)
+                job_guard = f"AND job_id NOT IN ({job_placeholders}) "
+                job_params = tuple(protected_job_ids)
+            else:
+                job_guard = ""
+                job_params = ()
+
+        if use_temp_cps:
+            connection.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS _gc_protected_checkpoints (checkpoint_id INTEGER PRIMARY KEY)"
+            )
+            connection.execute("DELETE FROM _gc_protected_checkpoints")
+            if protected_checkpoint_ids:
+                connection.executemany(
+                    "INSERT INTO _gc_protected_checkpoints (checkpoint_id) VALUES (?)",
+                    [(cp_id,) for cp_id in protected_checkpoint_ids],
+                )
+            cp_guard = "AND checkpoint_id NOT IN (SELECT checkpoint_id FROM _gc_protected_checkpoints) "
+            cp_params: tuple[Any, ...] = ()
         else:
-            cp_guard = ""
-            cp_params = ()
+            if protected_checkpoint_ids:
+                cp_placeholders = ",".join("?" for _ in protected_checkpoint_ids)
+                cp_guard = f"AND checkpoint_id NOT IN ({cp_placeholders}) "
+                cp_params = tuple(protected_checkpoint_ids)
+            else:
+                cp_guard = ""
+                cp_params = ()
+
         cursor = connection.execute(
             f"DELETE FROM job_checkpoints "
             f"WHERE recorded_at < ? "
@@ -1590,6 +1647,12 @@ def gc_artifacts(
             ),
         )
         deleted = int(cursor.rowcount or 0)
+
+        if use_temp_jobs:
+            connection.execute("DROP TABLE IF EXISTS _gc_protected_jobs")
+        if use_temp_cps:
+            connection.execute("DROP TABLE IF EXISTS _gc_protected_checkpoints")
+
     # The job_checkpoint_detail rows cascade via the FK ON DELETE CASCADE
     # (foreign_keys=ON in open_state_db). Callers verify the cascade in tests.
     return deleted

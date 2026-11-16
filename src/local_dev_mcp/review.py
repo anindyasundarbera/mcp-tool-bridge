@@ -38,6 +38,7 @@ import hashlib
 import json
 import os
 import secrets
+import sqlite3
 import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -403,6 +404,7 @@ class ReviewManager:
         executor: ClaudeExecutor,
         worktrees: GitWorktreeManager | None = None,
         projects: tuple[ProjectPolicy, ...] = (),
+        state_db: sqlite3.Connection | None = None,
     ) -> None:
         self.settings = settings
         self._locks = locks
@@ -418,8 +420,19 @@ class ReviewManager:
         # jobs and verification managers use. The ``reviews`` table is additive
         # (no schema-version bump), so an older code path ignores it. WAL
         # serializes the third writer safely.
-        self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+        if state_db is not None:
+            self._db = state_db
+            self._owns_db = False
+        else:
+            self._db = store.open_state_db(
+                self._worktrees.ensure_state_root() / "bridge.db"
+            )
+            self._owns_db = True
         self._reload_reviews()
+
+    def close(self) -> None:
+        if self._owns_db:
+            self._db.close()
 
     def _reload_reviews(self) -> None:
         """Load persisted review records, skipping unparseable rows.
@@ -483,24 +496,25 @@ class ReviewManager:
             record.diff_fingerprint,
             record.paths,
         )
-        store.upsert_review_row(self._db, review_to_row(record))
-        store.upsert_review_binding_row(
-            self._db,
-            {
-                "review_id": record.review_id,
-                "toolchain_digest": record.toolchain_digest,
-                "reviewer_independence_class": record.reviewer_independence_class,
-                "expires_at": record.expires_at,
-                "authority_ref": record.authority_ref,
-            },
-        )
-        store.upsert_review_content_row(
-            self._db,
-            {
-                "review_id": record.review_id,
-                "verdict_hash": record.verdict_hash,
-            },
-        )
+        with self._db:
+            self._db.execute(store._UPSERT_REVIEW, review_to_row(record))
+            self._db.execute(
+                store._UPSERT_REVIEW_BINDING,
+                {
+                    "review_id": record.review_id,
+                    "toolchain_digest": record.toolchain_digest,
+                    "reviewer_independence_class": record.reviewer_independence_class,
+                    "expires_at": record.expires_at,
+                    "authority_ref": record.authority_ref,
+                },
+            )
+            self._db.execute(
+                store._UPSERT_REVIEW_CONTENT,
+                {
+                    "review_id": record.review_id,
+                    "verdict_hash": record.verdict_hash,
+                },
+            )
 
     def _new_review_id(self) -> str:
         for _ in range(10):
@@ -674,7 +688,7 @@ class ReviewManager:
                     lines = text.splitlines(keepends=True)
                     if start_line > len(lines):
                         raise ReviewError("start_line is beyond the end of the file")
-                    actual_end = min(end_line, len(lines))
+                    actual_end = len(lines) if end_line is None else min(end_line, len(lines))
                     response["total_lines"] = len(lines)
                     response["start_line"] = start_line
                     response["end_line"] = actual_end

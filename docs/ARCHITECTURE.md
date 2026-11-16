@@ -201,7 +201,7 @@ exact tool surface and must be bumped when a tool is added.
 
 - `id`, `display_name`, `description`, `root` (absolute, must be the git top
   level when `require_git`),
-- `capabilities` — a `frozenset[ProjectCapability]` (15 possible),
+- `capabilities` — a `frozenset[ProjectCapability]` (22 possible),
 - `markdown_write_roots`, `commit_roots`, `protected_paths`,
 - `verification_commands`, `supply_chain_scans`, `runtime_verification_commands`,
   `working_tree_capture_scope`,

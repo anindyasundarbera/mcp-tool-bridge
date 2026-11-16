@@ -171,11 +171,12 @@ def sign_evidence_bundle(
     The signature is a deterministic HMAC-SHA256 over
     ``"<project_id>\\n<bundle_sha256>"`` using the project key. The manifest is
     attached under ``"manifest"`` and carries the algorithm, project id, digest,
-    and signature so a recipient can verify the bundle without the signing key.
-    The ``bundle_sha256`` field is left untouched: it was computed over the
-    bundle WITHOUT the manifest, so a recipient recomputes the digest by
-    stripping both ``bundle_sha256`` and ``manifest`` and re-serializing with
-    ``sort_keys=True`` and ``ensure_ascii=False``.
+    and signature. Verification is shared-secret: a recipient must hold the same
+    project key to recompute and compare the HMAC — the signature is not a
+    public, unkeyed artifact. The ``bundle_sha256`` field is left untouched: it
+    was computed over the bundle WITHOUT the manifest, so a recipient recomputes
+    the digest by stripping both ``bundle_sha256`` and ``manifest`` and
+    re-serializing with ``sort_keys=True`` and ``ensure_ascii=False``.
     """
     digest = bundle.get("bundle_sha256")
     if not digest or not isinstance(digest, str):

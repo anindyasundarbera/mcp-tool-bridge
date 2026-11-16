@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from local_dev_mcp import store
 from local_dev_mcp.config import Settings
 from local_dev_mcp.jobs import DevelopmentJobManager, JobStatus
 from local_dev_mcp.models import ProjectPolicy
@@ -976,6 +977,11 @@ class CheckpointStoreTests(unittest.TestCase):
             "milestone": None,
         }
 
+    def tearDown(self) -> None:
+        store.close_all_state_dbs()
+        if hasattr(self, "_tmp"):
+            self._tmp.cleanup()
+
     def test_checkpoint_detail_sidecar_additive_schema_version_stays_1(self) -> None:
         """M-CT-03: the ``job_checkpoint_detail`` sidecar table is created
         additively (``CREATE TABLE IF NOT EXISTS``), never alters
@@ -1289,6 +1295,11 @@ class ArtifactGcTests(unittest.TestCase):
             "event_json": None,
             "milestone": None,
         }
+
+    def tearDown(self) -> None:
+        store.close_all_state_dbs()
+        if hasattr(self, "_tmp"):
+            self._tmp.cleanup()
 
     def _insert_verification(
         self,

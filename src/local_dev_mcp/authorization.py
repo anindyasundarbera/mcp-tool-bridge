@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -103,12 +104,18 @@ class AuthorizationManager:
         settings: Settings,
         worktrees: GitWorktreeManager | None = None,
         projects: tuple[Any, ...] = (),
+        state_db: sqlite3.Connection | None = None,
     ) -> None:
         self.settings = settings
         self._worktrees = worktrees or GitWorktreeManager(
             settings, tuple(project.root for project in projects)
         )
-        self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+        if state_db is not None:
+            self._db = state_db
+            self._owns_db = False
+        else:
+            self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+            self._owns_db = True
 
     def _new_authorization_id(self) -> str:
         for _ in range(10):
@@ -116,6 +123,15 @@ class AuthorizationManager:
             if store.load_authorization_row(self._db, candidate) is None:
                 return candidate
         raise AuthorizationError("could not allocate a unique authorization ID")
+
+    def close(self) -> None:
+        """Close the durable state database if this manager owns it."""
+        if getattr(self, "_owns_db", False) and getattr(self, "_db", None) is not None:
+            try:
+                self._db.close()
+            except Exception:
+                pass
+            self._db = None  # type: ignore[assignment]
 
     def issue(
         self,

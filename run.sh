@@ -32,6 +32,17 @@ cd "$ROOT"
 VENV="$ROOT/.venv"
 PY="$VENV/bin/python"
 
+# --- Helpers ---------------------------------------------------------------
+# Read a single variable from .env via Python dotenv.
+read_env() {
+    "$PY" - "$1" <<'PY'
+import os, sys
+from dotenv import load_dotenv
+load_dotenv(".env")
+print(os.getenv(sys.argv[1], ""))
+PY
+}
+
 # --- Prerequisites ---------------------------------------------------------
 if [[ ! -x "$PY" ]]; then
     echo "error: virtualenv not found at $VENV" >&2
@@ -46,22 +57,23 @@ if [[ ! -f "$ROOT/projects.json" ]]; then
     echo "error: projects.json not found. Copy projects.example.json to projects.json." >&2
     exit 1
 fi
-if [[ ! -f "$ROOT/openai-connectors-mtls-ca.pem" ]]; then
-    echo "error: openai-connectors-mtls-ca.pem not found (required by tunnel.py)." >&2
+
+OPENAI_MTLS_CA_PATH="$(read_env OPENAI_MTLS_CA_PATH)"
+[[ -n "$OPENAI_MTLS_CA_PATH" ]] || OPENAI_MTLS_CA_PATH="$ROOT/openai-connectors-mtls-ca.pem"
+if [[ ! -f "$OPENAI_MTLS_CA_PATH" ]]; then
+    echo "error: CA certificate not found at $OPENAI_MTLS_CA_PATH (required by tunnel.py)." >&2
+    exit 1
+fi
+
+NGROK_AUTHTOKEN="$(read_env NGROK_AUTHTOKEN)"
+if [[ -z "$NGROK_AUTHTOKEN" ]]; then
+    echo "error: NGROK_AUTHTOKEN is not set in .env. Please configure your ngrok authtoken." >&2
     exit 1
 fi
 
 # --- Load .env for pre-flight banner --------------------------------------
 # tunnel.py and server.py load .env themselves; this is only for display and
 # for the readiness probe. load_dotenv does not override existing env vars.
-read_env() {
-    "$PY" - "$1" <<'PY'
-import os, sys
-from dotenv import load_dotenv
-load_dotenv(".env")
-print(os.getenv(sys.argv[1], ""))
-PY
-}
 MCP_HOST="$(read_env MCP_HOST)"
 [[ -n "$MCP_HOST" ]] || MCP_HOST="127.0.0.1"
 MCP_PORT="$(read_env MCP_PORT)"
@@ -131,9 +143,25 @@ CHILDREN_PIDS+=("$SERVER_PID")
 # probe pass while our server fails to bind and exits.
 port_owned_by_server() {
     # ss prints lines like:  LISTEN 0 2048 127.0.0.1:8000 ... users:(("python",pid=12345,fd=11))
-    ss -ltnp 2>/dev/null \
-        | grep -E "[ :]+${MCP_PORT}[ ]" \
-        | grep -q "pid=${SERVER_PID}"
+    local ss_out
+    ss_out="$(ss -ltnp 2>/dev/null | grep -E "[ :]+${MCP_PORT}[ ]")"
+    if [[ -z "$ss_out" ]]; then
+        ss_out="$(ss -ltn 2>/dev/null | grep -E "[ :]+${MCP_PORT}[ ]")" || return 1
+    fi
+
+    # Check pid=${SERVER_PID} first if process information is present
+    if echo "$ss_out" | grep -q "pid=${SERVER_PID}"; then
+        return 0
+    fi
+
+    # Fallback safely if ss omitted pid= tokens entirely under unprivileged runs
+    if ! echo "$ss_out" | grep -q "pid="; then
+        if kill -0 "$SERVER_PID" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    return 1
 }
 
 SERVER_READY=0

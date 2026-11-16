@@ -36,6 +36,7 @@ import json
 import os
 import secrets
 import signal
+import sqlite3
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -233,6 +234,7 @@ class RuntimeVerificationManager:
         locks: ProjectLockManager,
         worktrees: GitWorktreeManager | None = None,
         projects: tuple[ProjectPolicy, ...] = (),
+        state_db: sqlite3.Connection | None = None,
     ) -> None:
         self.settings = settings
         self._locks = locks
@@ -242,12 +244,26 @@ class RuntimeVerificationManager:
         self._project_roots = tuple(project.root for project in projects)
         self._records: list[dict[str, Any]] = []
         self._records_lock = asyncio.Lock()
-        self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+        if state_db is not None:
+            self._db = state_db
+            self._owns_db = False
+        else:
+            self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+            self._owns_db = True
         self._reload_records()
 
     def _reload_records(self) -> None:
         for row in store.load_runtime_verification_rows(self._db):
             self._records.append(row)
+
+    def close(self) -> None:
+        """Close the durable state database if this manager owns it."""
+        if getattr(self, "_owns_db", False) and getattr(self, "_db", None) is not None:
+            try:
+                self._db.close()
+            except Exception:
+                pass
+            self._db = None  # type: ignore[assignment]
 
     def _redaction_paths(self, project: ProjectPolicy) -> tuple[Path, ...]:
         return (

@@ -9,6 +9,8 @@ build/
 *.egg-info/
 projects.json
 openai-connectors-mtls-ca.pem
+mcp-servers.json
+reasonix.toml
 
 
 # bridge state directory (committed by mistake in db7a712; never staged or committed)

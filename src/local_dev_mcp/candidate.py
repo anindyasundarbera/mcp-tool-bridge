@@ -33,6 +33,21 @@ async def _probe_fastmcp(url: str) -> list[str]:
     return sorted(tool.name for tool in tools)
 
 
+def _redact(value: Any, paths: tuple[Path, ...]) -> Any:
+    if isinstance(value, str):
+        redacted = value
+        for path in paths:
+            redacted = redacted.replace(str(path), "<redacted-path>")
+        return redacted
+    if isinstance(value, dict):
+        return {key: _redact(item, paths) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact(item, paths) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact(item, paths) for item in value)
+    return value
+
+
 async def _stop_process(process: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
     if process.returncode is None:
         try:
@@ -47,7 +62,10 @@ async def _stop_process(process: asyncio.subprocess.Process) -> tuple[bytes, byt
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-        return await process.communicate()
+        try:
+            return await asyncio.wait_for(process.communicate(), timeout=3.0)
+        except TimeoutError:
+            return (b"", b"")
 
 
 class CandidateHealthChecker:
@@ -60,11 +78,15 @@ class CandidateHealthChecker:
         self._probe = probe or _probe_fastmcp
         self._lock = asyncio.Lock()
 
-    async def check(self, root: Path) -> dict[str, Any]:
+    async def check(
+        self, root: Path, project_root: Path | None = None
+    ) -> dict[str, Any]:
         async with self._lock:
-            return await self._check(root)
+            return await self._check(root, project_root=project_root)
 
-    async def _check(self, root: Path) -> dict[str, Any]:
+    async def _check(
+        self, root: Path, project_root: Path | None = None
+    ) -> dict[str, Any]:
         entrypoint = root / "server.py"
         try:
             metadata = os.lstat(entrypoint)
@@ -147,5 +169,6 @@ class CandidateHealthChecker:
                 diagnostics = stdout.decode("utf-8", errors="replace").strip()
             response["error"] = error[-2000:]
             if diagnostics:
-                response["diagnostics"] = diagnostics[-4000:]
+                paths = (root, project_root) if project_root is not None else (root,)
+                response["diagnostics"] = _redact(diagnostics, paths)[-4000:]
         return response

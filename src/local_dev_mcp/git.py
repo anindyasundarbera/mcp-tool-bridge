@@ -37,6 +37,13 @@ async def run_git(
         raise GitCommandError(
             f"git {' '.join(arguments)} timed out after {timeout_seconds} seconds"
         ) from exc
+    except asyncio.CancelledError:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await process.wait()
+        raise
     if process.returncode != 0:
         detail = stderr.decode("utf-8", errors="replace").strip()
         raise GitCommandError(
@@ -49,16 +56,30 @@ async def project_status(
     root: Path,
     timeout_seconds: int = 30,
 ) -> dict[str, object]:
-    branch, head, status, diff_stat = await asyncio.gather(
-        run_git(root, "branch", "--show-current", timeout_seconds=timeout_seconds),
-        run_git(root, "rev-parse", "HEAD", timeout_seconds=timeout_seconds),
-        run_git(root, "status", "--short", timeout_seconds=timeout_seconds),
-        run_git(root, "diff", "--stat", "HEAD", timeout_seconds=timeout_seconds),
-    )
+    branch_task = run_git(root, "branch", "--show-current", timeout_seconds=timeout_seconds)
+    status_task = run_git(root, "status", "--short", timeout_seconds=timeout_seconds)
+
+    try:
+        head: str | None = await run_git(
+            root, "rev-parse", "HEAD", timeout_seconds=timeout_seconds
+        )
+    except GitCommandError:
+        head = None
+
+    if head is None:
+        branch, status = await asyncio.gather(branch_task, status_task)
+        diff_stat = ""
+    else:
+        branch, status, diff_stat = await asyncio.gather(
+            branch_task,
+            status_task,
+            run_git(root, "diff", "--stat", "HEAD", timeout_seconds=timeout_seconds),
+        )
+
     return {
         "branch": branch,
         "head": head,
-        "clean": not bool(status),
+        "clean": status.strip() == "",
         "working_tree": status,
         "diff_stat": diff_stat,
     }

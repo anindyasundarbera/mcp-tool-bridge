@@ -23,7 +23,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import store
 from .config import Settings
 from .models import ProjectPolicy
 from .reader import RepositoryReader, RepositoryReadError
@@ -32,6 +31,11 @@ from .reader import RepositoryReader, RepositoryReadError
 NORMATIVE_ID_PATTERN = re.compile(r"^[A-Z]+-\d+[A-Z]?-R\d+(?:\s|$)")
 FENCED_NORMATIVE_PATTERN = re.compile(r"^```\s*normative\s*$", re.IGNORECASE)
 FENCE_END_PATTERN = re.compile(r"^```\s*$")
+
+# General fence pattern used to track the exact opener delimiter so nested
+# triple-backtick blocks inside a normative block opened with four (or more)
+# backticks — or with tildes — do not prematurely close the normative region.
+_FENCE_PATTERN = re.compile(r"^(```+|~~~+)\s*(.*?)\s*$")
 
 # Heuristic indicators for example/commentary context vs normative.
 _EXAMPLE_INDICATORS = (
@@ -165,23 +169,31 @@ class RequirementManager:
         """
         requirements: list[Requirement] = []
         lines = content.splitlines()
-        in_normative_block = False
+        fence_delim: tuple[str, int] | None = None
 
         for line_num, line in enumerate(lines, start=1):
             stripped = line.strip()
 
-            if FENCED_NORMATIVE_PATTERN.match(stripped):
-                in_normative_block = True
-                continue
-            elif FENCE_END_PATTERN.match(stripped) and in_normative_block:
-                in_normative_block = False
-                continue
+            fence_match = _FENCE_PATTERN.match(stripped)
+            if fence_match is not None:
+                fence_chars = fence_match.group(1)
+                info = fence_match.group(2)
+                fence_len = len(fence_chars)
+                fence_char = fence_chars[0]
+                if fence_delim is None:
+                    if info.lower() == "normative":
+                        fence_delim = (fence_char, fence_len)
+                        continue
+                else:
+                    if fence_char == fence_delim[0] and fence_len >= fence_delim[1]:
+                        fence_delim = None
+                        continue
 
             if NORMATIVE_ID_PATTERN.match(stripped):
                 parts = stripped.split(None, 1)
                 requirement_id = parts[0]
                 text = parts[1] if len(parts) > 1 else ""
-                normative = in_normative_block or self._is_likely_normative_context(
+                normative = fence_delim is not None or self._is_likely_normative_context(
                     lines, line_num - 1
                 )
                 kind = _kind_for(normative)
@@ -196,7 +208,7 @@ class RequirementManager:
                     status="unimplemented",
                     deferred_authority=None,
                 ))
-            elif in_normative_block and stripped:
+            elif fence_delim is not None and stripped:
                 # Content inside a fenced normative block without an ID is
                 # descriptive; skip it rather than fabricating auto-gen IDs
                 # (the original implementation's AUTO-Gen IDs polluted the
@@ -712,11 +724,11 @@ class RequirementManager:
         the list of uncovered normative IDs.
         """
         requirements = self.get_requirements_for_project(project_id)
+        linked_ids: set[str] = set()
         if job_id is not None:
             links = self._store.load_requirement_links_for_job(self._db, job_id)
-            linked_ids = {row["requirement_id"] for row in links}
+            linked_ids.update(row["requirement_id"] for row in links)
         else:
-            linked_ids: set[str] = set()
             for req in requirements:
                 rows = self._store.load_requirement_links_for_requirement(
                     self._db, req.requirement_id

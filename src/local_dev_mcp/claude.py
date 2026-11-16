@@ -516,6 +516,18 @@ class ClaudeExecutor:
         else:
             environment = os.environ.copy()
             environment["NO_COLOR"] = "1"
+            # When no credential_policy is set, the historical behavior copies the
+            # full process environment — but the bridge's own secrets must never
+            # leak into a Claude worktree subprocess. Scrub the bridge's sensitive
+            # tokens by default (NGROK auth, any OpenAI credential, and any
+            # LOCAL_DEV_MCP_*_KEY signing/authorization key).
+            for name in list(environment):
+                if (
+                    name == "NGROK_AUTHTOKEN"
+                    or name.startswith("OPENAI_")
+                    or (name.startswith("LOCAL_DEV_MCP_") and name.endswith("_KEY"))
+                ):
+                    environment.pop(name, None)
 
         process = await asyncio.create_subprocess_exec(
             *command,

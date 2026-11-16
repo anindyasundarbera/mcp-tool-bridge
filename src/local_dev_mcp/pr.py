@@ -14,19 +14,19 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from dataclasses import dataclass
+import re
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .config import Settings
 from . import store
-from .git import GitCommandError, run_git
+from .git import GitCommandError
 from .jobs import DevelopmentJobManager
 from .models import ProjectPolicy
 from .registry import ProjectLockManager
 from .verification import (
-    PublicationError,
     VerificationError,
     _remote_branch_sha,
     _validate_branch_name,
@@ -63,15 +63,18 @@ async def _gh(
     timeout_seconds: int,
 ) -> str:
     """Run the ``gh`` CLI with a fixed argument vector (no shell)."""
-    process = await asyncio.create_subprocess_exec(
-        "gh",
-        *arguments,
-        cwd=str(root),
-        start_new_session=True,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "gh",
+            *arguments,
+            cwd=str(root),
+            start_new_session=True,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise PullRequestError(f"gh binary unavailable: {exc}") from exc
     try:
         stdout, stderr = await asyncio.wait_for(
             process.communicate(), timeout=timeout_seconds
@@ -86,7 +89,9 @@ async def _gh(
             f"gh {' '.join(arguments)} timed out after {timeout_seconds} seconds"
         ) from exc
     if process.returncode != 0:
-        detail = stderr.decode("utf-8", errors="replace").strip()
+        detail = _redact(
+            stderr.decode("utf-8", errors="replace").strip(), (root,)
+        )[:2000]
         raise PullRequestError(
             f"gh {' '.join(arguments)} failed with exit code "
             f"{process.returncode}: {detail}"
@@ -104,6 +109,7 @@ class PullRequestManager:
         jobs: DevelopmentJobManager,
         worktrees: GitWorktreeManager | None = None,
         projects: tuple[ProjectPolicy, ...] = (),
+        state_db: sqlite3.Connection | None = None,
     ) -> None:
         self.settings = settings
         self._locks = locks
@@ -112,7 +118,18 @@ class PullRequestManager:
             settings, tuple(project.root for project in projects)
         )
         self._project_roots = tuple(project.root for project in projects)
-        self._db = store.open_state_db(self._worktrees.ensure_state_root() / "bridge.db")
+        if state_db is not None:
+            self._db = state_db
+            self._owns_db = False
+        else:
+            self._db = store.open_state_db(
+                self._worktrees.ensure_state_root() / "bridge.db"
+            )
+            self._owns_db = True
+
+    def close(self) -> None:
+        if self._owns_db:
+            self._db.close()
 
     def _redaction_paths(self, project: ProjectPolicy, job_id: str) -> tuple[Path, ...]:
         worktree_path = self.settings.job_worktree_root / project.id / job_id
@@ -348,8 +365,12 @@ class PullRequestManager:
                 output = await _gh(
                     worktree.path, *args, timeout_seconds=timeout
                 )
+                pr_number: int | None = None
+                match = re.search(r"/pull/(\d+)", output)
+                if match is not None:
+                    pr_number = int(match.group(1))
                 pr_state = {
-                    "number": None,
+                    "number": pr_number,
                     "url": output,
                     "state": "open",
                     "action": "created",

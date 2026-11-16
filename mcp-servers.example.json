@@ -7,7 +7,7 @@
     },
     "codebase-memory-mcp": {
       "type": "stdio",
-      "command": "/home/anindyasundar-bera/.local/bin/codebase-memory-mcp"
+      "command": "codebase-memory-mcp"
     },
     "searxng": {
       "type": "http",
@@ -23,12 +23,12 @@
     },
     "headroom": {
       "type": "stdio",
-      "command": "/home/anindyasundar-bera/.local/bin/headroom",
+      "command": "headroom",
       "args": ["mcp", "serve"]
     },
     "codegraph": {
       "type": "stdio",
-      "command": "/home/anindyasundar-bera/.nvm/versions/node/v24.16.0/bin/codegraph",
+      "command": "codegraph",
       "args": ["serve", "--mcp"]
     }
   }

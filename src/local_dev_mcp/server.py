@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
@@ -9,9 +10,9 @@ from pydantic import Field
 from .claude import ClaudeExecutor
 from .config import Settings
 from .evidence import EvidenceBundleError, EvidenceBundleManager
-from .git import project_status
+from .git import GitCommandError, project_status
 from .introspection import CanonicalizationResolver, effective_policy_view
-from .jobs import DevelopmentJobManager
+from .jobs import DevelopmentJobError, DevelopmentJobManager
 from .models import Effort, ProjectCapability
 from .pr import PullRequestError, PullRequestManager
 from .reader import RepositoryReader
@@ -19,6 +20,7 @@ from .registry import ProjectLockManager, ProjectRegistry
 from .review import ReviewError, ReviewManager
 from .writer import RepositoryWriter, WriteMode
 from .verification import (
+    PublicationError,
     PublicationManager,
     VerificationCommitManager,
     VerificationError,
@@ -32,8 +34,8 @@ from .working_tree_capture import (
     WorkingTreeCaptureError,
     WorkingTreeCaptureManager,
 )
-from .authorization import AuthorizationManager
-from .open_hands_action import OpenHandsActionManager
+from .authorization import AuthorizationError, AuthorizationManager
+from .open_hands_action import OpenHandsActionError, OpenHandsActionManager
 from . import store
 from .worktrees import GitWorktreeManager
 
@@ -56,10 +58,24 @@ def create_server(
     runtime: RuntimeVerificationManager | None = None,
     capture: WorkingTreeCaptureManager | None = None,
     requirements: Any = None,
+    state_db: sqlite3.Connection | None = None,
 ) -> FastMCP:
     active_settings = settings or Settings.from_env()
+    owns_state_db = False
+    if state_db is not None:
+        active_state_db = state_db
+    elif registry is not None and registry._state_db is not None:
+        active_state_db = registry._state_db
+    else:
+        active_state_db = store.open_state_db(
+            GitWorktreeManager(active_settings, ()).ensure_state_root() / "bridge.db"
+        )
+        owns_state_db = True
+
     if registry is not None:
         active_registry = registry
+        if getattr(active_registry, "_state_db", None) is None:
+            active_registry._state_db = active_state_db
     else:
         # M-GV-03: load the registry against the same durable state DB the job
         # manager uses, so the external-apex-grounding registration ledger is
@@ -67,9 +83,6 @@ def create_server(
         # without re-confirmation fails closed at startup). WAL allows the
         # registry and the job manager to hold concurrent connections to the
         # same file.
-        active_state_db = store.open_state_db(
-            GitWorktreeManager(active_settings, ()).ensure_state_root() / "bridge.db"
-        )
         active_registry = ProjectRegistry.load(
             active_settings.projects_config_path,
             require_apex_grounding=active_settings.require_apex_grounding,
@@ -79,6 +92,19 @@ def create_server(
     active_executor = executor or ClaudeExecutor(active_settings)
     active_reader = reader or RepositoryReader(active_settings)
     active_writer = writer or RepositoryWriter(active_settings)
+
+    if requirements is not None:
+        active_requirements = requirements
+    else:
+        from .requirement import RequirementManager
+
+        active_requirements = RequirementManager(
+            active_settings,
+            store,
+            active_reader,
+            db=active_state_db,
+        )
+
     # M-EV-01: construct the RequirementManager so it shares the job manager's
     # DB connection (wired inside DevelopmentJobManager). When the caller
     # passes a pre-built ``jobs`` manager, its own RequirementManager is kept.
@@ -87,13 +113,15 @@ def create_server(
         active_locks,
         active_executor,
         projects=active_registry.projects(),
-        requirements=requirements,
+        requirements=active_requirements,
+        state_db=active_state_db,
     )
     active_verification = verification or VerificationCommitManager(
         active_settings,
         active_locks,
         active_jobs,
         projects=active_registry.projects(),
+        state_db=active_state_db,
     )
     active_review = review or ReviewManager(
         active_settings,
@@ -101,12 +129,14 @@ def create_server(
         active_jobs,
         active_executor,
         projects=active_registry.projects(),
+        state_db=active_state_db,
     )
     active_publication = publication or PublicationManager(
         active_settings,
         active_locks,
         active_jobs,
         projects=active_registry.projects(),
+        state_db=active_state_db,
     )
     # Sync manager for canonical checkout synchronization
     active_sync = sync or SyncManager(
@@ -114,21 +144,28 @@ def create_server(
         active_locks,
         active_jobs,
         projects=active_registry.projects(),
+        state_db=active_state_db,
     )
     # Authorization manager for durable capability checks
-    active_authorization = AuthorizationManager(active_settings)
+    active_authorization = AuthorizationManager(
+        active_settings,
+        projects=active_registry.projects(),
+        state_db=active_state_db,
+    )
 
     active_evidence = evidence or EvidenceBundleManager(
         active_settings,
         active_locks,
         active_jobs,
         projects=active_registry.projects(),
+        state_db=active_state_db,
     )
     active_pr = pr or PullRequestManager(
         active_settings,
         active_locks,
         active_jobs,
         projects=active_registry.projects(),
+        state_db=active_state_db,
     )
     active_canonicalization = canonicalization or CanonicalizationResolver(
         active_settings,
@@ -137,22 +174,26 @@ def create_server(
         active_pr,
         active_sync,
         projects=active_registry.projects(),
+        state_db=active_state_db,
     )
     active_runtime = runtime or RuntimeVerificationManager(
         active_settings,
         active_locks,
         projects=active_registry.projects(),
+        state_db=active_state_db,
     )
     active_capture = capture or WorkingTreeCaptureManager(
         active_settings,
         active_locks,
         active_jobs,
         projects=active_registry.projects(),
+        state_db=active_state_db,
     )
     active_open_hands = OpenHandsActionManager(
         active_settings,
         active_locks,
         projects=active_registry.projects(),
+        state_db=active_state_db,
     )
 
     mcp = FastMCP(
@@ -1298,59 +1339,65 @@ def create_server(
         project = active_registry.resolve(
             project_id, ProjectCapability.VERIFICATION_COMMIT
         )
-        # M-GV-06: a delegated child is bounded to its mandate authority subset.
-        await active_jobs.require_job_capability(
-            project, job_id, ProjectCapability.VERIFICATION_COMMIT
-        )
-        if project.requires_review:
-            if review_id is None:
-                raise ReviewError(
-                    "review_id is required: this project requires a candidate "
-                    "review before a verified commit"
+        try:
+            # M-GV-06: a delegated child is bounded to its mandate authority subset.
+            await active_jobs.require_job_capability(
+                project, job_id, ProjectCapability.VERIFICATION_COMMIT
+            )
+            if project.requires_review:
+                if review_id is None:
+                    raise ReviewError(
+                        "review_id is required: this project requires a candidate "
+                        "review before a verified commit"
+                    )
+                await active_review.validate_for_commit(
+                    project,
+                    job_id,
+                    review_id,
+                    expected_head,
+                    expected_diff_fingerprint,
+                    paths,
                 )
-            await active_review.validate_for_commit(
+            # Durable authorization check (non-mutating precheck)
+            if active_settings.enable_durable_authz and authorization_id is not None:
+                active_authorization.check(
+                    authorization_id,
+                    project_id=project.id,
+                    capability=ProjectCapability.VERIFICATION_COMMIT,
+                    target=verification_id,
+                )
+            committed = await active_verification.commit(
                 project,
                 job_id,
-                review_id,
+                verification_id,
                 expected_head,
                 expected_diff_fingerprint,
                 paths,
+                message,
             )
-        # Durable authorization check, if enabled and auth ID provided
-        if active_settings.enable_durable_authz and authorization_id is not None:
-            active_authorization.check_and_consume(
-                authorization_id,
-                project_id=project.id,
-                capability=ProjectCapability.VERIFICATION_COMMIT,
-                target=verification_id,
-            )
-        committed = await active_verification.commit(
-            project,
-            job_id,
-            verification_id,
-            expected_head,
-            expected_diff_fingerprint,
-            paths,
-            message,
-        )
-        if project.requires_review and review_id is not None:
-            try:
-                await active_review.mark_used(review_id)
-            except Exception:
-                # The commit already succeeded and verification's single-use
-                # verification_id prevents a second commit, so a review-
-                # bookkeeping failure must not discard the commit_sha the caller
-                # needs. mark_used is atomic, so the review stays reusable in
-                # memory and disk; surface the issue as a warning instead.
-                committed = {
-                    **committed,
-                    "review_mark_warning": (
-                        "commit succeeded but the review record could not be "
-                        "marked used; the single-use verification_id still "
-                        "prevents a second commit"
-                    ),
-                }
-        return committed
+            # Consume authorization only after successful commit
+            if active_settings.enable_durable_authz and authorization_id is not None:
+                active_authorization.consume(authorization_id)
+            if project.requires_review and review_id is not None:
+                try:
+                    await active_review.mark_used(review_id)
+                except Exception:
+                    # The commit already succeeded and verification's single-use
+                    # verification_id prevents a second commit, so a review-
+                    # bookkeeping failure must not discard the commit_sha the caller
+                    # needs. mark_used is atomic, so the review stays reusable in
+                    # memory and disk; surface the issue as a warning instead.
+                    committed = {
+                        **committed,
+                        "review_mark_warning": (
+                            "commit succeeded but the review record could not be "
+                            "marked used; the single-use verification_id still "
+                            "prevents a second commit"
+                        ),
+                    }
+            return committed
+        except (VerificationError, ReviewError, AuthorizationError, DevelopmentJobError) as exc:
+            raise ValueError(str(exc)) from exc
 
     @mcp.tool(
         name="push_detached_development_commit",
@@ -1425,26 +1472,33 @@ def create_server(
         project = active_registry.resolve(
             project_id, ProjectCapability.PUSH_DEVELOPMENT_COMMIT
         )
-        # M-GV-06: a delegated child is bounded to its mandate authority subset.
-        await active_jobs.require_job_capability(
-            project, job_id, ProjectCapability.PUSH_DEVELOPMENT_COMMIT
-        )
-        # Durable authorization check for push, if enabled and auth ID provided
-        if active_settings.enable_durable_authz and authorization_id is not None:
-            active_authorization.check_and_consume(
-                authorization_id,
-                project_id=project.id,
-                capability=ProjectCapability.PUSH_DEVELOPMENT_COMMIT,
-                target=branch_name,
+        try:
+            # M-GV-06: a delegated child is bounded to its mandate authority subset.
+            await active_jobs.require_job_capability(
+                project, job_id, ProjectCapability.PUSH_DEVELOPMENT_COMMIT
             )
-        return await active_publication.publish(
-            project,
-            job_id,
-            commit_sha,
-            branch_name,
-            expected_base_head,
-            expected_diff_fingerprint,
-        )
+            # Durable authorization check for push (non-mutating precheck)
+            if active_settings.enable_durable_authz and authorization_id is not None:
+                active_authorization.check(
+                    authorization_id,
+                    project_id=project.id,
+                    capability=ProjectCapability.PUSH_DEVELOPMENT_COMMIT,
+                    target=branch_name,
+                )
+            published = await active_publication.publish(
+                project,
+                job_id,
+                commit_sha,
+                branch_name,
+                expected_base_head,
+                expected_diff_fingerprint,
+            )
+            # Consume authorization only after successful publish
+            if active_settings.enable_durable_authz and authorization_id is not None:
+                active_authorization.consume(authorization_id)
+            return published
+        except (PublicationError, AuthorizationError, DevelopmentJobError) as exc:
+            raise ValueError(str(exc)) from exc
 
     @mcp.tool(
         name="sync_canonical_checkout",
@@ -1792,7 +1846,10 @@ def create_server(
         project = active_registry.resolve(
             project_id, ProjectCapability.CANONICAL_HISTORY_READ
         )
-        return await active_canonicalization.resolve(project, commit_sha)
+        try:
+            return await active_canonicalization.resolve(project, commit_sha)
+        except (GitCommandError, RuntimeError, ValueError) as exc:
+            raise ValueError(str(exc)) from exc
 
     @mcp.tool(
         name="run_runtime_verification",
@@ -2072,6 +2129,39 @@ def create_server(
             return await active_open_hands.execute_action(project, action_params)
         except OpenHandsActionError as exc:
             raise ValueError(str(exc)) from exc
+
+    def close_all() -> None:
+        """Close all managers and the shared state DB."""
+        managers = [
+            active_registry,
+            active_jobs,
+            active_verification,
+            active_review,
+            active_publication,
+            active_sync,
+            active_authorization,
+            active_evidence,
+            active_pr,
+            active_canonicalization,
+            active_runtime,
+            active_capture,
+            active_open_hands,
+            active_requirements,
+        ]
+        for mgr in managers:
+            if hasattr(mgr, "close") and callable(mgr.close):
+                try:
+                    mgr.close()
+                except Exception:
+                    pass
+        if active_state_db is not None:
+            try:
+                active_state_db.close()
+            except Exception:
+                pass
+
+    setattr(mcp, "close", close_all)
+    setattr(mcp, "close_managers", close_all)
 
     return mcp
 
