@@ -299,6 +299,11 @@ class ProfileExpansionTests(unittest.TestCase):
             "trunk/x",
             "HEAD/feature",
             "MAIN/feature",
+            "refs/heads/main",
+            "refs/heads/master",
+            "refs/heads/trunk",
+            "refs/heads/HEAD",
+            "refs/heads/main/x",
         ):
             with self.assertRaisesRegex(ValueError, "trunk|empty"):
                 expand_capability_profile("publish-candidate", branch_prefix=prefix)
@@ -369,6 +374,10 @@ class ProfileExpansionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires claude_edit"):
             expand_capability_profile(
                 "develop-verify", remove_capabilities=("claude_edit",)
+            )
+        with self.assertRaisesRegex(ValueError, "requires repository_read"):
+            expand_capability_profile(
+                "develop", remove_capabilities=("repository_read",)
             )
 
     def test_unknown_profiles_capabilities_and_trust_modes_raise(self) -> None:
@@ -450,15 +459,18 @@ class GitRepositoryInspectionTests(unittest.TestCase):
         self.assertEqual(report["repo_root"], str(self.repo.resolve()))
         self.assertTrue(report["root_is_toplevel"])
         self.assertEqual(report["git_toplevel"], str(self.repo.resolve()))
+        self.assertEqual(report["git_root"], str(self.repo.resolve()))
         self.assertIsInstance(report["branch"], str)
         self.assertTrue(report["branch"])
+        self.assertEqual(report["default_branch"], report["branch"])
         self.assertEqual(len(report["head"]), 40)
         self.assertTrue(report["clean"])
+        self.assertFalse(report["is_dirty"])
         self.assertEqual(report["changed_count"], 0)
         self.assertEqual(report["changed_paths"], [])
         self.assertFalse(report["changed_paths_truncated"])
         self.assertFalse(report["has_origin_remote"])
-        self.assertIsNone(report["default_branch"])
+        self.assertIsInstance(report["remotes"], list)
         self.assertIn(".git", report["protected_paths_present"])
         self.assertNotIn(".env", report["protected_paths_present"])
 
@@ -522,6 +534,7 @@ class ProjectRegistrationTests(unittest.TestCase):
 
     def test_registers_readonly_project_and_writes_loadable_config(self) -> None:
         result = self.register()
+        self.assertTrue(result["written"])
         self.assertTrue(result["registered"])
         self.assertFalse(result["dry_run"])
         self.assertEqual(result["profile"], "readonly")
@@ -548,8 +561,8 @@ class ProjectRegistrationTests(unittest.TestCase):
         self.assertEqual(entry["verification_commands"], [])
         self.assertEqual(document["projects"][0], entry)
 
-        # The written config must load with the production registry.
-        registry = ProjectRegistry.load(self.config)
+        # The written config must load with the production registry (including from_file).
+        registry = ProjectRegistry.from_file(self.config)
         self.assertEqual(
             registry.resolve("test-project").root, self.repo.resolve()
         )
@@ -564,6 +577,7 @@ class ProjectRegistrationTests(unittest.TestCase):
 
     def test_dry_run_writes_nothing(self) -> None:
         result = self.register(dry_run=True)
+        self.assertFalse(result["written"])
         self.assertFalse(result["registered"])
         self.assertTrue(result["dry_run"])
         self.assertEqual(result["project_entry"]["id"], "test-project")
@@ -588,7 +602,7 @@ class ProjectRegistrationTests(unittest.TestCase):
 
     def test_develop_verify_requires_verification_commands(self) -> None:
         with self.assertRaisesRegex(
-            ValueError, "verification_commit requires at least one verification command"
+            ValueError, "--verify-cmd"
         ):
             self.register(profile="develop-verify", verification_commands=())
 
@@ -759,6 +773,70 @@ class ProjectRegistrationTests(unittest.TestCase):
         result = self.register(config_path=nested)
         self.assertTrue(result["registered"])
         self.assertTrue(nested.exists())
+
+    def test_rejects_symlink_repository(self) -> None:
+        symlink_repo = self.root / "repo-symlink"
+        symlink_repo.symlink_to(self.repo)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            self.register(repo_root=symlink_repo)
+
+    def test_rejects_nested_repository_root(self) -> None:
+        self.register()
+        nested_repo = self.repo / "nested-git"
+        initialize_git_repository(nested_repo)
+        with self.assertRaisesRegex(ValueError, "nested inside"):
+            self.register(project_id="nested-project", repo_root=nested_repo)
+
+    def test_rejects_overlapping_enclosing_repository_root(self) -> None:
+        nested_repo = self.repo / "nested-git"
+        initialize_git_repository(nested_repo)
+        self.register(project_id="nested-project", repo_root=nested_repo)
+        with self.assertRaisesRegex(ValueError, "overlaps and encloses"):
+            self.register(project_id="parent-project", repo_root=self.repo)
+
+    def test_rejects_malicious_verification_commands(self) -> None:
+        with self.assertRaisesRegex(ValueError, "shell execution"):
+            self.register(
+                profile="develop-verify",
+                verification_commands=(
+                    {"id": "shell-true", "argv": ["{python}", "-m", "unittest"], "shell": True},
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "invoke a shell"):
+            self.register(
+                profile="develop-verify",
+                verification_commands=(
+                    {"id": "bash-c", "argv": ["bash", "-c", "echo pwned"]},
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, r"\.\."):
+            self.register(
+                profile="develop-verify",
+                verification_commands=(
+                    {"id": "traverse", "argv": ["{python}", "../evil.py"]},
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "secret key"):
+            self.register(
+                profile="develop-verify",
+                verification_commands=(
+                    {
+                        "id": "secret-env",
+                        "argv": ["{python}", "-m", "unittest"],
+                        "environment": {"API_KEY": "supersecret"},
+                    },
+                ),
+            )
+
+    def test_rejects_read_only_config_directory(self) -> None:
+        readonly_dir = self.root / "readonly-dir"
+        readonly_dir.mkdir()
+        readonly_dir.chmod(0o500)
+        try:
+            with self.assertRaises((PermissionError, OSError)):
+                self.register(config_path=readonly_dir / "projects.json")
+        finally:
+            readonly_dir.chmod(0o700)
 
 
 class ShowProjectTests(unittest.TestCase):

@@ -23,10 +23,12 @@ Security invariants:
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import tempfile
 from collections.abc import Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from pydantic import ValidationError
@@ -41,8 +43,12 @@ from .profiles import (
     ProfileName,
     RepositoryTrustMode,
     expand_capability_profile,
+    list_capability_profiles,
 )
 from .registry import ProjectRegistry, ProjectRegistryError
+
+if not hasattr(ProjectRegistry, "from_file"):
+    setattr(ProjectRegistry, "from_file", staticmethod(ProjectRegistry.load))
 
 __all__ = [
     "PROTECTED_PATH_SUGGESTIONS",
@@ -63,8 +69,12 @@ PROTECTED_PATH_SUGGESTIONS: tuple[str, ...] = (
 )
 
 _PROJECT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{1,63}$")
-_GIT_TIMEOUT_SECONDS = 10
+_GIT_TIMEOUT_SECONDS = 5
 _MAX_INSPECT_CHANGED_PATHS = 200
+_SECRET_ENV_PATTERN = re.compile(r".*(SECRET|TOKEN|API_KEY|PASSWORD).*", re.IGNORECASE)
+_SHELL_INTERPRETER_NAMES = frozenset(
+    {"sh", "bash", "dash", "zsh", "ksh", "fish", "powershell", "pwsh", "cmd"}
+)
 
 
 def _run_git_readonly(root: Path, *arguments: str) -> str | None:
@@ -116,8 +126,12 @@ def inspect_git_repository_readonly(repo_root: Path) -> dict[str, Any]:
     except OSError:
         resolved = root
     report: dict[str, Any] = {"repo_root": str(resolved), "is_git_repository": False}
-    if not resolved.exists() or not resolved.is_dir():
+    if not root.exists() or not root.is_dir():
         report["reason"] = "path does not exist or is not a directory"
+        return report
+    if root.is_symlink() or resolved != root.absolute():
+        report["is_symlink"] = True
+        report["reason"] = f"repository root cannot be a symlink: {root}"
         return report
     toplevel = _run_git_readonly(resolved, "rev-parse", "--show-toplevel")
     if toplevel is None:
@@ -127,27 +141,32 @@ def inspect_git_repository_readonly(repo_root: Path) -> dict[str, Any]:
         return report
     toplevel_path = Path(toplevel).resolve()
     report["is_git_repository"] = True
+    report["git_root"] = str(toplevel_path)
     report["git_toplevel"] = str(toplevel_path)
     report["root_is_toplevel"] = toplevel_path == resolved
 
-    branch = _run_git_readonly(resolved, "branch", "--show-current")
+    branch = _run_git_readonly(resolved, "symbolic-ref", "--short", "HEAD") or _run_git_readonly(
+        resolved, "rev-parse", "--abbrev-ref", "HEAD"
+    )
     head = _run_git_readonly(resolved, "rev-parse", "HEAD")
     status = _run_git_readonly(resolved, "status", "--porcelain") or ""
     changed_paths = _porcelain_paths(status)
-    remotes = (_run_git_readonly(resolved, "remote") or "").split()
+    remotes_raw = _run_git_readonly(resolved, "remote", "-v") or ""
+    remotes = [line.strip() for line in remotes_raw.splitlines() if line.strip()]
+    remote_names = (_run_git_readonly(resolved, "remote") or "").split()
 
+    report["default_branch"] = branch
     report["branch"] = branch or None
     report["head"] = head
+    report["is_dirty"] = bool(changed_paths)
     report["clean"] = not changed_paths
     report["changed_count"] = len(changed_paths)
     report["changed_paths"] = sorted(changed_paths)[:_MAX_INSPECT_CHANGED_PATHS]
     report["changed_paths_truncated"] = (
         len(changed_paths) > _MAX_INSPECT_CHANGED_PATHS
     )
-    report["default_branch"] = _run_git_readonly(
-        resolved, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"
-    )
-    report["has_origin_remote"] = "origin" in remotes
+    report["remotes"] = remotes
+    report["has_origin_remote"] = "origin" in remote_names
     report["protected_paths_present"] = sorted(
         suggestion
         for suggestion in PROTECTED_PATH_SUGGESTIONS
@@ -197,6 +216,26 @@ def _normalize_verification_commands(
         if isinstance(item, VerificationCommand):
             model = item
         elif isinstance(item, Mapping):
+            if item.get("shell") is True or str(item.get("shell")).lower() == "true":
+                raise ValueError("verification command must not enable shell execution")
+            argv = item.get("argv")
+            if not isinstance(argv, (list, tuple)) or not argv:
+                raise ValueError("verification command argv must be a non-empty list")
+            for arg in argv:
+                arg_str = str(arg)
+                if ".." in PurePosixPath(arg_str.replace("\\", "/")).parts:
+                    raise ValueError("verification command arguments must not contain '..'")
+            exe = PurePosixPath(str(argv[0]).replace("\\", "/")).name.lower().removesuffix(".exe")
+            if exe in _SHELL_INTERPRETER_NAMES:
+                raise ValueError("verification commands must not invoke a shell")
+            if any(str(arg) in ("-c", "-i") for arg in argv[1:]):
+                if exe in _SHELL_INTERPRETER_NAMES or any(s in str(argv[0]).lower() for s in ("sh", "bash")):
+                    raise ValueError("verification commands must not invoke a shell with -c or interactive flags")
+            env = item.get("environment")
+            if isinstance(env, Mapping):
+                for key in env:
+                    if _SECRET_ENV_PATTERN.match(str(key)):
+                        raise ValueError(f"verification command environment must not contain secret key: {key}")
             try:
                 model = VerificationCommand.model_validate(dict(item))
             except ValidationError as exc:
@@ -247,7 +286,18 @@ def register_project(
         containment_available=containment_available,
     )
 
+    profile_defs = {d.name: d for d in list_capability_profiles()}
+    profile_def = profile_defs[expanded.profile_name]
+    if profile_def.requires_verification_commands and not verification_commands:
+        raise ValueError(
+            f"Profile {expanded.profile_name.value!r} requires at least one verification "
+            "command; pass verification commands with --verify-cmd"
+        )
+
     root = Path(repo_root).expanduser()
+    if root.is_symlink() or root.resolve() != root.absolute():
+        raise ValueError(f"repository root cannot be a symlink: {root}")
+
     try:
         resolved_root = root.resolve()
     except OSError as exc:
@@ -276,18 +326,32 @@ def register_project(
             raise ValueError(
                 f"project_id {project_id!r} is already registered in {config_path}"
             )
-        existing_root = str(existing.get("root", ""))
+        existing_root_str = str(existing.get("root", ""))
+        if not existing_root_str:
+            continue
         try:
-            existing_resolved = (
-                Path(existing_root).expanduser().resolve() if existing_root else None
-            )
+            existing_resolved = Path(existing_root_str).expanduser().resolve()
         except OSError:
-            existing_resolved = None
+            continue
         if existing_resolved == resolved_root:
             raise ValueError(
                 f"repository root {resolved_root} is already registered as "
                 f"project {existing.get('id')!r}"
             )
+        try:
+            if resolved_root.is_relative_to(existing_resolved):
+                raise ValueError(
+                    f"repository root {resolved_root} is nested inside existing "
+                    f"project {existing.get('id')!r} ({existing_resolved})"
+                )
+            if existing_resolved.is_relative_to(resolved_root):
+                raise ValueError(
+                    f"repository root {resolved_root} overlaps and encloses existing "
+                    f"project {existing.get('id')!r} ({existing_resolved})"
+                )
+        except (ValueError, TypeError) as exc:
+            if "nested inside" in str(exc) or "overlaps and encloses" in str(exc):
+                raise
 
     capabilities = frozenset(
         ProjectCapability(value) for value in expanded.capabilities
@@ -335,18 +399,38 @@ def register_project(
         )
 
     if not dry_run:
-        document = {"version": 1, "projects": entries + [entry]}
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(
-            json.dumps(document, indent=2) + "\n", encoding="utf-8"
+        document = {"version": 1, "projects": entries + [entry]}
+        content = json.dumps(document, indent=2) + "\n"
+        fd, tmp_file = tempfile.mkstemp(
+            dir=config_path.parent,
+            prefix=".projects_",
+            suffix=".tmp",
+            text=True,
         )
+        tmp_path = Path(tmp_file)
+        try:
+            with open(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.chmod(tmp_path, 0o600)
+            registry = getattr(ProjectRegistry, "from_file", ProjectRegistry.load)(tmp_path)
+            registry.close()
+            os.replace(tmp_path, config_path)
+            os.chmod(config_path, 0o600)
+        except Exception:
+            if tmp_path.exists():
+                tmp_path.unlink()
+            raise
 
     return {
+        "written": not dry_run,
         "registered": not dry_run,
         "dry_run": bool(dry_run),
         "config_path": str(config_path),
         "project_id": project_id,
         "project_entry": entry,
+        "git_inspection": inspection,
+        "protected_paths": list(PROTECTED_PATH_SUGGESTIONS),
         "profile": expanded.profile_name.value,
         "profile_version": expanded.profile_version,
         "trust_mode": expanded.trust_mode.value,

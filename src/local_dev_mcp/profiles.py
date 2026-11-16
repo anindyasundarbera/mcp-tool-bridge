@@ -57,7 +57,16 @@ PROFILE_CATALOG_VERSION = "1.0"
 # Branch prefixes that would make a publication target a trunk branch are
 # rejected (case-insensitively) so a profile can never be configured to push
 # onto the default history.
-_TRUNK_BRANCH_NAMES = ("main", "master", "trunk", "HEAD")
+_TRUNK_BRANCH_NAMES = (
+    "main",
+    "master",
+    "trunk",
+    "head",
+    "refs/heads/main",
+    "refs/heads/master",
+    "refs/heads/trunk",
+    "refs/heads/head",
+)
 
 
 class ProfileName(str, Enum):
@@ -314,9 +323,9 @@ def _validate_branch_prefix(branch_prefix: str) -> str:
         raise ValueError("branch_prefix must not contain control characters")
     if len(prefix) > 200:
         raise ValueError("branch_prefix must be at most 200 characters")
-    lowered = prefix.lower()
+    lowered = prefix.strip().lower()
     for trunk in _TRUNK_BRANCH_NAMES:
-        if lowered == trunk.lower() or lowered.startswith(trunk.lower() + "/"):
+        if lowered == trunk or lowered.startswith(trunk + "/"):
             raise ValueError(
                 f"branch_prefix {branch_prefix!r} must not be empty or target a "
                 f"trunk branch ({'/'.join(_TRUNK_BRANCH_NAMES)}); publication "
@@ -355,7 +364,7 @@ def _assert_dependency_closure(
         "enabled": False,
         "require_git": False,
         "capabilities": sorted(capability.value for capability in capabilities),
-        "requires_review": definition.commit_requires_review,
+        "requires_review": definition.commit_requires_review and needs_commands,
         "markdown_write_roots": ["docs"] if needs_write_roots else [],
         "commit_roots": ["."] if needs_commands else [],
         "verification_commands": (
