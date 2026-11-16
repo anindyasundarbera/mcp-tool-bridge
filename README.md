@@ -285,8 +285,11 @@ committed**.
 
 ```
 server.py, tunnel.py, run.sh       entry points (server / ngrok tunnel / launcher)
-src/local_dev_mcp/                 the bridge (26 modules, ~15k lines)
+src/local_dev_mcp/                 the bridge (28 modules, ~17k lines)
   server.py                        FastMCP tool surface (39 tools)
+  application.py                   transport-neutral GovernanceApplication core (Phase 1)
+  errors.py                        domain error boundary and envelope (Phase 1)
+  schema_compat.py                 public tool catalog and drift detection (Phase 1)
   registry.py, models.py           project registry + capability/policy models
   config.py                        Settings (env-driven)
   jobs.py, claude.py                development-job lifecycle + Claude executor
@@ -300,7 +303,7 @@ src/local_dev_mcp/                 the bridge (26 modules, ~15k lines)
   reader.py, writer.py             bounded Markdown read/write
   git.py, worktrees.py, candidate.py   git helpers / worktree mgmt
   authorization.py, requirement.py  durable authorizations / requirement traceability
-tests/                             597 unittest tests, no network/model deps
+tests/                             657 unittest tests, no network/model deps
 docs/                              milestone decision records + this documentation set
 ```
 
